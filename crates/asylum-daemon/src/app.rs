@@ -62,36 +62,36 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/client-config", get(api_client_config))
         .route("/api/health", get(api_health))
         .route("/api/nodes", get(api_nodes_list).post(api_nodes_create))
-        .route("/api/nodes/:id", get(api_node_inspect))
-        .route("/api/nodes/:id/events", get(api_node_events))
+        .route("/api/nodes/{id}", get(api_node_inspect))
+        .route("/api/nodes/{id}/events", get(api_node_events))
         .route("/api/graph", get(api_graph))
-        .route("/api/nodes/:id/input", post(api_node_send_input))
-        .route("/api/nodes/:id/interrupt", post(api_node_interrupt))
-        .route("/api/nodes/:id/stop", post(api_node_stop))
-        .route("/api/nodes/:id/archive", post(api_node_archive))
-        .route("/api/nodes/:id/observe/ws", get(api_node_observe_ws))
+        .route("/api/nodes/{id}/input", post(api_node_send_input))
+        .route("/api/nodes/{id}/interrupt", post(api_node_interrupt))
+        .route("/api/nodes/{id}/stop", post(api_node_stop))
+        .route("/api/nodes/{id}/archive", post(api_node_archive))
+        .route("/api/nodes/{id}/observe/ws", get(api_node_observe_ws))
         .route(
-            "/api/nodes/:id/attach/browser",
+            "/api/nodes/{id}/attach/browser",
             post(api_node_attach_browser),
         )
         .route(
-            "/api/nodes/:id/attach/native-target",
+            "/api/nodes/{id}/attach/native-target",
             post(api_node_attach_native),
         )
         .route("/api/tokens", post(api_issue_token))
-        .route("/api/tokens/:id", delete(api_revoke_token))
+        .route("/api/tokens/{id}", delete(api_revoke_token))
         .route("/api/harnesses", get(api_harnesses))
         .route("/api/substrates", get(api_substrates))
         .route("/api/workspaces/recent", get(api_recent_workspaces))
         .route("/api/context/system-map", get(api_system_map))
-        .route("/api/context/launch-packet/:id", get(api_launch_packet))
+        .route("/api/context/launch-packet/{id}", get(api_launch_packet))
         .route(
             "/api/relationships",
             get(api_list_relationships).post(api_create_relationship),
         )
-        .route("/api/relationships/:id", delete(api_delete_relationship))
+        .route("/api/relationships/{id}", delete(api_delete_relationship))
         .route("/api/notifications", get(api_notifications))
-        .route("/api/notifications/:id/read", post(api_notification_read))
+        .route("/api/notifications/{id}/read", post(api_notification_read))
         .route("/api/remote-commands", post(api_remote_commands))
         .route("/api/notify/send", post(api_notify_send))
         .layer(middleware::from_fn_with_state(
@@ -101,8 +101,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .nest_service("/assets", get_service(ServeDir::new("cockpit/dist/assets")))
-        .route("/attach/:token", get(api_attach_page))
-        .route("/api/attach/:token/ws", get(api_attach_ws))
+        .route("/attach/{token}", get(api_attach_page))
+        .route("/api/attach/{token}/ws", get(api_attach_ws))
         .route("/", get(api_root))
         .merge(protected)
         .layer(axum::Extension(state))
