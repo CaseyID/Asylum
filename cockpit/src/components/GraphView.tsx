@@ -12,7 +12,7 @@ import {
   Background,
   Position,
 } from "@xyflow/react";
-import { memo, type FC, type MouseEvent, useEffect, useMemo, useState } from "react";
+import { memo, type FC, type MouseEvent, useEffect, useMemo, useRef, useState } from "react";
 import { type GraphFlow } from "../api";
 
 type AsylumNodeData = GraphFlow["nodes"][number]["data"];
@@ -48,13 +48,18 @@ export interface GraphViewProps {
 
 export const GraphView: FC<GraphViewProps> = ({ flow, selectedNodeId, onSelectNode }) => {
   const [flowApi, setFlowApi] = useState<ReactFlowInstance | null>(null);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const [wrapWidth, setWrapWidth] = useState(0);
   const initialNodes: Node<Record<string, unknown>>[] = useMemo(
-    () =>
-      flow.nodes.map((node) => ({
+    () => {
+      const compact = wrapWidth > 0 && wrapWidth < 560;
+      return flow.nodes.map((node, index) => ({
         ...node,
+        position: compact ? { x: 0, y: index * 150 } : node.position,
         selected: node.id === selectedNodeId,
-      })),
-    [flow.nodes, selectedNodeId],
+      }));
+    },
+    [flow.nodes, selectedNodeId, wrapWidth],
   );
   const initialEdges: Edge[] = useMemo(() => flow.edges, [flow.edges]);
 
@@ -62,12 +67,24 @@ export const GraphView: FC<GraphViewProps> = ({ flow, selectedNodeId, onSelectNo
   const [edges, setEdges] = useEdgesState(initialEdges);
 
   useEffect(() => {
+    if (!wrapRef.current) return;
+    const observer = new ResizeObserver(([entry]) => {
+      setWrapWidth(entry.contentRect.width);
+    });
+    observer.observe(wrapRef.current);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
     setNodes(initialNodes);
   }, [setNodes, initialNodes]);
 
   useEffect(() => {
-    flowApi?.fitView({ duration: 150 });
-  }, [flow.nodes.length, flow.edges.length]);
+    const handle = window.requestAnimationFrame(() => {
+      flowApi?.fitView({ duration: 150, padding: wrapWidth < 560 ? 0.08 : 0.16 });
+    });
+    return () => window.cancelAnimationFrame(handle);
+  }, [flowApi, flow.nodes.length, flow.edges.length, wrapWidth]);
 
   useEffect(() => {
     setEdges(
@@ -90,9 +107,12 @@ export const GraphView: FC<GraphViewProps> = ({ flow, selectedNodeId, onSelectNo
           Reset zoom
         </button>
       </div>
-      <div className="graph-view-wrap">
+      <div className="graph-view-wrap" ref={wrapRef}>
         <ReactFlow
-          onInit={setFlowApi}
+          onInit={(instance) => {
+            setFlowApi(instance);
+            window.requestAnimationFrame(() => instance.fitView({ padding: 0.16 }));
+          }}
           nodeTypes={nodeTypes}
           nodes={nodes}
           edges={edges}

@@ -86,6 +86,10 @@ export interface RelationshipResponse {
   kind: string;
 }
 
+export interface OptionListResponse<T extends string = string> {
+  items: T[];
+}
+
 export interface AttachBrowserResponse {
   token?: string;
   attach_url: string;
@@ -103,23 +107,71 @@ export interface GraphFlow {
 }
 
 const BASE = "/api";
+const AUTH_TOKEN_KEY = "asylum.ownerToken";
 
 type Jsonish = Record<string, unknown>;
 
+export class ApiError extends Error {
+  status: number;
+  statusText: string;
+  body: string;
+
+  constructor(status: number, statusText: string, body: string) {
+    super(`${status} ${statusText}: ${body}`);
+    this.name = "ApiError";
+    this.status = status;
+    this.statusText = statusText;
+    this.body = body;
+  }
+}
+
+export function getStoredOwnerToken(): string {
+  if (typeof window === "undefined") return "";
+  return window.localStorage.getItem(AUTH_TOKEN_KEY) ?? "";
+}
+
+export function setStoredOwnerToken(token: string): void {
+  if (typeof window === "undefined") return;
+  const trimmed = token.trim();
+  if (trimmed) {
+    window.localStorage.setItem(AUTH_TOKEN_KEY, trimmed);
+  } else {
+    window.localStorage.removeItem(AUTH_TOKEN_KEY);
+  }
+}
+
+export function hydrateOwnerTokenFromLocation(): string {
+  if (typeof window === "undefined") return "";
+  const url = new URL(window.location.href);
+  const token = url.searchParams.get("token") ?? "";
+  if (token.trim()) {
+    setStoredOwnerToken(token);
+    url.searchParams.delete("token");
+    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+    return token.trim();
+  }
+  return getStoredOwnerToken();
+}
+
 async function parseResponseBody<T>(res: Response): Promise<T> {
+  if (res.status === 204) {
+    return undefined as T;
+  }
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`${res.status} ${res.statusText}: ${body}`);
+    throw new ApiError(res.status, res.statusText, body);
   }
   const data = (await res.json()) as T;
   return data;
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const token = getStoredOwnerToken();
   const res = await fetch(`${BASE}${path}`, {
     headers: {
       "content-type": "application/json",
       accept: "application/json",
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
       ...(init.headers ?? {}),
     },
     ...init,
@@ -152,6 +204,16 @@ export async function fetchNotifications(): Promise<NotificationRecord[]> {
       read: Boolean(raw.read ?? raw.read_at_epoch_secs),
     };
   });
+}
+
+export async function fetchHarnesses(): Promise<HarnessKind[]> {
+  const data = await request<OptionListResponse<HarnessKind> | HarnessKind[]>("/harnesses");
+  return Array.isArray(data) ? data : data.items;
+}
+
+export async function fetchSubstrates(): Promise<SubstrateKind[]> {
+  const data = await request<OptionListResponse<SubstrateKind> | SubstrateKind[]>("/substrates");
+  return Array.isArray(data) ? data : data.items;
 }
 
 export async function markNotificationRead(id: string): Promise<void> {

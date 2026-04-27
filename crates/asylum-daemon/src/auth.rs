@@ -29,11 +29,16 @@ pub enum AuthScope {
     Full,
 }
 
-pub fn issue_owner_token(name: &str, scope: &[String]) -> Result<IssuedOwnerToken> {
+pub fn issue_owner_token(
+    name: &str,
+    scope: &[String],
+    ttl_seconds: Option<u64>,
+) -> Result<IssuedOwnerToken> {
     let token_id = Uuid::new_v4();
     let raw = format!("asylum-owner-{}-{}", token_id, Uuid::new_v4());
     let stored_hash = hash_token(&raw);
-    let expires_at = chrono_like_now() + 3600;
+    let ttl = ttl_seconds.unwrap_or(3600);
+    let expires_at = chrono_like_now() + ttl as i64;
     Ok(IssuedOwnerToken {
         token_id,
         raw_token: raw,
@@ -101,7 +106,7 @@ mod tests {
 
     #[test]
     fn token_hash_verification_rejects_wrong_secret() {
-        let issued = issue_owner_token("test-owner", &["node.list".to_string()]).unwrap();
+        let issued = issue_owner_token("test-owner", &["node.list".to_string()], None).unwrap();
         assert!(verify_token(&issued.raw_token, &issued.stored_hash));
         assert!(!verify_token("wrong-token", &issued.stored_hash));
     }

@@ -27,6 +27,18 @@ npm --prefix cockpit run build
 ./target/debug/asylum serve --database ./.asylum/asylum.sqlite3
 ```
 
+For protected mode, bootstrap with an owner token and point CLI/Cockpit at it:
+
+```bash
+# terminal A
+export ASYLUM_OWNER_TOKEN="$(uuidgen)"
+./target/debug/asylum serve --owner-tokens-enabled
+
+# terminal B
+ASYLUM_TOKEN="$ASYLUM_OWNER_TOKEN" ./target/debug/asylum graph get
+open "http://127.0.0.1:7717/?token=$ASYLUM_OWNER_TOKEN"
+```
+
 The daemon serves:
 - `http://127.0.0.1:7717/api/...` for APIs
 - `/` for the Cockpit single-page UI when `cockpit/dist/index.html` exists
@@ -63,6 +75,12 @@ These commands print service definitions you can save as launch artifacts.
 `asylum` also reads optional environment:
 - `ASYLUM_BASE_URL` (default `http://127.0.0.1:7717`)
 - `ASYLUM_TOKEN` (Bearer token for protected endpoints)
+- `ASYLUM_OWNER_TOKEN` and `ASYLUM_OWNER_TOKENS_ENABLED` for daemon-side owner-token auth
+- `ASYLUM_ATTACH_SECRET` for attach URL signing; omitted means a per-process random secret
+- `ASYLUM_NTFY_SERVER`, `ASYLUM_NTFY_TOPIC`, `ASYLUM_NTFY_TOKEN`
+- `ASYLUM_LOON_ENABLED`, `ASYLUM_LOON_ENDPOINT`, and optional config-file `loon.cli_path`, `loon.api_key_file`, `loon.cert_fingerprint_file`
+
+When Loon is enabled, Asylum drives the documented `loon` CLI contract (`spawn`, `tell`, `interrupt`, `stop`, `terminate`, `attach`) and passes `LOON_ENDPOINT` plus configured auth/cert env vars to that process.
 
 ### Acceptance Walkthrough
 
@@ -81,3 +99,8 @@ These commands print service definitions you can save as launch artifacts.
    - `curl -X POST -H 'Content-Type: application/json' /api/nodes/<id>/attach/browser` returns `{ "url", "expires_in_seconds" }` in `attach` response.
 7. Generate notifications:
    - `asylum notify send --title "hello" --body "it works"` returns `notify sent: true` when sender config is enabled.
+8. Exercise remote commands:
+   - Issue a token, then `curl -X POST -H 'Content-Type: application/json' -d '{"command":"status token=<token>"}' http://127.0.0.1:7717/api/remote-commands`.
+9. If Loon is configured:
+   - `asylum serve --loon-enabled --loon-endpoint https://<host>:7777`
+   - `asylum node create --harness claude_code --substrate loon --role worker`

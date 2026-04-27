@@ -33,11 +33,17 @@ impl HarnessRegistry {
         let mut adapters: HashMap<HarnessKind, Arc<dyn HarnessAdapter>> = HashMap::new();
         adapters.insert(
             HarnessKind::Codex,
-            Arc::new(CodexHarness::new(config.codex_command.clone(), vec![])),
+            Arc::new(CodexHarness::new(
+                config.codex_command.clone(),
+                launch_args_for(config, &HarnessKind::Codex),
+            )),
         );
         adapters.insert(
             HarnessKind::ClaudeCode,
-            Arc::new(ClaudeHarness::new(config.claude_command.clone(), vec![])),
+            Arc::new(ClaudeHarness::new(
+                config.claude_command.clone(),
+                launch_args_for(config, &HarnessKind::ClaudeCode),
+            )),
         );
         Self { adapters }
     }
@@ -55,6 +61,14 @@ impl Default for HarnessRegistry {
     fn default() -> Self {
         Self::from_config(&HarnessConfig::default())
     }
+}
+
+fn launch_args_for(config: &HarnessConfig, kind: &HarnessKind) -> Vec<String> {
+    let key = match kind {
+        HarnessKind::Codex => "codex",
+        HarnessKind::ClaudeCode => "claude_code",
+    };
+    config.startup_args.get(key).cloned().unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use uuid::Uuid;
 
 use super::{SubstrateContext, SubstrateOutput};
@@ -12,6 +12,7 @@ use super::{SubstrateContext, SubstrateOutput};
 #[derive(Clone)]
 struct LocalRuntime {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    output_tx: broadcast::Sender<String>,
 }
 
 #[derive(Clone)]
@@ -57,6 +58,8 @@ impl LocalSubstrate {
         let node_id = ctx.node_id;
         let sink = self.output_sink.clone();
         let writer_arc: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(writer));
+        let (output_tx, _) = broadcast::channel(1024);
+        let output_tx_for_reader = output_tx.clone();
 
         tokio::task::spawn_blocking(move || {
             let mut local_child = child;
@@ -67,6 +70,7 @@ impl LocalSubstrate {
                     Ok(size) => {
                         let chunk = String::from_utf8_lossy(&buffer[..size]).to_string();
                         sink(node_id, &chunk);
+                        let _ = output_tx_for_reader.send(chunk.clone());
                     }
                     Err(_) => break,
                 }
@@ -76,23 +80,37 @@ impl LocalSubstrate {
 
         // keep the child alive by not dropping `child` here.
         // this is intentionally retained in thread scope only; we also keep output writer handle.
-        self.runtimes
-            .write()
-            .await
-            .insert(node_id, LocalRuntime { writer: writer_arc });
+        self.runtimes.write().await.insert(
+            node_id,
+            LocalRuntime {
+                writer: writer_arc,
+                output_tx,
+            },
+        );
         Ok(())
     }
 
     pub async fn send_input(&self, node_id: Uuid, text: &str) -> Result<()> {
+        self.send_input_raw(node_id, &format!("{text}\n")).await
+    }
+
+    pub async fn send_input_raw(&self, node_id: Uuid, text: &str) -> Result<()> {
         let runtimes = self.runtimes.read().await;
         let runtime = runtimes
             .get(&node_id)
             .ok_or_else(|| anyhow!("node not running"))?;
         let mut writer = runtime.writer.lock().await;
         writer.write_all(text.as_bytes())?;
-        writer.write_all(b"\n")?;
         writer.flush()?;
         Ok(())
+    }
+
+    pub async fn attach(&self, node_id: Uuid) -> Result<broadcast::Receiver<String>> {
+        let runtimes = self.runtimes.read().await;
+        let runtime = runtimes
+            .get(&node_id)
+            .ok_or_else(|| anyhow!("node not running"))?;
+        Ok(runtime.output_tx.subscribe())
     }
 
     pub async fn interrupt(&self, node_id: Uuid) -> Result<()> {

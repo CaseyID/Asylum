@@ -1,19 +1,55 @@
-import { type FC, useState } from "react";
+import { type FC, useEffect, useState } from "react";
 import { CirclePlus, RefreshCw } from "lucide-react";
-import { type AsylumNode, type CreateNodeRequest, createNode } from "../api";
+import {
+  type AsylumNode,
+  type CreateNodeRequest,
+  type HarnessKind,
+  type SubstrateKind,
+  createNode,
+  fetchHarnesses,
+  fetchSubstrates,
+} from "../api";
 
 export interface CreateNodePanelProps {
   onCreated: (node: AsylumNode) => void;
 }
 
 export const CreateNodePanel: FC<CreateNodePanelProps> = ({ onCreated }) => {
-  const [harness, setHarness] = useState<"codex" | "claude_code">("codex");
-  const [substrate, setSubstrate] = useState<"local" | "loon">("local");
+  const [harness, setHarness] = useState<HarnessKind>("codex");
+  const [substrate, setSubstrate] = useState<SubstrateKind>("local");
+  const [harnessOptions, setHarnessOptions] = useState<HarnessKind[]>(["codex", "claude_code"]);
+  const [substrateOptions, setSubstrateOptions] = useState<SubstrateKind[]>(["local"]);
   const [roleHint, setRoleHint] = useState("worker");
   const [workspace, setWorkspace] = useState("");
   const [description, setDescription] = useState("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | undefined>();
+
+  useEffect(() => {
+    let alive = true;
+    void Promise.all([fetchHarnesses(), fetchSubstrates()])
+      .then(([nextHarnesses, nextSubstrates]) => {
+        if (!alive) return;
+        const usableHarnesses: HarnessKind[] = nextHarnesses.length > 0 ? nextHarnesses : ["codex", "claude_code"];
+        const usableSubstrates: SubstrateKind[] = nextSubstrates.length > 0 ? nextSubstrates : ["local"];
+        setHarnessOptions(usableHarnesses);
+        setSubstrateOptions(usableSubstrates);
+        if (!usableHarnesses.includes(harness)) {
+          setHarness(usableHarnesses[0]);
+        }
+        if (!usableSubstrates.includes(substrate)) {
+          setSubstrate(usableSubstrates[0]);
+        }
+      })
+      .catch(() => {
+        if (alive) {
+          setSubstrateOptions(["local"]);
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, [harness, substrate]);
 
   const submit = async () => {
     const request: CreateNodeRequest = {
@@ -46,17 +82,23 @@ export const CreateNodePanel: FC<CreateNodePanelProps> = ({ onCreated }) => {
         Harness
         <select
           value={harness}
-          onChange={(event) => setHarness(event.target.value as "codex" | "claude_code")}
+          onChange={(event) => setHarness(event.target.value as HarnessKind)}
         >
-          <option value="codex">codex</option>
-          <option value="claude_code">claude_code</option>
+          {harnessOptions.map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))}
         </select>
       </label>
       <label>
         Substrate
-        <select value={substrate} onChange={(event) => setSubstrate(event.target.value as "local" | "loon")}>
-          <option value="local">local</option>
-          <option value="loon">loon</option>
+        <select value={substrate} onChange={(event) => setSubstrate(event.target.value as SubstrateKind)}>
+          {substrateOptions.map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))}
         </select>
       </label>
       <label>

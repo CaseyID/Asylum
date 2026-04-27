@@ -1,8 +1,11 @@
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use asylum_core::api::{CreateNodeRequest, ErrorPayload, LaunchPacketResponse, SendInputRequest};
+use asylum_core::config::AsylumConfig;
+use asylum_core::node::SubstrateKind;
 use asylum_core::security::TokenRequest;
 use axum::extract::ws::Message;
 use axum::{
@@ -20,31 +23,63 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
+use tokio::sync::{broadcast::error::RecvError, mpsc, Mutex};
 use tower_http::services::ServeDir;
 use uuid::Uuid;
 
+use crate::auth::hash_token;
 use crate::auth::AuthMode;
 use crate::capability_service::{AppConfig, CapabilityService};
 use crate::remote_commands::{parse_remote_command, RemoteCommandKind};
 use crate::storage::Store;
+use futures::{SinkExt, StreamExt};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 #[derive(Clone)]
 pub struct AppState {
     pub service: CapabilityService,
 }
 
-pub async fn serve(bind: SocketAddr, database: String) -> Result<()> {
+pub async fn serve(bind: SocketAddr, database: String, config: AsylumConfig) -> Result<()> {
     let store = Store::open(database)?;
-    let auth_mode = AuthMode::Disabled;
+    let mut expected_hashes = store
+        .list_active_tokens()?
+        .into_iter()
+        .map(|(_, _, hash, _, _)| hash)
+        .collect::<Vec<_>>();
+    if let Some(owner_token) = config.auth.owner_token.as_deref() {
+        if !owner_token.is_empty() {
+            expected_hashes.push(hash_token(owner_token));
+        }
+    }
+    let auth_mode = if config.auth.owner_tokens_enabled || config.auth.owner_token.is_some() {
+        expected_hashes.sort();
+        expected_hashes.dedup();
+        if expected_hashes.is_empty() {
+            bail!(
+                "owner-token auth is enabled but no active token or ASYLUM_OWNER_TOKEN/--owner-token was provided"
+            );
+        }
+        AuthMode::OwnerToken { expected_hashes }
+    } else {
+        AuthMode::Disabled
+    };
+    let base_url = if config.base_url.is_empty() {
+        format!("http://{bind}")
+    } else {
+        config.base_url.clone()
+    };
     let service = CapabilityService::new(
         store,
         auth_mode,
         AppConfig {
-            base_url: format!("http://{bind}"),
-            workspace_recent_limit: 50,
-            ntfy_server: None,
-            ntfy_topic: None,
-            ntfy_token: None,
+            base_url,
+            workspace_recent_limit: config.workspace.recent_limit,
+            ntfy_server: config.ntfy.server,
+            ntfy_topic: config.ntfy.topic,
+            ntfy_token: config.ntfy.token,
+            harness: config.harness,
+            loon: config.loon,
         },
     );
 
@@ -294,6 +329,33 @@ async fn handle_node_observe_ws(
     let _ = socket
         .send(Message::Text("asylum.observe.ws.initialized".into()))
         .await;
+
+    let Ok(Some(node)) = service.store.get_node(node_id) else {
+        return;
+    };
+    if node.substrate != SubstrateKind::Local {
+        let _ = socket
+            .send(Message::Text(
+                "asylum.observe.ws.live_stream_unavailable".into(),
+            ))
+            .await;
+        return;
+    }
+
+    let Ok(mut output) = service.local_substrate.attach(node_id).await else {
+        return;
+    };
+    loop {
+        match output.recv().await {
+            Ok(chunk) => {
+                if socket.send(Message::Text(chunk.into())).await.is_err() {
+                    break;
+                }
+            }
+            Err(RecvError::Lagged(_)) => continue,
+            Err(_) => break,
+        }
+    }
 }
 
 pub async fn api_harnesses(
@@ -411,9 +473,9 @@ pub async fn api_notification_read(
 }
 
 pub async fn api_remote_commands(
-    Extension(_state): Extension<Arc<AppState>>,
+    Extension(state): Extension<Arc<AppState>>,
     Json(payload): Json<serde_json::Value>,
-) -> StatusCode {
+) -> Result<Json<asylum_core::api::RemoteCommandResponse>, AppError> {
     let raw = payload
         .get("command")
         .and_then(serde_json::Value::as_str)
@@ -421,7 +483,7 @@ pub async fn api_remote_commands(
         .unwrap_or("");
     let command = match parse_remote_command(raw) {
         Ok(command) => command,
-        Err(_) => return StatusCode::BAD_REQUEST,
+        Err(error) => return Err(AppError::new(StatusCode::BAD_REQUEST, error.to_string())),
     };
 
     let has_required_node_id = matches!(
@@ -433,11 +495,27 @@ pub async fn api_remote_commands(
     ) && command.node_id.is_none();
 
     if has_required_node_id {
-        return StatusCode::BAD_REQUEST;
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "command requires node",
+        ));
     }
 
-    let _ = command.args;
-    StatusCode::OK
+    let token_id = state
+        .service
+        .token_id_for_raw(&command.token, true)
+        .map_err(|error| AppError::new(StatusCode::UNAUTHORIZED, error.to_string()))?;
+    let token_id = match token_id {
+        Some(token_id) => Some(token_id),
+        None => return Err(AppError::new(StatusCode::UNAUTHORIZED, "invalid token")),
+    };
+
+    let response = state
+        .service
+        .execute_remote_command(token_id, command)
+        .await
+        .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(response))
 }
 
 pub async fn api_attach_page(
@@ -458,13 +536,214 @@ pub async fn api_attach_ws(
     Path(token): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if state.service.verify_attach_token(&token).is_err() {
-        return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+    let attach_record = match state.service.verify_attach_token(&token) {
+        Ok(record) => record,
+        Err(error) => {
+            return (StatusCode::UNAUTHORIZED, error.to_string()).into_response();
+        }
+    };
+
+    let node = match state.service.store.get_node(attach_record.node_id) {
+        Ok(Some(node)) => node,
+        Ok(None) => return (StatusCode::NOT_FOUND, "node not found").into_response(),
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    };
+    match node.substrate {
+        SubstrateKind::Local => {
+            ws.on_upgrade(move |socket| handle_attach_ws(socket, state.service.clone(), node.id))
+        }
+        SubstrateKind::Loon => {
+            let external_id = match node.external_id.as_deref() {
+                Some(value) => value.to_string(),
+                None => {
+                    return (StatusCode::BAD_REQUEST, "missing loon external id").into_response()
+                }
+            };
+            let loon = match state.service.loon_substrate.as_ref() {
+                Some(loon) => loon.clone(),
+                None => {
+                    return (StatusCode::BAD_REQUEST, "loon substrate unavailable").into_response()
+                }
+            };
+            let (command, args, env) = loon.attach_invocation(&external_id);
+            ws.on_upgrade(move |socket| handle_command_attach_ws(socket, command, args, env))
+        }
     }
-    ws.on_upgrade(handle_attach_ws)
 }
 
-async fn handle_attach_ws(_socket: WebSocket) {}
+async fn handle_attach_ws(
+    mut socket: WebSocket,
+    service: crate::capability_service::CapabilityService,
+    node_id: Uuid,
+) {
+    let output = match service.local_substrate.attach(node_id).await {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            let _ = socket
+                .send(Message::Text(format!("attach failed: {error}").into()))
+                .await;
+            return;
+        }
+    };
+
+    let (mut send, mut recv) = socket.split();
+    let mut output = output;
+
+    loop {
+        tokio::select! {
+            inbound = recv.next() => match inbound {
+                Some(Ok(Message::Text(text))) => {
+                    if let Err(error) = service.local_substrate.send_input_raw(node_id, &text).await {
+                        let _ = send
+                            .send(Message::Text(format!("input failed: {error}").into()))
+                            .await;
+                    }
+                }
+                Some(Ok(Message::Binary(bytes))) => {
+                    match String::from_utf8(bytes.to_vec()) {
+                        Ok(text) => {
+                            if let Err(error) = service.local_substrate.send_input_raw(node_id, &text).await {
+                                let _ = send
+                                    .send(Message::Text(format!("input failed: {error}").into()))
+                                    .await;
+                            }
+                        }
+                        Err(_) => {
+                            let _ = send
+                                .send(Message::Text(
+                                    "binary input must be valid UTF-8 for this interface".into(),
+                                ))
+                                .await;
+                        }
+                    }
+                }
+                Some(Ok(Message::Close(_))) => break,
+                Some(Ok(Message::Ping(payload))) => {
+                    let _ = send.send(Message::Pong(payload)).await;
+                }
+                Some(Ok(_)) | Some(Err(_)) | None => break,
+            },
+            output_chunk = output.recv() => match output_chunk {
+                Ok(chunk) => {
+                    if send.send(Message::Text(chunk.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            },
+        }
+    }
+}
+
+async fn handle_command_attach_ws(
+    socket: WebSocket,
+    command: std::path::PathBuf,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+) {
+    let pty = match native_pty_system().openpty(PtySize::default()) {
+        Ok(pty) => pty,
+        Err(error) => {
+            send_attach_setup_error(socket, format!("attach failed: {error}")).await;
+            return;
+        }
+    };
+    let mut builder = CommandBuilder::new(command);
+    for arg in args {
+        builder.arg(arg);
+    }
+    for (key, value) in env {
+        builder.env(key, value);
+    }
+    let child = match pty.slave.spawn_command(builder) {
+        Ok(child) => child,
+        Err(error) => {
+            send_attach_setup_error(socket, format!("attach failed: {error}")).await;
+            return;
+        }
+    };
+    let mut reader = match pty.master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            send_attach_setup_error(socket, format!("attach failed: {error}")).await;
+            return;
+        }
+    };
+    let writer = match pty.master.take_writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            send_attach_setup_error(socket, format!("attach failed: {error}")).await;
+            return;
+        }
+    };
+
+    let writer = Arc::new(Mutex::new(writer));
+    let (output_tx, mut output_rx) = mpsc::channel::<String>(128);
+    tokio::task::spawn_blocking(move || {
+        let mut child = child;
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(size) => {
+                    let chunk = String::from_utf8_lossy(&buffer[..size]).to_string();
+                    if output_tx.blocking_send(chunk).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = child.wait();
+    });
+
+    let (mut send, mut recv) = socket.split();
+    loop {
+        tokio::select! {
+            inbound = recv.next() => match inbound {
+                Some(Ok(Message::Text(text))) => {
+                    if write_attach_input(writer.clone(), text.as_bytes()).await.is_err() {
+                        let _ = send.send(Message::Text("input failed".into())).await;
+                    }
+                }
+                Some(Ok(Message::Binary(bytes))) => {
+                    if write_attach_input(writer.clone(), &bytes).await.is_err() {
+                        let _ = send.send(Message::Text("input failed".into())).await;
+                    }
+                }
+                Some(Ok(Message::Close(_))) => break,
+                Some(Ok(Message::Ping(payload))) => {
+                    let _ = send.send(Message::Pong(payload)).await;
+                }
+                Some(Ok(_)) | Some(Err(_)) | None => break,
+            },
+            output = output_rx.recv() => match output {
+                Some(chunk) => {
+                    if send.send(Message::Text(chunk.into())).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            },
+        }
+    }
+}
+
+async fn send_attach_setup_error(mut socket: WebSocket, message: String) {
+    let _ = socket.send(Message::Text(message.into())).await;
+}
+
+async fn write_attach_input(
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let mut writer = writer.lock().await;
+    writer.write_all(bytes)?;
+    writer.flush()
+}
 
 #[derive(Deserialize)]
 struct NotifySendRequest {

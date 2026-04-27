@@ -13,6 +13,21 @@ pub enum RemoteCommandKind {
     DenyDecision,
 }
 
+impl RemoteCommandKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RemoteCommandKind::Status => "status",
+            RemoteCommandKind::Attach => "attach",
+            RemoteCommandKind::SendInput => "send",
+            RemoteCommandKind::Start => "start",
+            RemoteCommandKind::Interrupt => "interrupt",
+            RemoteCommandKind::Stop => "stop",
+            RemoteCommandKind::ApproveDecision => "approve",
+            RemoteCommandKind::DenyDecision => "deny",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ParsedRemoteCommand {
     pub kind: RemoteCommandKind,

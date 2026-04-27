@@ -50,7 +50,9 @@ export const AttachTerminal: FC<AttachTerminalProps> = ({ token, onClose }) => {
     });
 
     terminal.onData((data) => {
-      socket.send(data);
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(data);
+      }
     });
 
     const resizeObserver = new ResizeObserver(() => {

@@ -615,6 +615,35 @@ impl Store {
         Ok(())
     }
 
+    pub fn update_remote_command_status(
+        &self,
+        id: Uuid,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE remote_commands
+                SET status = ?1, error = ?2, updated_at = ?3
+                WHERE id = ?4",
+            params![status, error, now, id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn resolve_decision(&self, id: &str, status: &str) -> Result<bool> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let conn = self.conn()?;
+        let affected = conn.execute(
+            "UPDATE decisions
+                SET status = ?1, decided_at = ?2
+                WHERE id = ?3",
+            params![status, now, id],
+        )?;
+        Ok(affected > 0)
+    }
+
     pub fn mark_notification_read(&self, id: i64) -> Result<()> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let conn = self.conn()?;

@@ -134,9 +134,6 @@ export const CommandCenter: FC<CommandCenterProps> = ({ nodes, selectedNodeId, o
               <Send size={14} /> Send
             </button>
           </div>
-          <p className="micro">
-            Backend endpoint: <code>/api/nodes/{commandCenter.id}/input</code>
-          </p>
         </>
       )}
     </section>

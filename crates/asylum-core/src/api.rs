@@ -188,6 +188,14 @@ pub fn map_graph(nodes: Vec<NodeRecord>, relationships: Vec<RelationshipRecord>)
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RemoteCommandResponse {
+    pub kind: String,
+    pub status: String,
+    pub node_id: Option<String>,
+    pub result: serde_json::Value,
+}
+
 impl NodeLiveness {
     pub fn is_terminal(&self) -> bool {
         matches!(

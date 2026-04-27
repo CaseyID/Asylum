@@ -1,5 +1,13 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { fetchGraph, fetchNotifications, graphToFlow, type NotificationRecord } from "./api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ApiError,
+  fetchGraph,
+  fetchNotifications,
+  graphToFlow,
+  hydrateOwnerTokenFromLocation,
+  setStoredOwnerToken,
+  type NotificationRecord,
+} from "./api";
 import { isOperational, selectCommandCenter, useCockpitStore } from "./state";
 import { CommandCenter } from "./components/CommandCenter";
 import { CreateNodePanel } from "./components/CreateNodePanel";
@@ -25,6 +33,10 @@ export const App = () => {
   const [notifications, setNotifications] = useState<NotificationRecord[]>([]);
   const [localError, setLocalError] = useState<string | null>(null);
   const [warning, setWarning] = useState<string | undefined>();
+  const [ownerToken, setOwnerToken] = useState("");
+  const [tokenDraft, setTokenDraft] = useState("");
+  const [authRequired, setAuthRequired] = useState(false);
+  const refreshInFlight = useRef(false);
 
   const graphData = useMemo(() => graphToFlow(graph), [graph]);
   const [refreshing, setRefreshing] = useState(false);
@@ -43,7 +55,8 @@ export const App = () => {
   );
 
   const refreshAll = useCallback(async () => {
-    if (refreshing) return;
+    if (refreshInFlight.current) return;
+    refreshInFlight.current = true;
     setRefreshing(true);
     try {
       const [fetchedGraph, fetchedNotifications] = await Promise.all([fetchGraph(), fetchNotifications()]);
@@ -56,6 +69,7 @@ export const App = () => {
       setNotifications(fetchedNotifications);
       setCommandCenterSelection(commandCenter?.id);
       setLocalError(null);
+      setAuthRequired(false);
       setWarning(
         fetchedGraph.nodes.some((node) => !isOperational(node))
           ? "Some nodes are not operational; check liveness."
@@ -63,20 +77,39 @@ export const App = () => {
       );
     } catch (err) {
       initializeGraph({ nodes: [], relationships: [] });
-      setLocalError(`Backend unavailable: ${String(err instanceof Error ? err.message : err)}`);
+      const needsAuth = err instanceof ApiError && err.status === 401;
+      setAuthRequired(needsAuth);
+      setLocalError(needsAuth ? null : `Backend unavailable: ${String(err instanceof Error ? err.message : err)}`);
     } finally {
+      refreshInFlight.current = false;
       setRefreshing(false);
     }
-  }, [initializeGraph, setCommandCenterSelection, refreshing]);
+  }, [initializeGraph, setCommandCenterSelection]);
 
   useEffect(() => {
+    const token = hydrateOwnerTokenFromLocation();
+    setOwnerToken(token);
+    setTokenDraft(token);
     void refreshAll();
 
     const timer = setInterval(() => {
       void refreshAll();
     }, 6000);
     return () => clearInterval(timer);
-  }, []);
+  }, [refreshAll]);
+
+  const saveOwnerToken = () => {
+    setStoredOwnerToken(tokenDraft);
+    setOwnerToken(tokenDraft.trim());
+    void refreshAll();
+  };
+
+  const clearOwnerToken = () => {
+    setStoredOwnerToken("");
+    setOwnerToken("");
+    setTokenDraft("");
+    setAuthRequired(true);
+  };
 
   useEffect(() => {
     const commandCenter = selectCommandCenter(graph.nodes);
@@ -101,10 +134,32 @@ export const App = () => {
           <span><strong>{graph.relationships.length}</strong> edges</span>
           <span><strong>{substrateCount}</strong> substrates</span>
         </div>
+        <div className="auth-control" data-state={ownerToken ? "stored" : "empty"}>
+          <input
+            type="password"
+            value={tokenDraft}
+            onChange={(event) => setTokenDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                saveOwnerToken();
+              }
+            }}
+            placeholder={authRequired ? "owner token required" : "owner token"}
+            aria-label="Owner token"
+          />
+          <button type="button" onClick={saveOwnerToken}>
+            Unlock
+          </button>
+          {ownerToken ? (
+            <button type="button" className="ghost-btn" onClick={clearOwnerToken}>
+              Clear
+            </button>
+          ) : null}
+        </div>
       </header>
       <section className="operational-grid">
         <aside className="left-toolbar">
-          <CreateNodePanel onCreated={() => void refreshAll()} />
+          <CreateNodePanel key={ownerToken ? "authed" : "open"} onCreated={() => void refreshAll()} />
           <NotificationCenter notifications={notifications} onRefresh={refreshAll} />
           <section className="panel">
             <h3>Exposure</h3>

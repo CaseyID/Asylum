@@ -18,10 +18,9 @@ body {
   background:
     linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
     linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
-    radial-gradient(circle at 18% 0%, rgba(87, 198, 255, 0.12), transparent 34%),
-    radial-gradient(circle at 100% 18%, rgba(116, 255, 172, 0.08), transparent 28%),
+    linear-gradient(180deg, rgba(17, 27, 38, 0.72), rgba(5, 7, 10, 0.92) 34%, #05070a),
     #05070a;
-  background-size: 24px 24px, 24px 24px, auto, auto, auto;
+  background-size: 24px 24px, 24px 24px, auto, auto;
   color: #eef4ff;
 }
 
@@ -110,9 +109,9 @@ code,
 }
 
 .top-strip {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(190px, 1fr) auto minmax(250px, 360px);
   align-items: center;
-  justify-content: space-between;
   gap: 1rem;
   border: 1px solid #1c2633;
   background: rgba(7, 10, 15, 0.92);
@@ -154,6 +153,23 @@ code,
   color: #f7fbff;
   font-size: 1rem;
   line-height: 1;
+}
+
+.auth-control {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) auto auto;
+  gap: 0.38rem;
+  align-items: center;
+}
+
+.auth-control input {
+  min-width: 0;
+  border-color: #1d2a38;
+  background: #04070b;
+}
+
+.auth-control[data-state="stored"] input {
+  border-color: #2f5d49;
 }
 
 .operational-grid {
@@ -393,6 +409,12 @@ code,
   display: none;
 }
 
+.status-note {
+  margin: 0.55rem 0 0;
+  color: #9fb0c0;
+  font-size: 0.74rem;
+}
+
 .inline-action-row,
 .relationship-row,
 .panel-header {
@@ -463,6 +485,40 @@ code,
 
 .status-log p {
   margin: 0 0 0.28rem;
+}
+
+.relationship-list {
+  border-top: 1px solid #172231;
+  padding-top: 0.55rem;
+}
+
+.relationship-list p {
+  margin: 0 0 0.42rem;
+  color: #c8d5e3;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.relationship-list ul {
+  display: grid;
+  gap: 0.38rem;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.relationship-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.4rem;
+  align-items: center;
+  border: 1px solid #1e2a39;
+  border-radius: 6px;
+  padding: 0.42rem;
+  background: #080d13;
+  color: #aab7c6;
+  font-size: 0.7rem;
+  overflow-wrap: anywhere;
 }
 
 .notification-body {
@@ -610,6 +666,14 @@ code,
 }
 
 @media (max-width: 1180px) {
+  .top-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .auth-control {
+    width: 100%;
+  }
+
   .operational-grid {
     grid-template-columns: 290px 1fr;
     grid-template-rows: minmax(420px, 1fr) 360px;
@@ -636,7 +700,6 @@ code,
 
   .top-strip {
     align-items: flex-start;
-    flex-direction: column;
   }
 
   .top-metrics {
@@ -647,6 +710,15 @@ code,
   .operational-grid {
     grid-template-columns: 1fr;
     grid-template-rows: minmax(430px, 58vh) auto auto;
+  }
+
+  .auth-control {
+    grid-template-columns: 1fr auto;
+  }
+
+  .auth-control .ghost-btn {
+    grid-column: 1 / -1;
+    width: 100%;
   }
 
   .left-toolbar,
