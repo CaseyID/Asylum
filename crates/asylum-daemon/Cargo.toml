@@ -1,0 +1,30 @@
+[package]
+name = "asylum-daemon"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+asylum-core = { path = "../asylum-core" }
+axum.workspace = true
+futures.workspace = true
+portable-pty.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+url.workspace = true
+serde_with.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

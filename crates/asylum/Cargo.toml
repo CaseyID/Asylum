@@ -1,0 +1,17 @@
+[package]
+name = "asylum"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+asylum-core = { path = "../asylum-core" }
+asylum-daemon = { path = "../asylum-daemon" }
+clap.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+uuid.workspace = true
