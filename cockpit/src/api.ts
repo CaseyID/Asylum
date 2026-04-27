@@ -1,110 +1,31 @@
-import { Edge, type Node } from "@xyflow/react";
+// asylum cockpit — daemon api client
 
-export type HarnessKind = "codex" | "claude_code";
-export type SubstrateKind = "local" | "loon";
-export type NodeLiveness =
-  | "starting"
-  | "running"
-  | "waiting_for_input"
-  | "exited"
-  | "stopped"
-  | "failed"
-  | "archived";
-
-export interface CapabilitySnapshot {
-  browser_attach: boolean;
-  native_attach: boolean;
-  send_input: boolean;
-  interrupt: boolean;
-  stop: boolean;
-  resume: boolean;
-  structured_events: boolean;
-  transcript_export: boolean;
-}
-
-export interface AsylumNode {
-  [key: string]: unknown;
-  id: string;
-  harness: HarnessKind;
-  substrate: SubstrateKind;
-  role_hint: string;
-  liveness: NodeLiveness;
-  workspace: string | null;
-  description: string;
-  created_at: string;
-  updated_at: string;
-  external_id: string | null;
-  capabilities: CapabilitySnapshot;
-  output_preview?: string;
-}
-
-export interface GraphRelationship {
-  id: string;
-  source_node_id: string;
-  target_node_id: string;
-  kind: string;
-  label?: string | null;
-}
-
-export interface GraphResponse {
-  nodes: AsylumNode[];
-  relationships: GraphRelationship[];
-}
-
-export interface NodeListResponse {
-  nodes: AsylumNode[];
-}
-
-export interface NotificationRecord {
-  id: string;
-  node_id: string | null;
-  title: string;
-  body: string;
-  severity: "info" | "warn" | "error" | string;
-  created_at: string;
-  read: boolean;
-}
-
-export interface CreateNodeRequest {
-  harness: HarnessKind;
-  substrate: SubstrateKind;
-  role_hint: string;
-  workspace?: string;
-  description?: string;
-}
-
-export interface RelationshipCreateRequest {
-  source_node_id: string;
-  target_node_id: string;
-  kind: string;
-}
-
-export interface RelationshipResponse {
-  id: string;
-  source_node_id: string;
-  target_node_id: string;
-  kind: string;
-}
-
-export interface OptionListResponse<T extends string = string> {
-  items: T[];
-}
-
-export interface AttachBrowserResponse {
-  token?: string;
-  attach_url: string;
-}
-
-export interface NativeTargetResponse {
-  command: string;
-  args: string[];
-  env: Record<string, string>;
-}
-
-export interface GraphFlow {
-  nodes: Node<{ node: AsylumNode; label: string; status: NodeLiveness } & Record<string, unknown>>[];
-  edges: Edge[];
-}
+import type {
+  AsylumNode,
+  AttachBrowserResponse,
+  ChannelCreateRequest,
+  ChannelDescriptor,
+  ChannelInboundRequest,
+  ChannelMessageRecord,
+  ChannelTestRequest,
+  ChannelUpdateRequest,
+  CreateNodeRequest,
+  ForkNodeRequest,
+  GraphResponse,
+  HarnessDescriptor,
+  HarnessKind,
+  HookCreateRequest,
+  HookEventCatalogEntry,
+  HookFiringRecord,
+  HookRule,
+  HookUpdateRequest,
+  NativeTargetResponse,
+  NotificationRecord,
+  RecipeDescriptor,
+  RecipeSpawnRequest,
+  SubstrateDescriptor,
+  SubstrateKind,
+} from "./types";
 
 const BASE = "/api";
 const AUTH_TOKEN_KEY = "asylum.ownerToken";
@@ -154,15 +75,12 @@ export function hydrateOwnerTokenFromLocation(): string {
 }
 
 async function parseResponseBody<T>(res: Response): Promise<T> {
-  if (res.status === 204) {
-    return undefined as T;
-  }
+  if (res.status === 204) return undefined as T;
   if (!res.ok) {
     const body = await res.text();
     throw new ApiError(res.status, res.statusText, body);
   }
-  const data = (await res.json()) as T;
-  return data;
+  return (await res.json()) as T;
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -181,10 +99,19 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 export async function fetchGraph(): Promise<GraphResponse> {
   const data = await request<GraphResponse | { graph: GraphResponse }>("/graph");
-  if ("graph" in data) {
-    return data.graph;
-  }
+  if ("graph" in data) return data.graph;
   return data;
+}
+
+export async function fetchNodes(): Promise<AsylumNode[]> {
+  const data = await request<{ nodes: AsylumNode[] } | AsylumNode[]>("/nodes");
+  if (Array.isArray(data)) return data;
+  return data.nodes ?? [];
+}
+
+export async function fetchNode(id: string): Promise<AsylumNode> {
+  const data = await request<AsylumNode | { node: AsylumNode }>(`/nodes/${id}`);
+  return "node" in (data as object) ? (data as { node: AsylumNode }).node : (data as AsylumNode);
 }
 
 export async function fetchNotifications(): Promise<NotificationRecord[]> {
@@ -207,48 +134,41 @@ export async function fetchNotifications(): Promise<NotificationRecord[]> {
 }
 
 export async function fetchHarnesses(): Promise<HarnessKind[]> {
-  const data = await request<OptionListResponse<HarnessKind> | HarnessKind[]>("/harnesses");
+  const data = await request<{ items: HarnessKind[] } | HarnessKind[]>("/harnesses");
   return Array.isArray(data) ? data : data.items;
 }
 
 export async function fetchSubstrates(): Promise<SubstrateKind[]> {
-  const data = await request<OptionListResponse<SubstrateKind> | SubstrateKind[]>("/substrates");
+  const data = await request<{ items: SubstrateKind[] } | SubstrateKind[]>("/substrates");
   return Array.isArray(data) ? data : data.items;
+}
+
+export async function fetchHarnessDescriptors(): Promise<HarnessDescriptor[]> {
+  const data = await request<{ harnesses: HarnessDescriptor[] }>("/harness-descriptors");
+  return data.harnesses;
+}
+
+export async function fetchSubstrateDescriptors(): Promise<SubstrateDescriptor[]> {
+  const data = await request<{ substrates: SubstrateDescriptor[] }>("/substrate-descriptors");
+  return data.substrates;
+}
+
+export async function fetchSystemMap(): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>("/context/system-map");
 }
 
 export async function markNotificationRead(id: string): Promise<void> {
   await request<void>(`/notifications/${id}/read`, { method: "POST" });
 }
 
-export async function fetchNode(id: string): Promise<AsylumNode> {
-  const data = await request<AsylumNode | { node: AsylumNode }>(`/nodes/${id}`);
-  const maybeWrapped = data as { node?: AsylumNode };
-  if (maybeWrapped.node) {
-    return maybeWrapped.node;
-  }
-  return data as AsylumNode;
-}
-
-export async function fetchNodes(): Promise<AsylumNode[]> {
-  const data = await request<GraphResponse | NodeListResponse | AsylumNode[]>("/nodes");
-  if ("nodes" in (data as object)) {
-    return (data as NodeListResponse).nodes ?? [];
-  }
-  return (data as AsylumNode[]) || [];
-}
-
-export async function createNode(requestBody: CreateNodeRequest): Promise<AsylumNode> {
-  const payload = {
-    ...requestBody,
-    role_hint: requestBody.role_hint.trim() || "worker",
-  };
+export async function createNode(payload: CreateNodeRequest): Promise<AsylumNode> {
+  const body = { ...payload, role_hint: payload.role_hint.trim() || "worker" };
   const created = await request<AsylumNode | { node_id: string }>("/nodes", {
     method: "POST",
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
   });
-  const maybeCreated = created as { node_id?: string };
-  if (maybeCreated.node_id) {
-    return fetchNode(maybeCreated.node_id);
+  if ("node_id" in (created as object)) {
+    return fetchNode((created as { node_id: string }).node_id);
   }
   return created as AsylumNode;
 }
@@ -258,15 +178,13 @@ async function fallbackPostNodeAction(
   action: "interrupt" | "stop" | "archive" | "resume",
   body?: Jsonish,
 ): Promise<void> {
-  const primaryPath = `/nodes/${nodeId}/${action}`;
+  const primary = `/nodes/${nodeId}/${action}`;
   try {
-    await request<void>(primaryPath, { method: "POST", body: JSON.stringify(body ?? {}) });
+    await request<void>(primary, { method: "POST", body: JSON.stringify(body ?? {}) });
     return;
   } catch (err) {
     const message = String((err as Error).message);
-    if (!message.startsWith("404")) {
-      throw err;
-    }
+    if (!message.startsWith("404")) throw err;
   }
   return request<void>(`/${action}`, {
     method: "POST",
@@ -281,89 +199,189 @@ export async function postNodeInput(nodeId: string, input: string): Promise<void
   });
 }
 
-export async function interruptNode(nodeId: string): Promise<void> {
-  return fallbackPostNodeAction(nodeId, "interrupt");
-}
-
-export async function stopNode(nodeId: string): Promise<void> {
-  return fallbackPostNodeAction(nodeId, "stop");
-}
-
-export async function archiveNode(nodeId: string): Promise<void> {
-  return fallbackPostNodeAction(nodeId, "archive");
-}
-
-export async function resumeNode(nodeId: string): Promise<void> {
-  return fallbackPostNodeAction(nodeId, "resume");
-}
+export const interruptNode = (id: string) => fallbackPostNodeAction(id, "interrupt");
+export const stopNode = (id: string) => fallbackPostNodeAction(id, "stop");
+export const archiveNode = (id: string) => fallbackPostNodeAction(id, "archive");
+export const resumeNode = (id: string) => fallbackPostNodeAction(id, "resume");
 
 export async function requestBrowserAttach(nodeId: string): Promise<AttachBrowserResponse> {
-  const data = await request<AttachBrowserResponse | { url: string; expires_in_seconds: number }>(`/nodes/${nodeId}/attach/browser`, {
-    method: "POST",
-  });
+  const data = await request<AttachBrowserResponse | { url: string; expires_in_seconds: number }>(
+    `/nodes/${nodeId}/attach/browser`,
+    { method: "POST" },
+  );
   if ("url" in data) {
     const token = data.url.split("/attach/")[1]?.split(/[/?#]/)[0];
-    return { attach_url: data.url, token };
+    return { attach_url: data.url, token, expires_in_seconds: data.expires_in_seconds };
   }
   return data;
 }
 
 export async function requestNativeTarget(nodeId: string): Promise<NativeTargetResponse> {
-  const data = await request<NativeTargetResponse | { command: string; args: string[]; environment: Record<string, string> }>(`/nodes/${nodeId}/attach/native-target`, {
-    method: "POST",
-  });
+  const data = await request<
+    NativeTargetResponse | { command: string; args: string[]; environment: Record<string, string>; label?: string }
+  >(`/nodes/${nodeId}/attach/native-target`, { method: "POST" });
   if ("environment" in data) {
-    return { command: data.command, args: data.args, env: data.environment };
+    return { command: data.command, args: data.args, env: data.environment, label: data.label };
   }
   return data;
 }
 
-export async function createRelationship(requestBody: RelationshipCreateRequest): Promise<RelationshipResponse> {
-  return request<RelationshipResponse>("/relationships", {
+export async function fetchNodeEvents(nodeId: string): Promise<unknown[]> {
+  const data = await request<{ events: unknown[] } | unknown[]>(`/nodes/${nodeId}/events`);
+  return Array.isArray(data) ? data : data.events;
+}
+
+export async function notifySend(payload: { topic?: string; title: string; body: string }): Promise<unknown> {
+  return request<unknown>("/notify/send", { method: "POST", body: JSON.stringify(payload) });
+}
+
+// — channels —
+
+export async function fetchChannels(): Promise<ChannelDescriptor[]> {
+  const data = await request<{ channels: ChannelDescriptor[] } | ChannelDescriptor[]>("/channels");
+  return Array.isArray(data) ? data : data.channels ?? [];
+}
+
+export async function createChannel(req: ChannelCreateRequest): Promise<ChannelDescriptor> {
+  return request<ChannelDescriptor>("/channels", {
     method: "POST",
-    body: JSON.stringify(requestBody),
+    body: JSON.stringify(req),
   });
 }
 
-export async function deleteRelationship(id: string): Promise<void> {
-  return request<void>(`/relationships/${id}`, { method: "DELETE" });
+export async function getChannel(id: string): Promise<ChannelDescriptor> {
+  return request<ChannelDescriptor>(`/channels/${id}`);
 }
 
-export function graphToFlow(graph: GraphResponse): GraphFlow {
-  const rows = 160;
-  const cols = Math.max(1, Math.min(5, Math.ceil(Math.sqrt(graph.nodes.length || 1))));
-  const byId = new Map(graph.nodes.map((node) => [node.id, node]));
-
-  const flowNodes: Node<{ node: AsylumNode; label: string; status: NodeLiveness } & Record<string, unknown>>[] = graph.nodes.map(
-    (node, index) => {
-    const x = (index % cols) * 260;
-    const y = Math.floor(index / cols) * rows;
-    return {
-      id: node.id,
-      type: "asylum",
-      position: { x, y },
-      data: {
-        node,
-        label: `${node.role_hint} (${node.harness}/${node.substrate})`,
-        status: node.liveness,
-      },
-      selectable: true,
-    };
+export async function updateChannel(id: string, req: ChannelUpdateRequest): Promise<ChannelDescriptor> {
+  return request<ChannelDescriptor>(`/channels/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(req),
   });
+}
 
-  const edges: Edge[] = graph.relationships
-    .filter((edge) => byId.has(edge.source_node_id) && byId.has(edge.target_node_id))
-    .map((edge) => ({
-      id: edge.id,
-      source: edge.source_node_id,
-      target: edge.target_node_id,
-      label: edge.kind,
-      labelBgPadding: [6, 3] as [number, number],
-      labelBgBorderRadius: 4,
-      labelBgStyle: { fill: "#05080c", fillOpacity: 0.95 },
-      labelStyle: { fill: "#c8d5e3", fontSize: 11, fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" },
-      style: { stroke: "#4d667e", strokeWidth: 1.4 },
-    }));
+export async function deleteChannel(id: string): Promise<void> {
+  await request<void>(`/channels/${id}`, { method: "DELETE" });
+}
 
-  return { nodes: flowNodes, edges };
+export async function fetchChannelMessages(id: string, limit = 200): Promise<ChannelMessageRecord[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  const data = await request<{ messages: ChannelMessageRecord[] } | ChannelMessageRecord[]>(
+    `/channels/${id}/messages?${params.toString()}`,
+  );
+  return Array.isArray(data) ? data : data.messages ?? [];
+}
+
+export async function testChannel(id: string, body: ChannelTestRequest): Promise<{ sent: boolean }> {
+  return request<{ sent: boolean }>(`/channels/${id}/test`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function inboundChannel(id: string, body: ChannelInboundRequest): Promise<void> {
+  await request<void>(`/channels/${id}/inbound`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+// — hooks —
+
+export async function fetchHooks(): Promise<HookRule[]> {
+  const data = await request<{ hooks: HookRule[] } | HookRule[]>("/hooks");
+  return Array.isArray(data) ? data : data.hooks ?? [];
+}
+
+export async function createHook(req: HookCreateRequest): Promise<HookRule> {
+  return request<HookRule>("/hooks", {
+    method: "POST",
+    body: JSON.stringify(req),
+  });
+}
+
+export async function updateHook(id: string, req: HookUpdateRequest): Promise<HookRule> {
+  return request<HookRule>(`/hooks/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(req),
+  });
+}
+
+export async function deleteHook(id: string): Promise<void> {
+  await request<void>(`/hooks/${id}`, { method: "DELETE" });
+}
+
+export async function fetchHookFirings(limit = 200): Promise<HookFiringRecord[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  const data = await request<{ firings: HookFiringRecord[] } | HookFiringRecord[]>(
+    `/hooks/firings?${params.toString()}`,
+  );
+  return Array.isArray(data) ? data : data.firings ?? [];
+}
+
+export async function fetchHookEvents(): Promise<HookEventCatalogEntry[]> {
+  const data = await request<{ events: HookEventCatalogEntry[] } | HookEventCatalogEntry[]>("/hooks/events");
+  return Array.isArray(data) ? data : data.events ?? [];
+}
+
+export async function dryRunHook(id: string): Promise<HookFiringRecord> {
+  const data = await request<{ firing: HookFiringRecord } | HookFiringRecord>(`/hooks/${id}/test`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  return "firing" in (data as object)
+    ? (data as { firing: HookFiringRecord }).firing
+    : (data as HookFiringRecord);
+}
+
+// — recipes —
+
+export async function fetchRecipes(): Promise<RecipeDescriptor[]> {
+  const data = await request<{ recipes: RecipeDescriptor[] } | RecipeDescriptor[]>("/recipes");
+  return Array.isArray(data) ? data : data.recipes ?? [];
+}
+
+export async function spawnRecipe(id: string, req: RecipeSpawnRequest): Promise<string[]> {
+  const data = await request<{ node_ids: string[] } | string[]>(`/recipes/${id}/spawn`, {
+    method: "POST",
+    body: JSON.stringify(req),
+  });
+  return Array.isArray(data) ? data : data.node_ids ?? [];
+}
+
+// — fork —
+
+export async function forkNode(id: string, req: ForkNodeRequest = {}): Promise<AsylumNode> {
+  const data = await request<AsylumNode | { node: AsylumNode }>(`/nodes/${id}/fork`, {
+    method: "POST",
+    body: JSON.stringify(req),
+  });
+  return "node" in (data as object) ? (data as { node: AsylumNode }).node : (data as AsylumNode);
+}
+
+// — observe websocket —
+
+export interface ObserveSocketOptions {
+  onMessage?: (data: string) => void;
+  onError?: (e: Event) => void;
+  onClose?: () => void;
+  onOpen?: () => void;
+}
+
+export function openNodeObserveSocket(nodeId: string, options: ObserveSocketOptions = {}): WebSocket {
+  // the daemon's auth middleware reads bearer headers; since the browser WS API cannot set headers, we pass the token via ?token= for ws upgrades
+  const proto = typeof window !== "undefined" && window.location.protocol === "https:" ? "wss" : "ws";
+  const host = typeof window !== "undefined" ? window.location.host : "";
+  const token = getStoredOwnerToken();
+  const url = `${proto}://${host}/api/nodes/${nodeId}/observe/ws?token=${encodeURIComponent(token)}`;
+  const ws = new WebSocket(url);
+  if (options.onOpen) ws.addEventListener("open", () => options.onOpen!());
+  if (options.onMessage) {
+    ws.addEventListener("message", (event: MessageEvent) => {
+      options.onMessage!(event.data as string);
+    });
+  }
+  if (options.onError) ws.addEventListener("error", (e: Event) => options.onError!(e));
+  if (options.onClose) ws.addEventListener("close", () => options.onClose!());
+  return ws;
 }

@@ -1,5 +1,12 @@
+// asylum cockpit — zustand store for graph + selection state.
+//
+// the daemon exposes a single graph snapshot at /api/graph; this store keeps
+// a copy plus the operator's current selection.  ui-only state (current
+// screen, command palette open, theme tweak) lives in App.tsx as react state
+// — the store is for daemon-derived values that multiple screens read.
+
 import { create } from "zustand";
-import { type AsylumNode, type GraphResponse } from "./api";
+import type { AsylumNode, GraphResponse } from "./types";
 
 export interface CockpitState {
   graph: GraphResponse;
@@ -17,7 +24,9 @@ export const useCockpitStore = create<CockpitState>((set, get) => ({
   initializeGraph(graph) {
     const commandCenter = selectCommandCenter(graph.nodes);
     const existing = get().selectedNodeId;
-    const selectedNodeId = graph.nodes.some((node) => node.id === existing) ? existing : commandCenter?.id ?? graph.nodes[0]?.id;
+    const selectedNodeId = graph.nodes.some((node) => node.id === existing)
+      ? existing
+      : commandCenter?.id ?? graph.nodes[0]?.id;
     set({
       graph,
       loading: false,
@@ -39,13 +48,13 @@ export interface NodeSelectorItem {
   liveness: AsylumNode["liveness"];
 }
 
-export function selectCommandCenter(nodes: readonly NodeSelectorItem[]): NodeSelectorItem | undefined {
+export function selectCommandCenter(
+  nodes: readonly NodeSelectorItem[],
+): NodeSelectorItem | undefined {
   return (
-    nodes.find(
-      (node) => node.role_hint === "command-center" && node.liveness === "running",
-    ) ??
-    nodes.find((node) => node.role_hint === "command-center") ??
-    nodes.find((node) => node.liveness === "running")
+    nodes.find((n) => n.role_hint === "command-center" && n.liveness === "running") ??
+    nodes.find((n) => n.role_hint === "command-center") ??
+    nodes.find((n) => n.liveness === "running")
   );
 }
 

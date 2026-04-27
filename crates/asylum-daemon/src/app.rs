@@ -3,7 +3,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
-use asylum_core::api::{CreateNodeRequest, ErrorPayload, LaunchPacketResponse, SendInputRequest};
+use asylum_core::api::{
+    ChannelCreateRequest, ChannelInboundRequest, ChannelTestRequest, ChannelUpdateRequest,
+    CreateNodeRequest, ErrorPayload, ForkNodeRequest, HookCreateRequest, HookUpdateRequest,
+    LaunchPacketResponse, RecipeSpawnRequest, SendInputRequest,
+};
 use asylum_core::config::AsylumConfig;
 use asylum_core::node::SubstrateKind;
 use asylum_core::security::TokenRequest;
@@ -11,7 +15,7 @@ use axum::extract::ws::Message;
 use axum::{
     extract::{
         ws::{WebSocket, WebSocketUpgrade},
-        Extension, Json, Path, State,
+        Extension, Json, Path, Query, State,
     },
     http::{header::AUTHORIZATION, StatusCode},
     middleware::{self, Next},
@@ -84,6 +88,8 @@ pub async fn serve(bind: SocketAddr, database: String, config: AsylumConfig) -> 
     );
 
     let state = Arc::new(AppState { service });
+    let service_arc = Arc::new(state.service.clone());
+    service_arc.start_background_tasks();
     let router = build_router(state.clone());
     println!("Asylum serving on http://{bind}");
     let listener = TcpListener::bind(bind).await?;
@@ -117,6 +123,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/tokens/{id}", delete(api_revoke_token))
         .route("/api/harnesses", get(api_harnesses))
         .route("/api/substrates", get(api_substrates))
+        .route("/api/harness-descriptors", get(api_harness_descriptors))
+        .route("/api/substrate-descriptors", get(api_substrate_descriptors))
         .route("/api/workspaces/recent", get(api_recent_workspaces))
         .route("/api/context/system-map", get(api_system_map))
         .route("/api/context/launch-packet/{id}", get(api_launch_packet))
@@ -129,6 +137,32 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/notifications/{id}/read", post(api_notification_read))
         .route("/api/remote-commands", post(api_remote_commands))
         .route("/api/notify/send", post(api_notify_send))
+        .route(
+            "/api/channels",
+            get(api_channels_list).post(api_channels_create),
+        )
+        .route(
+            "/api/channels/{id}",
+            get(api_channel_inspect)
+                .patch(api_channel_update)
+                .delete(api_channel_delete),
+        )
+        .route("/api/channels/{id}/messages", get(api_channel_messages))
+        .route("/api/channels/{id}/test", post(api_channel_test))
+        .route("/api/channels/{id}/inbound", post(api_channel_inbound))
+        .route("/api/hooks", get(api_hooks_list).post(api_hooks_create))
+        .route(
+            "/api/hooks/{id}",
+            get(api_hook_inspect)
+                .patch(api_hook_update)
+                .delete(api_hook_delete),
+        )
+        .route("/api/hooks/firings", get(api_hook_firings))
+        .route("/api/hooks/events", get(api_hook_events))
+        .route("/api/hooks/{id}/test", post(api_hook_test))
+        .route("/api/recipes", get(api_recipes_list))
+        .route("/api/recipes/{id}/spawn", post(api_recipe_spawn))
+        .route("/api/nodes/{id}/fork", post(api_node_fork))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -369,6 +403,18 @@ pub async fn api_substrates(
 ) -> Json<asylum_core::api::SubstrateListResponse> {
     let response = state.service.list_substrates().await;
     Json(response)
+}
+
+pub async fn api_harness_descriptors(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Json<asylum_core::api::HarnessDescriptorResponse> {
+    Json(state.service.list_harness_descriptors().await)
+}
+
+pub async fn api_substrate_descriptors(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Json<asylum_core::api::SubstrateDescriptorResponse> {
+    Json(state.service.list_substrate_descriptors().await)
 }
 
 pub async fn api_recent_workspaces(
@@ -759,6 +805,234 @@ struct NotifySendResponse {
     sent: bool,
 }
 
+#[derive(Deserialize)]
+pub struct LimitQuery {
+    pub limit: Option<usize>,
+}
+
+pub async fn api_channels_list(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<asylum_core::api::ChannelListResponse>, AppError> {
+    let response = state
+        .service
+        .list_channels()
+        .await
+        .map_err(|err| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(response))
+}
+
+pub async fn api_channels_create(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(request): Json<ChannelCreateRequest>,
+) -> Result<Json<asylum_core::api::ChannelDescriptor>, AppError> {
+    let response = state
+        .service
+        .create_channel(request)
+        .await
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    Ok(Json(response))
+}
+
+pub async fn api_channel_inspect(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<asylum_core::api::ChannelDescriptor>, AppError> {
+    let response = state
+        .service
+        .inspect_channel(&id)
+        .await
+        .map_err(|err| AppError::new(StatusCode::NOT_FOUND, err.to_string()))?;
+    Ok(Json(response))
+}
+
+pub async fn api_channel_update(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(request): Json<ChannelUpdateRequest>,
+) -> Result<Json<asylum_core::api::ChannelDescriptor>, AppError> {
+    let response = state
+        .service
+        .update_channel(&id, request)
+        .await
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    Ok(Json(response))
+}
+
+pub async fn api_channel_delete(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.service.delete_channel(&id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => AppError::new(StatusCode::NOT_FOUND, "channel not found").into_response(),
+        Err(error) => AppError::new(StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
+pub async fn api_channel_messages(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<LimitQuery>,
+) -> Result<Json<asylum_core::api::ChannelMessagesResponse>, AppError> {
+    let limit = query.limit.unwrap_or(200).min(1000);
+    let response = state
+        .service
+        .channel_messages(&id, limit)
+        .await
+        .map_err(|err| AppError::new(StatusCode::NOT_FOUND, err.to_string()))?;
+    Ok(Json(response))
+}
+
+pub async fn api_channel_test(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(request): Json<ChannelTestRequest>,
+) -> Result<Json<asylum_core::api::ChannelTestResponse>, AppError> {
+    let response = state
+        .service
+        .channel_test(&id, request)
+        .await
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    Ok(Json(response))
+}
+
+pub async fn api_channel_inbound(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(request): Json<ChannelInboundRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .service
+        .channel_inbound(&id, request)
+        .await
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn api_hooks_list(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<asylum_core::api::HookListResponse>, AppError> {
+    let response = state
+        .service
+        .list_hooks()
+        .await
+        .map_err(|err| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(response))
+}
+
+pub async fn api_hooks_create(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(request): Json<HookCreateRequest>,
+) -> Result<Json<asylum_core::api::HookRule>, AppError> {
+    let response = state
+        .service
+        .create_hook(request)
+        .await
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    Ok(Json(response))
+}
+
+pub async fn api_hook_inspect(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<asylum_core::api::HookRule>, AppError> {
+    let response = state
+        .service
+        .inspect_hook(&id)
+        .await
+        .map_err(|err| AppError::new(StatusCode::NOT_FOUND, err.to_string()))?;
+    Ok(Json(response))
+}
+
+pub async fn api_hook_update(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(request): Json<HookUpdateRequest>,
+) -> Result<Json<asylum_core::api::HookRule>, AppError> {
+    let response = state
+        .service
+        .update_hook(&id, request)
+        .await
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    Ok(Json(response))
+}
+
+pub async fn api_hook_delete(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> StatusCode {
+    match state.service.delete_hook(&id).await {
+        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+pub async fn api_hook_firings(
+    Extension(state): Extension<Arc<AppState>>,
+    Query(query): Query<LimitQuery>,
+) -> Result<Json<asylum_core::api::HookFiringsResponse>, AppError> {
+    let limit = query.limit.unwrap_or(200).min(1000);
+    let response = state
+        .service
+        .list_hook_firings(limit)
+        .await
+        .map_err(|err| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(response))
+}
+
+pub async fn api_hook_events(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Json<asylum_core::api::HookEventCatalogResponse> {
+    Json(state.service.hook_event_catalog().await)
+}
+
+pub async fn api_hook_test(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<asylum_core::api::HookTestResponse>, AppError> {
+    let response = state
+        .service
+        .hook_test(&id)
+        .await
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    Ok(Json(response))
+}
+
+pub async fn api_recipes_list(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Json<asylum_core::api::RecipeListResponse> {
+    Json(state.service.list_recipes().await)
+}
+
+pub async fn api_recipe_spawn(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(request): Json<RecipeSpawnRequest>,
+) -> Result<Json<asylum_core::api::RecipeSpawnResponse>, AppError> {
+    let response = state
+        .service
+        .spawn_recipe(&id, request)
+        .await
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    Ok(Json(response))
+}
+
+pub async fn api_node_fork(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(request): Json<ForkNodeRequest>,
+) -> Result<Json<asylum_core::node::NodeRecord>, AppError> {
+    let id = Uuid::parse_str(&id)
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    let node = state
+        .service
+        .fork_node(id, request)
+        .await
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    Ok(Json(node))
+}
+
 async fn api_notify_send(
     Extension(state): Extension<Arc<AppState>>,
     Json(payload): Json<NotifySendRequest>,
@@ -792,24 +1066,43 @@ pub async fn auth_middleware(
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
+    if state.service.auth_mode == AuthMode::Disabled {
+        return next.run(request).await;
+    }
+
     let has_bearer = request
         .headers()
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| state.service.validate_owner_token(Some(value)));
 
-    if state.service.auth_mode == AuthMode::Disabled || has_bearer {
-        next.run(request).await
-    } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorPayload {
-                code: "unauthorized".to_string(),
-                message: "missing or invalid token".to_string(),
-            }),
-        )
-            .into_response()
+    if has_bearer {
+        return next.run(request).await;
     }
+
+    // Browser WebSocket clients cannot set custom headers; accept a ?token= query param.
+    let has_query_token = request
+        .uri()
+        .query()
+        .and_then(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .find(|(key, _)| key == "token")
+                .map(|(_, value)| value.into_owned())
+        })
+        .is_some_and(|token| state.service.validate_owner_token_value(&token));
+
+    if has_query_token {
+        return next.run(request).await;
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ErrorPayload {
+            code: "unauthorized".to_string(),
+            message: "missing or invalid token".to_string(),
+        }),
+    )
+        .into_response()
 }
 
 #[derive(Debug)]

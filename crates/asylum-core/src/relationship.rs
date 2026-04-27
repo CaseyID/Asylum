@@ -9,6 +9,7 @@ pub struct RelationshipRecord {
     pub target_node_id: Uuid,
     pub kind: RelationshipKind,
     pub label: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
 

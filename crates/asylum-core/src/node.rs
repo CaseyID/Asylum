@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::relationship::RelationshipRecord;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeRecord {
     pub id: Uuid,
     pub harness: HarnessKind,
@@ -13,10 +13,22 @@ pub struct NodeRecord {
     pub liveness: NodeLiveness,
     pub workspace: Option<String>,
     pub description: String,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
     pub external_id: Option<String>,
     pub capabilities: CapabilitySnapshot,
+    #[serde(default)]
+    pub tokens_in: u64,
+    #[serde(default)]
+    pub tokens_out: u64,
+    #[serde(default)]
+    pub tool_calls: u64,
+    #[serde(default)]
+    pub ctx_pct: f32,
+    #[serde(default)]
+    pub idle_seconds: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
@@ -57,7 +69,7 @@ pub struct CapabilitySnapshot {
     pub transcript_export: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GraphRecord {
     pub nodes: Vec<NodeRecord>,
     pub relationships: Vec<RelationshipRecord>,
@@ -77,6 +89,11 @@ impl Default for NodeRecord {
             updated_at: OffsetDateTime::UNIX_EPOCH,
             external_id: None,
             capabilities: CapabilitySnapshot::default(),
+            tokens_in: 0,
+            tokens_out: 0,
+            tool_calls: 0,
+            ctx_pct: 0.0,
+            idle_seconds: 0,
         }
     }
 }
@@ -199,11 +216,27 @@ mod tests {
                 structured_events: false,
                 transcript_export: false,
             },
+            tokens_in: 12,
+            tokens_out: 34,
+            tool_calls: 5,
+            ctx_pct: 0.25,
+            idle_seconds: 7,
         };
 
         let value = serde_json::to_value(&node).unwrap();
         assert_eq!(value["harness"], "claude_code");
         assert_eq!(value["substrate"], "local");
         assert_eq!(value["liveness"], "waiting_for_input");
+        assert_eq!(value["tokens_in"], 12);
+        assert_eq!(value["tokens_out"], 34);
+        assert_eq!(value["tool_calls"], 5);
+        assert_eq!(value["idle_seconds"], 7);
+        assert!(value["ctx_pct"].is_number());
+
+        let round_trip: NodeRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(round_trip.tokens_in, 12);
+        assert_eq!(round_trip.tokens_out, 34);
+        assert_eq!(round_trip.tool_calls, 5);
+        assert_eq!(round_trip.idle_seconds, 7);
     }
 }

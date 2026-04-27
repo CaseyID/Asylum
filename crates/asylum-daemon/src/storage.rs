@@ -158,10 +158,62 @@ impl Store {
                 decided_at INTEGER
             );
 
+            CREATE TABLE IF NOT EXISTS channels (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                label TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                status TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                config_json TEXT NOT NULL,
+                live INTEGER NOT NULL,
+                builtin INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS channel_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                sender TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                body TEXT NOT NULL,
+                replies_json TEXT,
+                FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_channel_messages_channel_ts ON channel_messages(channel_id, ts);
+
+            CREATE TABLE IF NOT EXISTS hooks (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                enabled INTEGER NOT NULL,
+                event TEXT NOT NULL,
+                filter TEXT NOT NULL,
+                actions_json TEXT NOT NULL,
+                future INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS hook_firings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hook_id TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                trigger TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                ok INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                FOREIGN KEY (hook_id) REFERENCES hooks(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_events_node_seq ON events(node_id, sequence);
             CREATE INDEX IF NOT EXISTS idx_artifacts_node ON artifacts(node_id);
             CREATE INDEX IF NOT EXISTS idx_relationships_source ON relationships(source_node_id);
             CREATE INDEX IF NOT EXISTS idx_relationships_target ON relationships(target_node_id);
+            CREATE INDEX IF NOT EXISTS idx_hook_firings_hook_ts ON hook_firings(hook_id, ts);
             ",
         )?;
         Ok(())
@@ -179,7 +231,9 @@ impl Store {
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            out.push(row_to_node_record(row)?);
+            let mut node = row_to_node_record(row)?;
+            hydrate_node_telemetry(&conn, &mut node)?;
+            out.push(node);
         }
         Ok(out)
     }
@@ -197,7 +251,9 @@ impl Store {
         let mut rows = stmt.query([liveness.to_string()])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            out.push(row_to_node_record(row)?);
+            let mut node = row_to_node_record(row)?;
+            hydrate_node_telemetry(&conn, &mut node)?;
+            out.push(node);
         }
         Ok(out)
     }
@@ -261,7 +317,11 @@ impl Store {
         )?;
         let mut rows = stmt.query([id_string])?;
         match rows.next()? {
-            Some(row) => Ok(Some(row_to_node_record(row)?)),
+            Some(row) => {
+                let mut node = row_to_node_record(row)?;
+                hydrate_node_telemetry(conn, &mut node)?;
+                Ok(Some(node))
+            }
             None => Ok(None),
         }
     }
@@ -744,6 +804,309 @@ impl Store {
         )
     }
 
+    pub fn list_channels(&self) -> Result<Vec<ChannelRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id,kind,name,label,direction,status,detail,config_json,live,builtin,created_at
+             FROM channels ORDER BY builtin DESC, name ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(row_to_channel_row(row)?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_channel(&self, id: &str) -> Result<Option<ChannelRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id,kind,name,label,direction,status,detail,config_json,live,builtin,created_at
+             FROM channels WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query([id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row_to_channel_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_channel(
+        &self,
+        id: &str,
+        kind: &str,
+        name: &str,
+        label: &str,
+        direction: &str,
+        status: &str,
+        detail: &str,
+        config_json: &str,
+        live: bool,
+        builtin: bool,
+    ) -> Result<ChannelRow> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO channels(id,kind,name,label,direction,status,detail,config_json,live,builtin,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             ON CONFLICT(id) DO UPDATE SET
+                 kind=excluded.kind,
+                 name=excluded.name,
+                 label=excluded.label,
+                 direction=excluded.direction,
+                 status=excluded.status,
+                 detail=excluded.detail,
+                 config_json=excluded.config_json,
+                 live=excluded.live,
+                 builtin=excluded.builtin",
+            params![
+                id,
+                kind,
+                name,
+                label,
+                direction,
+                status,
+                detail,
+                config_json,
+                live as i64,
+                builtin as i64,
+                now,
+            ],
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT id,kind,name,label,direction,status,detail,config_json,live,builtin,created_at
+             FROM channels WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query([id])?;
+        let row = rows
+            .next()?
+            .ok_or_else(|| anyhow::anyhow!("channel upsert returned no row"))?;
+        row_to_channel_row(row)
+    }
+
+    pub fn delete_channel(&self, id: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        let builtin: Option<i64> = conn
+            .query_row("SELECT builtin FROM channels WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        match builtin {
+            Some(1) => Err(anyhow::anyhow!("cannot delete builtin channel")),
+            Some(_) => {
+                conn.execute("DELETE FROM channels WHERE id = ?1", [id])?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    pub fn list_channel_messages(&self, id: &str, limit: usize) -> Result<Vec<ChannelMessageRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id,channel_id,direction,ts,sender,subject,body,replies_json
+             FROM channel_messages WHERE channel_id = ?1 ORDER BY ts DESC LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![id, limit as i64])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(row_to_channel_message(row)?);
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    pub fn insert_channel_message(
+        &self,
+        channel_id: &str,
+        direction: &str,
+        sender: &str,
+        subject: &str,
+        body: &str,
+        replies: &[String],
+    ) -> Result<i64> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let conn = self.conn()?;
+        let replies_json = serde_json::to_string(&replies.to_vec())?;
+        conn.execute(
+            "INSERT INTO channel_messages(channel_id,direction,ts,sender,subject,body,replies_json)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![channel_id, direction, now, sender, subject, body, replies_json],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn count_channel_messages_24h(&self, channel_id: &str) -> Result<u64> {
+        let conn = self.conn()?;
+        let cutoff = OffsetDateTime::now_utc().unix_timestamp() - 86_400;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM channel_messages WHERE channel_id = ?1 AND ts >= ?2",
+            params![channel_id, cutoff],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
+    pub fn list_hooks(&self) -> Result<Vec<HookRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id,name,enabled,event,filter,actions_json,future,created_at,updated_at
+             FROM hooks ORDER BY created_at DESC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(row_to_hook_row(row)?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_hook(&self, id: &str) -> Result<Option<HookRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id,name,enabled,event,filter,actions_json,future,created_at,updated_at
+             FROM hooks WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query([id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row_to_hook_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_hook(
+        &self,
+        id: &str,
+        name: &str,
+        enabled: bool,
+        event: &str,
+        filter: &str,
+        actions_json: &str,
+        future: bool,
+    ) -> Result<HookRow> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO hooks(id,name,enabled,event,filter,actions_json,future,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8)",
+            params![
+                id,
+                name,
+                enabled as i64,
+                event,
+                filter,
+                actions_json,
+                future as i64,
+                now,
+            ],
+        )?;
+        Self::load_hook_with_conn(&conn, id)?
+            .ok_or_else(|| anyhow::anyhow!("hook insert returned no row"))
+    }
+
+    fn load_hook_with_conn(conn: &Connection, id: &str) -> Result<Option<HookRow>> {
+        let mut stmt = conn.prepare(
+            "SELECT id,name,enabled,event,filter,actions_json,future,created_at,updated_at
+             FROM hooks WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query([id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row_to_hook_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_hook(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        enabled: Option<bool>,
+        event: Option<&str>,
+        filter: Option<&str>,
+        actions_json: Option<&str>,
+        future: Option<bool>,
+    ) -> Result<Option<HookRow>> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let conn = self.conn()?;
+        let existing = Self::load_hook_with_conn(&conn, id)?;
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        let new_name = name.map(str::to_string).unwrap_or(existing.name);
+        let new_enabled = enabled.unwrap_or(existing.enabled);
+        let new_event = event.map(str::to_string).unwrap_or(existing.event);
+        let new_filter = filter.map(str::to_string).unwrap_or(existing.filter);
+        let new_actions = actions_json
+            .map(str::to_string)
+            .unwrap_or(existing.actions_json);
+        let new_future = future.unwrap_or(existing.future);
+        conn.execute(
+            "UPDATE hooks SET name=?2, enabled=?3, event=?4, filter=?5, actions_json=?6, future=?7, updated_at=?8 WHERE id = ?1",
+            params![
+                id,
+                new_name,
+                new_enabled as i64,
+                new_event,
+                new_filter,
+                new_actions,
+                new_future as i64,
+                now,
+            ],
+        )?;
+        Self::load_hook_with_conn(&conn, id)
+    }
+
+    pub fn delete_hook(&self, id: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        let count = conn.execute("DELETE FROM hooks WHERE id = ?1", [id])?;
+        Ok(count > 0)
+    }
+
+    pub fn list_hook_firings(&self, limit: usize) -> Result<Vec<HookFiringRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id,hook_id,ts,trigger,outcome,ok,payload_json
+             FROM hook_firings ORDER BY ts DESC LIMIT ?1",
+        )?;
+        let mut rows = stmt.query([limit as i64])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(row_to_hook_firing(row)?);
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    pub fn insert_hook_firing(
+        &self,
+        hook_id: &str,
+        trigger: &str,
+        outcome: &str,
+        ok: bool,
+        payload_json: &str,
+    ) -> Result<HookFiringRow> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO hook_firings(hook_id,ts,trigger,outcome,ok,payload_json)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![hook_id, now, trigger, outcome, ok as i64, payload_json],
+        )?;
+        let id = conn.last_insert_rowid();
+        Ok(HookFiringRow {
+            id,
+            hook_id: hook_id.to_string(),
+            ts: now,
+            trigger: trigger.to_string(),
+            outcome: outcome.to_string(),
+            ok,
+            payload_json: payload_json.to_string(),
+        })
+    }
+
     fn next_event_sequence_with_conn(conn: &Connection, node_id: Uuid) -> Result<i64> {
         let next: Option<i64> = conn
             .query_row(
@@ -804,7 +1167,94 @@ fn row_to_node_record(row: &rusqlite::Row<'_>) -> Result<NodeRecord> {
         updated_at,
         external_id,
         capabilities,
+        tokens_in: 0,
+        tokens_out: 0,
+        tool_calls: 0,
+        ctx_pct: 0.0,
+        idle_seconds: 0,
     })
+}
+
+fn hydrate_node_telemetry(conn: &Connection, node: &mut NodeRecord) -> Result<()> {
+    let id_string = node.id.to_string();
+
+    let mut stmt = conn.prepare(
+        "SELECT kind, body, created_at FROM events WHERE node_id = ?1 ORDER BY created_at ASC",
+    )?;
+    let mut rows = stmt.query([id_string])?;
+
+    let mut tokens_in: u64 = 0;
+    let mut tokens_out: u64 = 0;
+    let mut tool_calls: u64 = 0;
+    let mut last_event_created_at: Option<i64> = None;
+    let mut last_output_chunk_at: Option<i64> = None;
+
+    while let Some(row) = rows.next()? {
+        let kind_text: String = row.get(0)?;
+        let body_text: String = row.get(1)?;
+        let created_at: i64 = row.get(2)?;
+        last_event_created_at = Some(created_at);
+
+        let kind = parse_event_kind(&kind_text)?;
+        let text_len = match serde_json::from_str::<JsonValue>(&body_text)
+            .ok()
+            .as_ref()
+            .and_then(|value| value.get("text"))
+            .and_then(|value| value.as_str())
+            .map(|text| text.to_string())
+        {
+            Some(text) => {
+                let len = text.len();
+                match kind {
+                    NodeEventKind::OutputChunk => {
+                        last_output_chunk_at = Some(created_at);
+                        if text.contains("⏺ ") || text.contains("tool ") || text.contains("Tool: ") {
+                            tool_calls = tool_calls.saturating_add(1);
+                        }
+                    }
+                    NodeEventKind::InputSent => {}
+                    _ => {}
+                }
+                len
+            }
+            None => 0,
+        };
+
+        match kind {
+            NodeEventKind::InputSent => {
+                tokens_in = tokens_in.saturating_add((text_len as u64) / 4);
+            }
+            NodeEventKind::OutputChunk => {
+                tokens_out = tokens_out.saturating_add((text_len as u64) / 4);
+            }
+            _ => {}
+        }
+    }
+
+    node.tokens_in = tokens_in;
+    node.tokens_out = tokens_out;
+    node.tool_calls = tool_calls;
+    let total = (tokens_in + tokens_out) as f32;
+    node.ctx_pct = (total / 200_000.0).clamp(0.0, 1.0);
+
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    node.idle_seconds = match last_event_created_at {
+        Some(ts) => {
+            let elapsed = (now - ts).max(0) as u64;
+            if matches!(node.liveness, NodeLiveness::Running)
+                && last_output_chunk_at
+                    .map(|out_ts| (now - out_ts).max(0) <= 5)
+                    .unwrap_or(false)
+            {
+                0
+            } else {
+                elapsed
+            }
+        }
+        None => 0,
+    };
+
+    Ok(())
 }
 
 fn parse_node_liveness(raw: &str) -> Result<NodeLiveness> {
@@ -829,6 +1279,112 @@ fn parse_harness_kind(raw: &str) -> Result<HarnessKind> {
 fn parse_substrate_kind(raw: &str) -> Result<SubstrateKind> {
     raw.parse()
         .map_err(|err| anyhow::anyhow!("invalid substrate '{raw}': {err}"))
+}
+
+#[derive(Clone, Debug)]
+pub struct ChannelRow {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub label: String,
+    pub direction: String,
+    pub status: String,
+    pub detail: String,
+    pub config_json: String,
+    pub live: bool,
+    pub builtin: bool,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChannelMessageRow {
+    pub id: i64,
+    pub channel_id: String,
+    pub direction: String,
+    pub ts: i64,
+    pub sender: String,
+    pub subject: String,
+    pub body: String,
+    pub replies_json: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HookRow {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub event: String,
+    pub filter: String,
+    pub actions_json: String,
+    pub future: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct HookFiringRow {
+    pub id: i64,
+    pub hook_id: String,
+    pub ts: i64,
+    pub trigger: String,
+    pub outcome: String,
+    pub ok: bool,
+    pub payload_json: String,
+}
+
+fn row_to_channel_row(row: &rusqlite::Row<'_>) -> Result<ChannelRow> {
+    Ok(ChannelRow {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        name: row.get(2)?,
+        label: row.get(3)?,
+        direction: row.get(4)?,
+        status: row.get(5)?,
+        detail: row.get(6)?,
+        config_json: row.get(7)?,
+        live: row.get::<_, i64>(8)? != 0,
+        builtin: row.get::<_, i64>(9)? != 0,
+        created_at: row.get(10)?,
+    })
+}
+
+fn row_to_channel_message(row: &rusqlite::Row<'_>) -> Result<ChannelMessageRow> {
+    Ok(ChannelMessageRow {
+        id: row.get(0)?,
+        channel_id: row.get(1)?,
+        direction: row.get(2)?,
+        ts: row.get(3)?,
+        sender: row.get(4)?,
+        subject: row.get(5)?,
+        body: row.get(6)?,
+        replies_json: row.get(7)?,
+    })
+}
+
+fn row_to_hook_row(row: &rusqlite::Row<'_>) -> Result<HookRow> {
+    Ok(HookRow {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        enabled: row.get::<_, i64>(2)? != 0,
+        event: row.get(3)?,
+        filter: row.get(4)?,
+        actions_json: row.get(5)?,
+        future: row.get::<_, i64>(6)? != 0,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn row_to_hook_firing(row: &rusqlite::Row<'_>) -> Result<HookFiringRow> {
+    Ok(HookFiringRow {
+        id: row.get(0)?,
+        hook_id: row.get(1)?,
+        ts: row.get(2)?,
+        trigger: row.get(3)?,
+        outcome: row.get(4)?,
+        ok: row.get::<_, i64>(5)? != 0,
+        payload_json: row.get(6)?,
+    })
 }
 
 fn parse_relationship_kind(raw: &str) -> Option<RelationshipKind> {
@@ -899,5 +1455,83 @@ mod tests {
         let graph = store.graph().unwrap();
         assert_eq!(graph.nodes.len(), 2);
         assert!(graph.relationships.is_empty());
+    }
+
+    #[test]
+    fn telemetry_hydration_counts_tokens_and_tool_calls() {
+        let store = Store::open_in_memory().unwrap();
+        let node = store.insert_test_node("worker").unwrap();
+        store
+            .record_event(
+                node.id,
+                NodeEventKind::InputSent,
+                serde_json::json!({"text": "abcdefgh"}),
+            )
+            .unwrap();
+        store
+            .append_transcript_chunk(node.id, "hello world chunk text")
+            .unwrap();
+        store
+            .append_transcript_chunk(node.id, "⏺ tool invoked Bash")
+            .unwrap();
+        let hydrated = store.get_node(node.id).unwrap().unwrap();
+        assert_eq!(hydrated.tokens_in, 2);
+        assert!(hydrated.tokens_out >= 1);
+        assert_eq!(hydrated.tool_calls, 1);
+        assert!(hydrated.ctx_pct >= 0.0 && hydrated.ctx_pct <= 1.0);
+    }
+
+    #[test]
+    fn channel_seed_and_messages_round_trip() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_channel(
+                "ntfy-default",
+                "ntfy",
+                "ntfy default",
+                "ntfy default",
+                "duplex",
+                "live",
+                "detail",
+                "{}",
+                true,
+                true,
+            )
+            .unwrap();
+        store
+            .insert_channel_message("ntfy-default", "out", "asylum", "subject", "body", &[])
+            .unwrap();
+        let messages = store.list_channel_messages("ntfy-default", 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].subject, "subject");
+        let count = store.count_channel_messages_24h("ntfy-default").unwrap();
+        assert_eq!(count, 1);
+        let err = store.delete_channel("ntfy-default");
+        assert!(err.is_err(), "builtin channel delete should fail");
+    }
+
+    #[test]
+    fn hook_round_trip() {
+        let store = Store::open_in_memory().unwrap();
+        let hook = store
+            .insert_hook(
+                "hook-1",
+                "Test",
+                true,
+                "node.exited",
+                "any",
+                "[]",
+                false,
+            )
+            .unwrap();
+        assert_eq!(hook.name, "Test");
+        let updated = store
+            .update_hook("hook-1", Some("Renamed"), Some(false), None, None, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.name, "Renamed");
+        assert!(!updated.enabled);
+        assert!(store.delete_hook("hook-1").unwrap());
+        assert!(!store.delete_hook("hook-1").unwrap());
     }
 }
