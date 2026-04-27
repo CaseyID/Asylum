@@ -38,7 +38,7 @@ export const NotificationCenter: FC<NotificationCenterProps> = ({ notifications,
         <Bell size={14} /> Notifications
       </h3>
       <div className="notification-body">
-        {critical.length > 0 && <div className="warning">Attention needed on {critical.length} route(s).</div>}
+        {critical.length > 0 && <div className="warning">{critical.length} item(s) need attention.</div>}
         {notifications.length === 0 ? (
           <p className="empty-cell">No notifications.</p>
         ) : (

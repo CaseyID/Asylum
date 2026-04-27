@@ -87,7 +87,7 @@ export interface RelationshipResponse {
 }
 
 export interface AttachBrowserResponse {
-  token: string;
+  token?: string;
   attach_url: string;
 }
 
@@ -128,11 +128,30 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 export async function fetchGraph(): Promise<GraphResponse> {
-  return request<GraphResponse>("/graph");
+  const data = await request<GraphResponse | { graph: GraphResponse }>("/graph");
+  if ("graph" in data) {
+    return data.graph;
+  }
+  return data;
 }
 
 export async function fetchNotifications(): Promise<NotificationRecord[]> {
-  return request<NotificationRecord[]>("/notifications");
+  const data = await request<NotificationRecord[] | { notifications: unknown[] }>("/notifications");
+  const records = Array.isArray(data) ? data : data.notifications;
+  return records.map((item) => {
+    const raw = item as Record<string, unknown>;
+    return {
+      id: String(raw.id),
+      node_id: raw.node_id ? String(raw.node_id) : null,
+      title: String(raw.title ?? "System event"),
+      body: String(raw.body ?? ""),
+      severity: String(raw.severity ?? raw.kind ?? "info"),
+      created_at: raw.created_at
+        ? String(raw.created_at)
+        : new Date(Number(raw.created_at_epoch_secs ?? 0) * 1000).toISOString(),
+      read: Boolean(raw.read ?? raw.read_at_epoch_secs),
+    };
+  });
 }
 
 export async function markNotificationRead(id: string): Promise<void> {
@@ -140,7 +159,12 @@ export async function markNotificationRead(id: string): Promise<void> {
 }
 
 export async function fetchNode(id: string): Promise<AsylumNode> {
-  return request<AsylumNode>(`/nodes/${id}`);
+  const data = await request<AsylumNode | { node: AsylumNode }>(`/nodes/${id}`);
+  const maybeWrapped = data as { node?: AsylumNode };
+  if (maybeWrapped.node) {
+    return maybeWrapped.node;
+  }
+  return data as AsylumNode;
 }
 
 export async function fetchNodes(): Promise<AsylumNode[]> {
@@ -156,10 +180,15 @@ export async function createNode(requestBody: CreateNodeRequest): Promise<Asylum
     ...requestBody,
     role_hint: requestBody.role_hint.trim() || "worker",
   };
-  return request<AsylumNode>("/nodes", {
+  const created = await request<AsylumNode | { node_id: string }>("/nodes", {
     method: "POST",
     body: JSON.stringify(payload),
   });
+  const maybeCreated = created as { node_id?: string };
+  if (maybeCreated.node_id) {
+    return fetchNode(maybeCreated.node_id);
+  }
+  return created as AsylumNode;
 }
 
 async function fallbackPostNodeAction(
@@ -186,7 +215,7 @@ async function fallbackPostNodeAction(
 export async function postNodeInput(nodeId: string, input: string): Promise<void> {
   return request<void>(`/nodes/${nodeId}/input`, {
     method: "POST",
-    body: JSON.stringify({ input }),
+    body: JSON.stringify({ text: input }),
   });
 }
 
@@ -207,15 +236,24 @@ export async function resumeNode(nodeId: string): Promise<void> {
 }
 
 export async function requestBrowserAttach(nodeId: string): Promise<AttachBrowserResponse> {
-  return request<AttachBrowserResponse>(`/nodes/${nodeId}/attach/browser`, {
+  const data = await request<AttachBrowserResponse | { url: string; expires_in_seconds: number }>(`/nodes/${nodeId}/attach/browser`, {
     method: "POST",
   });
+  if ("url" in data) {
+    const token = data.url.split("/attach/")[1]?.split(/[/?#]/)[0];
+    return { attach_url: data.url, token };
+  }
+  return data;
 }
 
 export async function requestNativeTarget(nodeId: string): Promise<NativeTargetResponse> {
-  return request<NativeTargetResponse>(`/nodes/${nodeId}/attach/native-target`, {
+  const data = await request<NativeTargetResponse | { command: string; args: string[]; environment: Record<string, string> }>(`/nodes/${nodeId}/attach/native-target`, {
     method: "POST",
   });
+  if ("environment" in data) {
+    return { command: data.command, args: data.args, env: data.environment };
+  }
+  return data;
 }
 
 export async function createRelationship(requestBody: RelationshipCreateRequest): Promise<RelationshipResponse> {
@@ -240,7 +278,7 @@ export function graphToFlow(graph: GraphResponse): GraphFlow {
     const y = Math.floor(index / cols) * rows;
     return {
       id: node.id,
-      type: "default",
+      type: "asylum",
       position: { x, y },
       data: {
         node,
@@ -258,6 +296,11 @@ export function graphToFlow(graph: GraphResponse): GraphFlow {
       source: edge.source_node_id,
       target: edge.target_node_id,
       label: edge.kind,
+      labelBgPadding: [6, 3] as [number, number],
+      labelBgBorderRadius: 4,
+      labelBgStyle: { fill: "#05080c", fillOpacity: 0.95 },
+      labelStyle: { fill: "#c8d5e3", fontSize: 11, fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" },
+      style: { stroke: "#4d667e", strokeWidth: 1.4 },
     }));
 
   return { nodes: flowNodes, edges };

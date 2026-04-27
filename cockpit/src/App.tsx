@@ -33,6 +33,14 @@ export const App = () => {
     () => graph.nodes.find((node) => node.id === selectedNodeId),
     [graph.nodes, selectedNodeId],
   );
+  const liveCount = useMemo(
+    () => graph.nodes.filter((node) => node.liveness === "running" || node.liveness === "waiting_for_input").length,
+    [graph.nodes],
+  );
+  const substrateCount = useMemo(
+    () => new Set(graph.nodes.map((node) => node.substrate)).size,
+    [graph.nodes],
+  );
 
   const refreshAll = useCallback(async () => {
     if (refreshing) return;
@@ -54,6 +62,7 @@ export const App = () => {
           : undefined,
       );
     } catch (err) {
+      initializeGraph({ nodes: [], relationships: [] });
       setLocalError(`Backend unavailable: ${String(err instanceof Error ? err.message : err)}`);
     } finally {
       setRefreshing(false);
@@ -82,7 +91,16 @@ export const App = () => {
   return (
     <main className="cockpit-root">
       <header className="top-strip">
-        <h1>Asylum Cockpit</h1>
+        <div>
+          <span className="eyebrow">ASYLUM://CONTROL-PLANE</span>
+          <h1>Asylum Cockpit</h1>
+        </div>
+        <div className="top-metrics" aria-label="System summary">
+          <span><strong>{graph.nodes.length}</strong> nodes</span>
+          <span><strong>{liveCount}</strong> live</span>
+          <span><strong>{graph.relationships.length}</strong> edges</span>
+          <span><strong>{substrateCount}</strong> substrates</span>
+        </div>
       </header>
       <section className="operational-grid">
         <aside className="left-toolbar">

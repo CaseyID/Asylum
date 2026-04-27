@@ -1,17 +1,44 @@
 import "@xyflow/react/dist/style.css";
 import {
   type Edge,
+  Handle,
   ReactFlow,
   type Node,
+  type NodeProps,
   type ReactFlowInstance,
   useEdgesState,
   useNodesState,
-  MiniMap,
   Controls,
   Background,
+  Position,
 } from "@xyflow/react";
-import { type FC, type MouseEvent, useEffect, useMemo, useState } from "react";
+import { memo, type FC, type MouseEvent, useEffect, useMemo, useState } from "react";
 import { type GraphFlow } from "../api";
+
+type AsylumNodeData = GraphFlow["nodes"][number]["data"];
+
+const AsylumGraphNode = memo(({ data, selected }: NodeProps<Node<AsylumNodeData>>) => {
+  const node = data.node;
+  return (
+    <div className={`asylum-flow-node ${selected ? "selected" : ""} state-${node.liveness}`}>
+      <Handle type="target" position={Position.Left} />
+      <div className="node-shell-row">
+        <span className="status-dot" />
+        <span className="node-role">{node.role_hint}</span>
+        <span className="node-state">{node.liveness}</span>
+      </div>
+      <div className="node-meta">
+        <span>{node.harness}</span>
+        <span>{node.substrate}</span>
+        <span>{node.id.slice(0, 8)}</span>
+      </div>
+      <p>{node.output_preview ?? node.description ?? "waiting for output"}</p>
+      <Handle type="source" position={Position.Right} />
+    </div>
+  );
+});
+
+const nodeTypes = { asylum: AsylumGraphNode };
 
 export interface GraphViewProps {
   flow: GraphFlow;
@@ -66,6 +93,7 @@ export const GraphView: FC<GraphViewProps> = ({ flow, selectedNodeId, onSelectNo
       <div className="graph-view-wrap">
         <ReactFlow
           onInit={setFlowApi}
+          nodeTypes={nodeTypes}
           nodes={nodes}
           edges={edges}
           onNodesChange={onNodesChange}
@@ -75,7 +103,6 @@ export const GraphView: FC<GraphViewProps> = ({ flow, selectedNodeId, onSelectNo
           zoomOnScroll={true}
           attributionPosition="bottom-left"
         >
-          <MiniMap pannable zoomable />
           <Controls />
           <Background gap={18} color="#2b3040" />
         </ReactFlow>
