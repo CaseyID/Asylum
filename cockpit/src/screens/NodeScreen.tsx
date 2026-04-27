@@ -15,8 +15,16 @@ import {
   uiStateOf,
   uptimeLabel,
 } from "../lib/glyphs";
-import { fetchHarnessDescriptors } from "../api";
+import { fetchHarnessDescriptors, fetchNodeEvents } from "../api";
 import type { AsylumNode, GraphRelationship, HarnessDescriptor } from "../types";
+
+interface NodeEventRecord {
+  id: number;
+  sequence: number;
+  kind: string;
+  body: unknown;
+  created_at: string;
+}
 
 export type NodeScreenAction =
   | "attach"
@@ -228,16 +236,80 @@ export function NodeScreen({ node, nodes, relationships, onBack, onOpen, onActio
   );
 }
 
-function EventsView({ node: _node }: { node: AsylumNode }): JSX.Element {
+function EventsView({ node }: { node: AsylumNode }): JSX.Element {
+  const [events, setEvents] = useState<NodeEventRecord[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = () => {
+      fetchNodeEvents(node.id)
+        .then((items) => {
+          if (cancelled) return;
+          setEvents(items as NodeEventRecord[]);
+          setError(null);
+          timer = setTimeout(tick, 2000);
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return;
+          setError(err instanceof Error ? err.message : String(err));
+          timer = setTimeout(tick, 5000);
+        });
+    };
+    tick();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [node.id]);
+
+  if (error && events.length === 0) {
+    return (
+      <div className="log">
+        <Empty glyph="[!]" lead="failed to load events" sub={error} />
+      </div>
+    );
+  }
+  if (events.length === 0) {
+    return (
+      <div className="log">
+        <Empty glyph="[ ]" lead="no events yet" sub="harness output and lifecycle events appear here as they happen" />
+      </div>
+    );
+  }
+  const ordered = [...events].sort((a, b) => b.sequence - a.sequence);
   return (
-    <div className="log">
-      <Empty
-        glyph="[ ]"
-        lead="event stream not yet wired"
-        sub="connect to /api/nodes/{id}/events to populate this view"
-      />
+    <div className="log" style={{ overflow: "auto", padding: "8px 12px", fontFamily: "var(--font-mono, monospace)" }}>
+      {ordered.map((ev) => (
+        <div key={ev.id} style={{ padding: "4px 0", borderBottom: "1px solid var(--border)" }}>
+          <span style={{ color: "var(--text-muted)" }}>#{ev.sequence}</span>
+          {" "}
+          <span style={{ color: "var(--text-muted)" }}>{ev.created_at}</span>
+          {" "}
+          <Tag>{ev.kind}</Tag>
+          {" "}
+          <span>{summarizeEventBody(ev.body)}</span>
+        </div>
+      ))}
     </div>
   );
+}
+
+function summarizeEventBody(body: unknown): string {
+  if (body == null) return "";
+  if (typeof body === "string") return body;
+  if (typeof body === "object") {
+    const obj = body as Record<string, unknown>;
+    if (typeof obj.text === "string") return obj.text.slice(0, 240);
+    if (typeof obj.message === "string") return obj.message.slice(0, 240);
+    try {
+      return JSON.stringify(body).slice(0, 240);
+    } catch {
+      return String(body);
+    }
+  }
+  return String(body);
 }
 
 function ToolsView(): JSX.Element {

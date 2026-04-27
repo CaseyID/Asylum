@@ -9,6 +9,7 @@ pub struct NodeEvent {
     pub sequence: i64,
     pub kind: NodeEventKind,
     pub body: serde_json::Value,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
 

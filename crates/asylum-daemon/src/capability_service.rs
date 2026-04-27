@@ -1063,12 +1063,17 @@ impl CapabilityService {
 
     pub async fn archive_node(&self, node_id: Uuid) -> Result<()> {
         if let Some(node) = self.store.get_node(node_id)? {
-            if let (SubstrateKind::Loon, Some(loon), Some(external)) = (
-                node.substrate,
-                self.loon_substrate.as_ref(),
-                node.external_id.as_deref(),
-            ) {
-                loon.archive(external).await?;
+            match node.substrate {
+                SubstrateKind::Local => {
+                    let _ = self.local_substrate.stop(node_id).await;
+                }
+                SubstrateKind::Loon => {
+                    if let (Some(loon), Some(external)) =
+                        (self.loon_substrate.as_ref(), node.external_id.as_deref())
+                    {
+                        loon.archive(external).await?;
+                    }
+                }
             }
         }
         self.store

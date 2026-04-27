@@ -270,9 +270,6 @@ export function App() {
     setScreen("node");
   };
 
-  // inspector / node-detail action handler — wires buttons through to daemon
-  // endpoints, with local-only behaviour for actions the daemon does not yet
-  // support (fork is a no-op stub today).
   async function handleNodeAction(target: AsylumNode | undefined, action: InspectorAction, payload?: string) {
     if (!target) return;
     const bus = sessionBus.current;

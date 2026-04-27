@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use asylum_core::node::{CapabilitySnapshot, HarnessKind};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use super::{SubstrateContext, SubstrateOutput};
 struct LocalRuntime {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     output_tx: broadcast::Sender<String>,
+    killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
 }
 
 #[derive(Clone)]
@@ -52,6 +53,7 @@ impl LocalSubstrate {
             .slave
             .spawn_command(command)
             .context("spawn local harness process")?;
+        let killer = child.clone_killer();
         let mut reader = pty.master.try_clone_reader()?;
         let writer = pty.master.take_writer()?;
 
@@ -78,13 +80,12 @@ impl LocalSubstrate {
             let _ = local_child.wait();
         });
 
-        // keep the child alive by not dropping `child` here.
-        // this is intentionally retained in thread scope only; we also keep output writer handle.
         self.runtimes.write().await.insert(
             node_id,
             LocalRuntime {
                 writer: writer_arc,
                 output_tx,
+                killer: Arc::new(Mutex::new(killer)),
             },
         );
         Ok(())
@@ -125,8 +126,14 @@ impl LocalSubstrate {
     }
 
     pub async fn stop(&self, node_id: Uuid) -> Result<()> {
-        let mut runtimes = self.runtimes.write().await;
-        runtimes.remove(&node_id);
+        let runtime = {
+            let mut runtimes = self.runtimes.write().await;
+            runtimes.remove(&node_id)
+        };
+        if let Some(runtime) = runtime {
+            let mut killer = runtime.killer.lock().await;
+            let _ = killer.kill();
+        }
         Ok(())
     }
 
