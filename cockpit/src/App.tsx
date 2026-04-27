@@ -1,0 +1,134 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { fetchGraph, fetchNotifications, graphToFlow, type NotificationRecord } from "./api";
+import { isOperational, selectCommandCenter, useCockpitStore } from "./state";
+import { CommandCenter } from "./components/CommandCenter";
+import { CreateNodePanel } from "./components/CreateNodePanel";
+import { GraphView } from "./components/GraphView";
+import { NodeInspector } from "./components/NodeInspector";
+import { NodeTable } from "./components/NodeTable";
+import { NotificationCenter } from "./components/NotificationCenter";
+
+type BottomPanel = "command-center" | "table";
+
+export const App = () => {
+  const {
+    graph,
+    selectedNodeId,
+    commandCenterNodeId,
+    loading,
+    initializeGraph,
+    setSelectedNode,
+    setCommandCenterSelection,
+  } = useCockpitStore();
+
+  const [bottomPanel, setBottomPanel] = useState<BottomPanel>("command-center");
+  const [notifications, setNotifications] = useState<NotificationRecord[]>([]);
+  const [localError, setLocalError] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | undefined>();
+
+  const graphData = useMemo(() => graphToFlow(graph), [graph]);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const selectedNode = useMemo(
+    () => graph.nodes.find((node) => node.id === selectedNodeId),
+    [graph.nodes, selectedNodeId],
+  );
+
+  const refreshAll = useCallback(async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      const [fetchedGraph, fetchedNotifications] = await Promise.all([fetchGraph(), fetchNotifications()]);
+      const commandCenter = selectCommandCenter(fetchedGraph.nodes);
+      initializeGraph({
+        ...fetchedGraph,
+        nodes: [...fetchedGraph.nodes].sort((a, b) => a.created_at.localeCompare(b.created_at)),
+        relationships: [...fetchedGraph.relationships],
+      });
+      setNotifications(fetchedNotifications);
+      setCommandCenterSelection(commandCenter?.id);
+      setLocalError(null);
+      setWarning(
+        fetchedGraph.nodes.some((node) => !isOperational(node))
+          ? "Some nodes are not operational; check liveness."
+          : undefined,
+      );
+    } catch (err) {
+      setLocalError(`Backend unavailable: ${String(err instanceof Error ? err.message : err)}`);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [initializeGraph, setCommandCenterSelection, refreshing]);
+
+  useEffect(() => {
+    void refreshAll();
+
+    const timer = setInterval(() => {
+      void refreshAll();
+    }, 6000);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const commandCenter = selectCommandCenter(graph.nodes);
+    if (!selectedNodeId && commandCenter) {
+      setSelectedNode(commandCenter.id);
+      setCommandCenterSelection(commandCenter.id);
+    } else if (graph.nodes.length > 0 && !selectedNodeId) {
+      setSelectedNode(graph.nodes[0]?.id);
+    }
+  }, [graph.nodes, selectedNodeId, setSelectedNode, setCommandCenterSelection]);
+
+  return (
+    <main className="cockpit-root">
+      <header className="top-strip">
+        <h1>Asylum Cockpit</h1>
+      </header>
+      <section className="operational-grid">
+        <aside className="left-toolbar">
+          <CreateNodePanel onCreated={() => void refreshAll()} />
+          <NotificationCenter notifications={notifications} onRefresh={refreshAll} />
+          <section className="panel">
+            <h3>Exposure</h3>
+            <p>{warning ?? "No known exposure warning."}</p>
+          </section>
+        </aside>
+        <div className="graph-stage">
+          {loading ? <p className="empty-cell">Loading cockpit…</p> : <GraphView flow={graphData} selectedNodeId={selectedNode?.id} onSelectNode={setSelectedNode} />}
+        </div>
+        <aside className="node-inspector-col">
+          <NodeInspector
+            node={selectedNode}
+            nodes={graph.nodes}
+            relationships={graph.relationships}
+            onActionComplete={refreshAll}
+          />
+        </aside>
+        <footer className="bottom-row">
+          <div className="panel tab-strip">
+            <button
+              type="button"
+              className={bottomPanel === "command-center" ? "selected" : ""}
+              onClick={() => setBottomPanel("command-center")}
+            >
+              Command Center
+            </button>
+            <button
+              type="button"
+              className={bottomPanel === "table" ? "selected" : ""}
+              onClick={() => setBottomPanel("table")}
+            >
+              Node Table
+            </button>
+          </div>
+          {bottomPanel === "command-center" ? (
+            <CommandCenter nodes={graph.nodes} selectedNodeId={commandCenterNodeId} onSelectNode={setSelectedNode} />
+          ) : (
+            <NodeTable nodes={graph.nodes} selectedNodeId={selectedNode?.id} onSelectNode={setSelectedNode} />
+          )}
+        </footer>
+      </section>
+      {localError ? <div className="error-banner">{localError}</div> : null}
+    </main>
+  );
+};
