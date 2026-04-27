@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use asylum_core::api::{CreateNodeRequest, ErrorPayload, LaunchPacketResponse, SendInputRequest};
 use asylum_core::security::TokenRequest;
+use axum::extract::ws::Message;
 use axum::{
     extract::{
         ws::{WebSocket, WebSocketUpgrade},
@@ -12,11 +13,14 @@ use axum::{
     http::{header::AUTHORIZATION, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
+    routing::get_service,
     routing::{delete, get, post},
     Router,
 };
+use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
+use tower_http::services::ServeDir;
 use uuid::Uuid;
 
 use crate::auth::AuthMode;
@@ -65,6 +69,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/nodes/:id/interrupt", post(api_node_interrupt))
         .route("/api/nodes/:id/stop", post(api_node_stop))
         .route("/api/nodes/:id/archive", post(api_node_archive))
+        .route("/api/nodes/:id/observe/ws", get(api_node_observe_ws))
         .route(
             "/api/nodes/:id/attach/browser",
             post(api_node_attach_browser),
@@ -88,12 +93,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/notifications", get(api_notifications))
         .route("/api/notifications/:id/read", post(api_notification_read))
         .route("/api/remote-commands", post(api_remote_commands))
+        .route("/api/notify/send", post(api_notify_send))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
         ));
 
     Router::new()
+        .nest_service("/assets", get_service(ServeDir::new("cockpit/dist/assets")))
         .route("/attach/:token", get(api_attach_page))
         .route("/api/attach/:token/ws", get(api_attach_ws))
         .route("/", get(api_root))
@@ -249,6 +256,44 @@ pub async fn api_node_attach_native(
         .await
         .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
     Ok(Json(response))
+}
+
+pub async fn api_node_observe_ws(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let id = match Uuid::parse_str(&id) {
+        Ok(node_id) => node_id,
+        Err(err) => return AppError::new(StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+
+    let service = state.service.clone();
+    match service.inspect_node(id).await {
+        Ok(_) => ws.on_upgrade(move |socket| handle_node_observe_ws(socket, service, id)),
+        Err(_) => AppError::new(StatusCode::NOT_FOUND, "node not found").into_response(),
+    }
+}
+
+async fn handle_node_observe_ws(
+    socket: WebSocket,
+    service: crate::capability_service::CapabilityService,
+    node_id: Uuid,
+) {
+    let response = service.node_events(node_id).await;
+    let mut socket = socket;
+
+    for event in response.events {
+        if let Ok(payload) = serde_json::to_string(&event) {
+            if socket.send(Message::Text(payload.into())).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    let _ = socket
+        .send(Message::Text("asylum.observe.ws.initialized".into()))
+        .await;
 }
 
 pub async fn api_harnesses(
@@ -421,10 +466,46 @@ pub async fn api_attach_ws(
 
 async fn handle_attach_ws(_socket: WebSocket) {}
 
-pub async fn api_root() -> Html<&'static str> {
-    Html(
-        "cockpit assets not present; run `npm --prefix cockpit run build` and serve `cockpit/dist`",
-    )
+#[derive(Deserialize)]
+struct NotifySendRequest {
+    title: String,
+    body: String,
+    server: Option<String>,
+    topic: Option<String>,
+    token: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct NotifySendResponse {
+    sent: bool,
+}
+
+async fn api_notify_send(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(payload): Json<NotifySendRequest>,
+) -> Json<NotifySendResponse> {
+    let sent = state
+        .service
+        .notify_send(
+            payload.title,
+            payload.body,
+            payload.server,
+            payload.topic,
+            payload.token,
+        )
+        .await
+        .unwrap_or(false);
+    Json(NotifySendResponse { sent })
+}
+
+pub async fn api_root() -> Html<String> {
+    match tokio::fs::read_to_string("cockpit/dist/index.html").await {
+        Ok(contents) => Html(contents),
+        Err(_) => Html(
+            "cockpit assets not present; run `npm --prefix cockpit run build` and serve `cockpit/dist`"
+                .to_string(),
+        ),
+    }
 }
 
 pub async fn auth_middleware(

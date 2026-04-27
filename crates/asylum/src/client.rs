@@ -1,0 +1,208 @@
+use std::env;
+
+use anyhow::{anyhow, Context, Result};
+use reqwest::{self, StatusCode};
+use serde::{de::DeserializeOwned, Serialize};
+use serde_json::Value;
+use uuid::Uuid;
+
+use asylum_core::api::{
+    CreateNodeRequest, GraphGetResponse, NativeAttachResponse, NodeCreateResponse,
+    NodeEventsResponse, NodeInspectResponse, NodeListResponse, SendInputRequest,
+    TokenIssueResponse,
+};
+use asylum_core::security::TokenRequest;
+
+pub struct AsylumClient {
+    base_url: String,
+    token: Option<String>,
+    http: reqwest::Client,
+}
+
+impl AsylumClient {
+    const DEFAULT_BASE_URL: &'static str = "http://127.0.0.1:7717";
+
+    pub fn from_env() -> Self {
+        let base_url =
+            env::var("ASYLUM_BASE_URL").unwrap_or_else(|_| Self::DEFAULT_BASE_URL.to_string());
+        let token = env::var("ASYLUM_TOKEN").ok();
+        Self::new(base_url, token)
+    }
+
+    pub fn new(base_url: impl Into<String>, token: impl Into<Option<String>>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            token: token.into(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    fn endpoint(&self, path: &str) -> String {
+        let trimmed = self.base_url.trim_end_matches('/');
+        if path.starts_with('/') {
+            format!("{trimmed}{path}")
+        } else {
+            format!("{trimmed}/{path}")
+        }
+    }
+
+    fn request_builder(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        let mut request = self.http.request(method, self.endpoint(path));
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        request
+    }
+
+    async fn parse_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("{status}: {body}"));
+        }
+        serde_json::from_str::<T>(&body)
+            .with_context(|| format!("failed to parse response body for status {status}"))
+    }
+
+    async fn send_request<T, P>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        payload: Option<&P>,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+        P: Serialize + ?Sized,
+    {
+        let mut request = self.request_builder(method, path);
+        if let Some(payload) = payload {
+            request = request.json(payload);
+        }
+        let response = request.send().await?;
+        if response.status() == StatusCode::NO_CONTENT {
+            return Err(anyhow!("unexpected 204 for endpoint {path}"));
+        }
+        Self::parse_response(response).await
+    }
+
+    async fn send_request_no_content(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        payload: Option<&(impl Serialize + ?Sized)>,
+    ) -> Result<()> {
+        let mut request = self.request_builder(method, path);
+        if let Some(payload) = payload {
+            request = request.json(payload);
+        }
+        let response = request.send().await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(anyhow!("{status}: {body}"))
+    }
+
+    pub async fn list_nodes(&self) -> Result<NodeListResponse> {
+        self.send_request(reqwest::Method::GET, "/api/nodes", Option::<&str>::None)
+            .await
+    }
+
+    pub async fn create_node(&self, request: CreateNodeRequest) -> Result<NodeCreateResponse> {
+        self.send_request(reqwest::Method::POST, "/api/nodes", Some(&request))
+            .await
+    }
+
+    pub async fn inspect_node(&self, id: Uuid) -> Result<NodeInspectResponse> {
+        let path = format!("/api/nodes/{id}");
+        self.send_request(reqwest::Method::GET, &path, Option::<&str>::None)
+            .await
+    }
+
+    pub async fn graph(&self) -> Result<GraphGetResponse> {
+        self.send_request(reqwest::Method::GET, "/api/graph", Option::<&str>::None)
+            .await
+    }
+
+    pub async fn send_input(&self, id: Uuid, text: impl Into<String>) -> Result<()> {
+        let path = format!("/api/nodes/{id}/input");
+        let request = SendInputRequest { text: text.into() };
+        self.send_request_no_content(reqwest::Method::POST, &path, Some(&request))
+            .await
+    }
+
+    pub async fn interrupt_node(&self, id: Uuid) -> Result<()> {
+        let path = format!("/api/nodes/{id}/interrupt");
+        self.send_request_no_content(reqwest::Method::POST, &path, Option::<&str>::None)
+            .await
+    }
+
+    pub async fn stop_node(&self, id: Uuid) -> Result<()> {
+        let path = format!("/api/nodes/{id}/stop");
+        self.send_request_no_content(reqwest::Method::POST, &path, Option::<&str>::None)
+            .await
+    }
+
+    pub async fn archive_node(&self, id: Uuid) -> Result<()> {
+        let path = format!("/api/nodes/{id}/archive");
+        self.send_request_no_content(reqwest::Method::POST, &path, Option::<&str>::None)
+            .await
+    }
+
+    pub async fn native_attach_target(&self, id: Uuid) -> Result<NativeAttachResponse> {
+        let path = format!("/api/nodes/{id}/attach/native-target");
+        self.send_request(reqwest::Method::POST, &path, Option::<&str>::None)
+            .await
+    }
+
+    pub async fn browser_attach_url(&self, id: Uuid) -> Result<asylum_core::api::AttachResponse> {
+        let path = format!("/api/nodes/{id}/attach/browser");
+        self.send_request(reqwest::Method::POST, &path, Option::<&str>::None)
+            .await
+    }
+
+    #[allow(dead_code)]
+    pub async fn node_events(&self, id: Uuid) -> Result<NodeEventsResponse> {
+        let path = format!("/api/nodes/{id}/events");
+        self.send_request(reqwest::Method::GET, &path, Option::<&str>::None)
+            .await
+    }
+
+    pub async fn issue_token(&self, request: TokenRequest) -> Result<TokenIssueResponse> {
+        self.send_request(reqwest::Method::POST, "/api/tokens", Some(&request))
+            .await
+    }
+
+    pub async fn notify_send(
+        &self,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Result<bool> {
+        let path = "/api/notify/send";
+        let payload = serde_json::json!({"title": title.into(), "body": body.into()});
+        let response: Value = self
+            .send_request(reqwest::Method::POST, path, Some(&payload))
+            .await?;
+        Ok(response
+            .get("sent")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_client_uses_builtin_default_url() {
+        let client = AsylumClient::new(AsylumClient::DEFAULT_BASE_URL, Option::<String>::None);
+        assert_eq!(client.base_url(), "http://127.0.0.1:7717");
+    }
+}

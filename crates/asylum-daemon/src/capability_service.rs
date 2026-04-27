@@ -24,6 +24,7 @@ use crate::attach::AttachTokenIssuer;
 use crate::auth::verify_token;
 use crate::auth::{issue_owner_token, AuthMode};
 use crate::harness::HarnessRegistry;
+use crate::notifications::send_with_optional_config;
 use crate::recipes;
 use crate::storage::Store;
 use crate::substrate::loon::{capability_flags_from_health, LoonHealth, LoonSubstrate};
@@ -445,6 +446,27 @@ impl CapabilityService {
 
     pub async fn mark_notification_read(&self, id: i64) -> Result<()> {
         self.store.mark_notification_read(id)
+    }
+
+    pub async fn notify_send(
+        &self,
+        title: impl AsRef<str>,
+        body: impl AsRef<str>,
+        server: Option<String>,
+        topic: Option<String>,
+        token: Option<String>,
+    ) -> Result<bool> {
+        let configured = asylum_core::config::NtfyConfig {
+            server: server.or_else(|| self.config.ntfy_server.clone()),
+            topic: topic.or_else(|| self.config.ntfy_topic.clone()),
+            token: token.or_else(|| self.config.ntfy_token.clone()),
+            poll_interval_seconds: 30,
+        };
+        if configured.server.is_none() || configured.topic.is_none() {
+            return Ok(false);
+        }
+        send_with_optional_config(Some(&configured), title.as_ref(), body.as_ref()).await?;
+        Ok(true)
     }
 
     pub fn validate_owner_token(&self, header: Option<&str>) -> bool {
