@@ -133,6 +133,14 @@ fi
 check assert_eq "${parse_sete_rc}" "2" "main parse failure under set -e returns parse code"
 check assert_contains "$parse_sete_output" "Usage:" "main parse failure prints usage"
 
+if piped_help_output="$(bash -s -- --help < "${SCRIPT_DIR}/install.sh" 2>&1)"; then
+  piped_help_rc=0
+else
+  piped_help_rc=$?
+fi
+check assert_eq "${piped_help_rc}" "0" "piped installer runs under bash -s"
+check assert_contains "$piped_help_output" "Asylum binary installer" "piped installer prints help"
+
 NO_COLOR=1
 asylum_color_init
 INSTALL_DIR="/tmp/asylum-test-home"
