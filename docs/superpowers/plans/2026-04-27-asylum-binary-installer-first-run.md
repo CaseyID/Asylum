@@ -77,12 +77,12 @@
 
 **Requirements:**
 - Lead with the one-line installer:
-  `curl -fsSL https://raw.githubusercontent.com/caseyID/Asylum/main/scripts/install.sh | bash`
+  `curl -fsSL https://raw.githubusercontent.com/CaseyID/Asylum/main/scripts/install.sh | bash`
 - Make the next command `asylum`.
 - Explain what bare `asylum` does: setup if needed, start if needed, wait for health, open Cockpit, print the URL.
 - Document core commands: `setup`, `cockpit`, `start`, `stop`, `restart`, `status`, `doctor`, `logs`, `update`.
 - Move source build and existing advanced CLI/API/MCP/operator commands below the product path.
-- Include manual release artifact expectations and checksum behavior.
+- Include local release artifact build/publish expectations and checksum behavior.
 
 ## Final Verification
 

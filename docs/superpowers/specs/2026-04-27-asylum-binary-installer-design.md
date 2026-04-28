@@ -14,7 +14,7 @@ Asylum should be as simple to install and start using as Hermes Agent. The norma
 The public install command is:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/caseyID/Asylum/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/CaseyID/Asylum/main/scripts/install.sh | bash
 ```
 
 After install, `asylum` must be available on `PATH`. The primary command should take the user to the product.
@@ -26,7 +26,7 @@ Hermes maps bare `hermes` to its primary TUI. Asylum's primary surface is Cockpi
 The happy path is:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/caseyID/Asylum/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/CaseyID/Asylum/main/scripts/install.sh | bash
 asylum
 ```
 
@@ -75,7 +75,7 @@ Default interactive behavior should run setup or ask to run setup immediately. N
 
 ## Release Artifact Contract
 
-Releases are uploaded manually for now. The installer assumes predictable GitHub Release assets.
+Releases are built and uploaded locally from the MacBook for now. The installer assumes predictable GitHub Release assets.
 
 Recommended archive names:
 
@@ -86,12 +86,10 @@ asylum-linux-arm64.tar.gz
 asylum-linux-x86_64.tar.gz
 ```
 
-Each archive should contain:
+Each archive must contain exactly one top-level executable:
 
 ```text
 asylum
-README.md or INSTALL.md
-LICENSE
 ```
 
 Optional checksum files:
@@ -102,6 +100,16 @@ asylum-darwin-arm64.tar.gz.sha256
 ```
 
 The installer should prefer checksum verification when published, but early manual releases may omit checksums. In that case the installer should say verification was skipped rather than pretending it happened.
+
+Local release commands:
+
+```bash
+scripts/build-release-artifacts.sh --version v0.1.1
+scripts/publish-release.sh --version v0.1.1
+scripts/test-release-install.sh --version v0.1.1
+```
+
+The local release builder uses native macOS Rust targets for `darwin-arm64` and `darwin-x86_64`, and Docker for Linux artifacts. On Apple Silicon, `linux-x86_64` is cross-compiled from a native arm64 Linux container to avoid running the compiler under amd64 emulation.
 
 ## Installed Layout
 
@@ -238,7 +246,7 @@ Avoid leading with build commands. Source build instructions belong in a develop
 ## Non-Goals
 
 - No normal source-build fallback in `scripts/install.sh`.
-- No CI/CD or release automation in this pass.
+- No GitHub Actions or hosted CI/CD release automation in this pass.
 - No hosted installer service.
 - No requirement that users understand launchd, systemd, PID files, database paths, owner tokens, or bind addresses for first use.
 - No public `asylum service ...` workflow in the friendly path.

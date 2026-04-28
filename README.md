@@ -15,7 +15,7 @@ The core product object is the **Node**: a live or resumable harness session run
 ## Product Path
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/caseyID/Asylum/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/CaseyID/Asylum/main/scripts/install.sh | bash
 asylum
 ```
 If installed via a piped/noninteractive install, `asylum` may only be on PATH after you restart/open a new shell. Ensure `~/.local/bin` is on PATH, add the printed `export PATH="...` line to your shell config, or run `~/.local/bin/asylum` directly when using the default install directory.
@@ -46,7 +46,7 @@ asylum update
 
 ## Release Artifact Expectations
 
-Manual release packaging should produce archives named:
+Local release packaging produces archives named:
 
 - `asylum-darwin-arm64.tar.gz`
 - `asylum-darwin-x86_64.tar.gz`
@@ -54,6 +54,17 @@ Manual release packaging should produce archives named:
 - `asylum-linux-x86_64.tar.gz`
 
 Each archive should contain exactly one executable `asylum` binary.
+
+Build artifacts locally from a MacBook with Docker running:
+
+```bash
+scripts/build-release-artifacts.sh --version v0.1.1
+scripts/publish-release.sh --version v0.1.1 --dry-run
+scripts/publish-release.sh --version v0.1.1
+scripts/test-release-install.sh --version v0.1.1
+```
+
+The local release builder uses native macOS Rust targets for `darwin-arm64` and `darwin-x86_64`, and Docker for `linux-arm64` and `linux-x86_64`. On Apple Silicon, `linux-x86_64` is cross-compiled from a native arm64 Linux container so the compiler does not run under amd64 emulation. The release build runs the Cockpit production build before compiling the release binaries so Cockpit is embedded into each archive.
 
 Checksum behavior:
 - Installer first tries `checksums.txt` from the release.
