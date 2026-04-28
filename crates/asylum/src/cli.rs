@@ -28,7 +28,7 @@ use asylum_core::security::TokenRequest;
 const DEFAULT_BIND: &str = "127.0.0.1:7717";
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:7717";
 const PUBLIC_INSTALLER_URL: &str =
-    "https://raw.githubusercontent.com/caseyID/Asylum/main/scripts/install.sh";
+    "https://raw.githubusercontent.com/CaseyID/Asylum/main/scripts/install.sh";
 
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -158,7 +158,7 @@ pub async fn run() -> Result<()> {
 }
 
 #[derive(Parser)]
-#[command(name = "asylum", version = "0.1.0")]
+#[command(name = "asylum", version)]
 struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,

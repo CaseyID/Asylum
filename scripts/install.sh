@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-REPO_SLUG="caseyID/Asylum"
+REPO_SLUG="CaseyID/Asylum"
 GITHUB_API_URL="https://api.github.com/repos/${REPO_SLUG}/releases"
 GITHUB_RELEASE_URL="https://github.com/${REPO_SLUG}/releases"
 COLOR_LABEL=""
@@ -30,8 +30,8 @@ Options:
   --no-color            Disable color output
 
 Examples:
-  curl -fsSL https://raw.githubusercontent.com/caseyID/Asylum/main/scripts/install.sh | bash
-  curl -fsSL https://raw.githubusercontent.com/caseyID/Asylum/main/scripts/install.sh | bash -- --version v0.1.0
+  curl -fsSL https://raw.githubusercontent.com/CaseyID/Asylum/main/scripts/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/CaseyID/Asylum/main/scripts/install.sh | bash -- --version v0.1.1
 EOF
 }
 

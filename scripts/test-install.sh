@@ -87,7 +87,7 @@ check assert_eq "$(asylum_normalize_arch amd64)" "x86_64" "normalize_arch amd64"
 check assert_eq "$(asylum_normalize_arch x86)" "unsupported" "normalize_arch unsupported"
 
 check assert_eq "$(asylum_archive_name darwin arm64)" "asylum-darwin-arm64.tar.gz" "archive name"
-check assert_eq "$(asylum_release_url v0.1.0 asylum-darwin-arm64.tar.gz)" "https://github.com/caseyID/Asylum/releases/download/v0.1.0/asylum-darwin-arm64.tar.gz" "release URL construction"
+check assert_eq "$(asylum_release_url v0.1.1 asylum-darwin-arm64.tar.gz)" "https://github.com/CaseyID/Asylum/releases/download/v0.1.1/asylum-darwin-arm64.tar.gz" "release URL construction"
 
 if asylum_parse_args --help; then
   parse_rc=0
@@ -434,7 +434,7 @@ if absolute_output="$((
     command tar "$@"
   }
   absolute_test_tmp="$(mktemp -d)"
-  tar -czf "${absolute_test_tmp}/absolute.tar.gz" .
+  : > "${absolute_test_tmp}/absolute.tar.gz"
   if asylum_extract_binary "${absolute_test_tmp}/absolute.tar.gz" "${absolute_test_tmp}/out" 2>&1; then
     absolute_result=0
   else
