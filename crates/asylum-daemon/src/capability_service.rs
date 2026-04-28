@@ -5,10 +5,10 @@ use asylum_core::api::{
     AttachResponse, CapabilityListResponse, ClientConfigResponse, CreateNodeRequest,
     GraphGetResponse, HarnessDescriptor, HarnessDescriptorResponse, HarnessListResponse,
     HealthResponse, LaunchPacketResponse, NativeAttachResponse, NodeCreateResponse,
-    NodeEventsResponse, NodeInspectResponse, NodeListResponse, Notification,
-    NotificationsResponse, RelationshipCreateRequest, RelationshipResponse,
-    RemoteCommandResponse, SendInputRequest, SubstrateDescriptor,
-    SubstrateDescriptorResponse, SubstrateHealth, SubstrateListResponse, TokenIssueResponse,
+    NodeEventsResponse, NodeInspectResponse, NodeListResponse, Notification, NotificationsResponse,
+    RelationshipCreateRequest, RelationshipResponse, RemoteCommandResponse, SendInputRequest,
+    SubstrateDescriptor, SubstrateDescriptorResponse, SubstrateHealth, SubstrateListResponse,
+    TokenIssueResponse,
 };
 use asylum_core::capabilities::CapabilityDescriptor;
 use asylum_core::capabilities::CapabilityName;
@@ -41,9 +41,9 @@ use crate::substrate::{LocalSubstrate, SubstrateContext};
 use asylum_core::api::{
     ChannelCreateRequest, ChannelDescriptor, ChannelInboundRequest, ChannelListResponse,
     ChannelMessagesResponse, ChannelTestRequest, ChannelTestResponse, ChannelUpdateRequest,
-    ForkNodeRequest, HookAction, HookCreateRequest, HookEventCatalogResponse,
-    HookFiringsResponse, HookListResponse, HookRule, HookTestResponse, HookUpdateRequest,
-    RecipeDescriptor, RecipeListResponse, RecipeSpawnRequest, RecipeSpawnResponse,
+    ForkNodeRequest, HookAction, HookCreateRequest, HookEventCatalogResponse, HookFiringsResponse,
+    HookListResponse, HookRule, HookTestResponse, HookUpdateRequest, RecipeDescriptor,
+    RecipeListResponse, RecipeSpawnRequest, RecipeSpawnResponse,
 };
 use asylum_core::config::{HarnessConfig, LoonConfig};
 use asylum_core::node::NodeRecord;
@@ -198,11 +198,7 @@ impl CapabilityService {
         }
     }
 
-    async fn execute_hook_actions(
-        &self,
-        rule: &HookRule,
-        payload: &JsonValue,
-    ) -> Result<String> {
+    async fn execute_hook_actions(&self, rule: &HookRule, payload: &JsonValue) -> Result<String> {
         let mut results: Vec<String> = Vec::new();
         for action in &rule.actions {
             let result = self.execute_hook_action(action, payload).await;
@@ -214,7 +210,11 @@ impl CapabilityService {
         Ok(results.join("; "))
     }
 
-    async fn execute_hook_action(&self, action: &HookAction, payload: &JsonValue) -> Result<String> {
+    async fn execute_hook_action(
+        &self,
+        action: &HookAction,
+        payload: &JsonValue,
+    ) -> Result<String> {
         match action.kind.as_str() {
             "channel" => {
                 let channel = require_channel(&self.store, &action.target)?;
@@ -223,17 +223,14 @@ impl CapabilityService {
                     .get("title")
                     .and_then(JsonValue::as_str)
                     .unwrap_or("hook");
-                let template = action
-                    .template
-                    .clone()
-                    .unwrap_or_else(|| {
-                        action
-                            .args
-                            .get("body")
-                            .and_then(JsonValue::as_str)
-                            .map(str::to_string)
-                            .unwrap_or_else(|| "{event}".to_string())
-                    });
+                let template = action.template.clone().unwrap_or_else(|| {
+                    action
+                        .args
+                        .get("body")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "{event}".to_string())
+                });
                 let rendered_title = render_template(title, payload);
                 let rendered_body = render_template(&template, payload);
                 self.send_via_channel(&channel.id, &rendered_title, &rendered_body)
@@ -267,7 +264,11 @@ impl CapabilityService {
                     role_hint: None,
                 };
                 let response = self.spawn_recipe(recipe_id, request).await?;
-                Ok(format!("spawn:{}:{}", recipe_id, response.node_ids.join(",")))
+                Ok(format!(
+                    "spawn:{}:{}",
+                    recipe_id,
+                    response.node_ids.join(",")
+                ))
             }
             "tool" => {
                 let outcome = self.dispatch_tool(&action.target, payload).await?;
@@ -302,20 +303,19 @@ impl CapabilityService {
         Err(anyhow!("unknown tool target '{target}'"))
     }
 
-    pub async fn send_via_channel(&self, channel_id: &str, title: &str, body: &str) -> Result<bool> {
+    pub async fn send_via_channel(
+        &self,
+        channel_id: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<bool> {
         let channel = require_channel(&self.store, channel_id)?;
         let sent = if !channel.live {
             false
         } else if channel.kind == "ntfy" {
-            self.notify_send(
-                title.to_string(),
-                body.to_string(),
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap_or(false)
+            self.notify_send(title.to_string(), body.to_string(), None, None, None)
+                .await
+                .unwrap_or(false)
         } else {
             true
         };
@@ -347,7 +347,6 @@ fn node_id_from_payload(payload: &JsonValue) -> Result<Uuid> {
 }
 
 impl CapabilityService {
-
     pub async fn capabilities(&self) -> CapabilityListResponse {
         self.list_capability_descriptors().await
     }
@@ -1599,11 +1598,7 @@ impl CapabilityService {
         Ok(ChannelTestResponse { sent })
     }
 
-    pub async fn channel_inbound(
-        &self,
-        id: &str,
-        request: ChannelInboundRequest,
-    ) -> Result<()> {
+    pub async fn channel_inbound(&self, id: &str, request: ChannelInboundRequest) -> Result<()> {
         require_channel(&self.store, id)?;
         self.store.insert_channel_message(
             id,
@@ -1655,11 +1650,7 @@ impl CapabilityService {
         Ok(rule_from_row(row))
     }
 
-    pub async fn update_hook(
-        &self,
-        id: &str,
-        request: HookUpdateRequest,
-    ) -> Result<HookRule> {
+    pub async fn update_hook(&self, id: &str, request: HookUpdateRequest) -> Result<HookRule> {
         let actions_json = match request.actions {
             Some(actions) => Some(serde_json::to_string(&actions)?),
             None => None,
@@ -1851,7 +1842,6 @@ impl CapabilityService {
             .ok_or_else(|| anyhow!("forked node not found"))?;
         Ok(new_node)
     }
-
 }
 
 pub async fn loom_support_for_harness(

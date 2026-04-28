@@ -7,7 +7,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use asylum_core::api::{
-    CreateNodeRequest, GraphGetResponse, NativeAttachResponse, NodeCreateResponse,
+    CreateNodeRequest, GraphGetResponse, HealthResponse, NativeAttachResponse, NodeCreateResponse,
     NodeEventsResponse, NodeInspectResponse, NodeListResponse, SendInputRequest,
     TokenIssueResponse,
 };
@@ -128,6 +128,18 @@ impl AsylumClient {
     pub async fn graph(&self) -> Result<GraphGetResponse> {
         self.send_request(reqwest::Method::GET, "/api/graph", Option::<&str>::None)
             .await
+    }
+
+    pub async fn health(&self) -> Result<HealthResponse> {
+        self.send_request(reqwest::Method::GET, "/api/health", Option::<&str>::None)
+            .await
+    }
+
+    pub async fn is_healthy(&self) -> bool {
+        self.health()
+            .await
+            .map(|health| health.status == "ok")
+            .unwrap_or(false)
     }
 
     pub async fn send_input(&self, id: Uuid, text: impl Into<String>) -> Result<()> {

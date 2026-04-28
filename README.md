@@ -12,16 +12,67 @@ The core product object is the **Node**: a live or resumable harness session run
 - Implementation-planning handoff: [docs/handoff/transition-to-implementation-planning.md](docs/handoff/transition-to-implementation-planning.md)
 - Source and context trail: [docs/context/source-trail.md](docs/context/source-trail.md)
 
-## Quick Start
+## Product Path
 
-### Build
+```bash
+curl -fsSL https://raw.githubusercontent.com/caseyID/Asylum/main/scripts/install.sh | bash
+asylum
+```
+If installed via a piped/noninteractive install, `asylum` may only be on PATH after you restart/open a new shell. Ensure `~/.local/bin` is on PATH, add the printed `export PATH="...` line to your shell config, or run `~/.local/bin/asylum` directly when using the default install directory.
+
+Running bare `asylum` does the product bootstrap path:
+- Runs `asylum setup` if runtime files do not exist.
+- Starts Asylum if it is not already running.
+- Waits for service health during startup.
+- Opens Cockpit in your browser.
+- Prints the Cockpit URL.
+
+### Core Commands
+
+```bash
+asylum setup
+asylum cockpit
+asylum start
+asylum stop
+asylum restart
+asylum status
+asylum doctor
+asylum logs
+asylum logs --tail
+asylum update
+```
+
+`asylum update` reuses release resolution and fetch flow and then runs a health check afterwards.
+
+## Release Artifact Expectations
+
+Manual release packaging should produce archives named:
+
+- `asylum-darwin-arm64.tar.gz`
+- `asylum-darwin-x86_64.tar.gz`
+- `asylum-linux-arm64.tar.gz`
+- `asylum-linux-x86_64.tar.gz`
+
+Each archive should contain exactly one executable `asylum` binary.
+
+Checksum behavior:
+- Installer first tries `checksums.txt` from the release.
+- If absent, it tries `<archive>.sha256`.
+- If neither exists, checksum verification is reported as skipped.
+- If checksum tools are missing locally, checksum verification is also skipped.
+
+For release binaries, ensure `npm --prefix cockpit run build` is run before `cargo build --release` so embedded Cockpit assets are present.
+
+## Source and Advanced CLI (below product path)
+
+### Source Build
 
 ```bash
 cargo build --workspace
 npm --prefix cockpit run build
 ```
 
-### Run
+### Source Run
 
 ```bash
 ./target/debug/asylum serve --database ./.asylum/asylum.sqlite3
@@ -39,12 +90,12 @@ ASYLUM_TOKEN="$ASYLUM_OWNER_TOKEN" ./target/debug/asylum graph get
 open "http://127.0.0.1:7717/?token=$ASYLUM_OWNER_TOKEN"
 ```
 
-The daemon serves:
+The debug daemon serves:
 - `http://127.0.0.1:7717/api/...` for APIs
 - `/` for the Cockpit single-page UI when `cockpit/dist/index.html` exists
 - `/assets/*` for static assets from `cockpit/dist/assets`
 
-### Install
+### Service File Output
 
 ```bash
 ./target/debug/asylum install launchd
