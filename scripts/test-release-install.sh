@@ -149,6 +149,7 @@ if [[ ! -x "${INSTALL_DIR}/asylum" ]]; then
   exit 1
 fi
 
+export PATH="${INSTALL_DIR}:${PATH}"
 assert_version
 
 ASYLUM_HOME="$ASYLUM_HOME" "${INSTALL_DIR}/asylum" setup
