@@ -932,7 +932,15 @@ impl Store {
         conn.execute(
             "INSERT INTO channel_messages(channel_id,direction,ts,sender,subject,body,replies_json)
              VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![channel_id, direction, now, sender, subject, body, replies_json],
+            params![
+                channel_id,
+                direction,
+                now,
+                sender,
+                subject,
+                body,
+                replies_json
+            ],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -1208,7 +1216,8 @@ fn hydrate_node_telemetry(conn: &Connection, node: &mut NodeRecord) -> Result<()
                 match kind {
                     NodeEventKind::OutputChunk => {
                         last_output_chunk_at = Some(created_at);
-                        if text.contains("⏺ ") || text.contains("tool ") || text.contains("Tool: ") {
+                        if text.contains("⏺ ") || text.contains("tool ") || text.contains("Tool: ")
+                        {
                             tool_calls = tool_calls.saturating_add(1);
                         }
                     }
@@ -1514,19 +1523,19 @@ mod tests {
     fn hook_round_trip() {
         let store = Store::open_in_memory().unwrap();
         let hook = store
-            .insert_hook(
-                "hook-1",
-                "Test",
-                true,
-                "node.exited",
-                "any",
-                "[]",
-                false,
-            )
+            .insert_hook("hook-1", "Test", true, "node.exited", "any", "[]", false)
             .unwrap();
         assert_eq!(hook.name, "Test");
         let updated = store
-            .update_hook("hook-1", Some("Renamed"), Some(false), None, None, None, None)
+            .update_hook(
+                "hook-1",
+                Some("Renamed"),
+                Some(false),
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(updated.name, "Renamed");

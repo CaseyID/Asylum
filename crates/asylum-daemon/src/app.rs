@@ -17,10 +17,10 @@ use axum::{
         ws::{WebSocket, WebSocketUpgrade},
         Extension, Json, Path, Query, State,
     },
-    http::{header::AUTHORIZATION, StatusCode},
+    http::header::AUTHORIZATION,
+    http::StatusCode,
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
-    routing::get_service,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Router,
 };
@@ -28,7 +28,6 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast::error::RecvError, mpsc, Mutex};
-use tower_http::services::ServeDir;
 use uuid::Uuid;
 
 use crate::auth::hash_token;
@@ -36,13 +35,35 @@ use crate::auth::AuthMode;
 use crate::capability_service::{AppConfig, CapabilityService};
 use crate::remote_commands::{parse_remote_command, RemoteCommandKind};
 use crate::storage::Store;
+#[cfg(debug_assertions)]
+use axum::response::Html;
+#[cfg(debug_assertions)]
+use axum::routing::get_service;
 use futures::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+#[cfg(not(debug_assertions))]
+use rust_embed::RustEmbed;
+#[cfg(debug_assertions)]
+use tower_http::services::ServeDir;
 
 #[derive(Clone)]
 pub struct AppState {
     pub service: CapabilityService,
 }
+
+#[cfg(not(debug_assertions))]
+#[derive(RustEmbed)]
+// In release builds, cockpit assets must be built before compiling this crate.
+// Ensure `cockpit/dist` exists by running:
+// `npm --prefix cockpit run build`
+#[folder = "../../cockpit/dist/"]
+struct CockpitAssets;
+
+#[cfg(not(debug_assertions))]
+const ASSETS_ROUTE: &str = "/assets/{*path}";
+
+const MISSING_COCKPIT_ASSETS_MESSAGE: &str =
+    "cockpit assets not present; run `npm --prefix cockpit run build` and serve `cockpit/dist`";
 
 pub async fn serve(bind: SocketAddr, database: String, config: AsylumConfig) -> Result<()> {
     let store = Store::open(database)?;
@@ -168,13 +189,27 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             auth_middleware,
         ));
 
-    Router::new()
-        .nest_service("/assets", get_service(ServeDir::new("cockpit/dist/assets")))
+    let mut router = Router::new()
         .route("/attach/{token}", get(api_attach_page))
         .route("/api/attach/{token}/ws", get(api_attach_ws))
-        .route("/", get(api_root))
         .merge(protected)
-        .layer(axum::Extension(state))
+        .layer(axum::Extension(state));
+
+    #[cfg(debug_assertions)]
+    {
+        router = router
+            .nest_service("/assets", get_service(ServeDir::new("cockpit/dist/assets")))
+            .route("/", get(api_root))
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        router = router
+            .route(ASSETS_ROUTE, get(api_assets))
+            .route("/", get(api_root_embedded))
+    }
+
+    router
 }
 
 pub async fn api_health(
@@ -1051,13 +1086,131 @@ async fn api_notify_send(
     Json(NotifySendResponse { sent })
 }
 
+#[cfg(debug_assertions)]
 pub async fn api_root() -> Html<String> {
     match tokio::fs::read_to_string("cockpit/dist/index.html").await {
         Ok(contents) => Html(contents),
-        Err(_) => Html(
-            "cockpit assets not present; run `npm --prefix cockpit run build` and serve `cockpit/dist`"
-                .to_string(),
-        ),
+        Err(_) => Html(MISSING_COCKPIT_ASSETS_MESSAGE.to_string()),
+    }
+}
+
+#[cfg(not(debug_assertions))]
+pub async fn api_root_embedded() -> impl IntoResponse {
+    match CockpitAssets::get("index.html") {
+        Some(file) => (
+            StatusCode::OK,
+            [("Content-Type", "text/html")],
+            file.data.to_vec(),
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, MISSING_COCKPIT_ASSETS_MESSAGE).into_response(),
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn api_assets(Path(path): Path<String>) -> Response {
+    let path = match normalize_asset_path(&path) {
+        Some(path) => path,
+        None => return (StatusCode::NOT_FOUND, "asset not found").into_response(),
+    };
+
+    match CockpitAssets::get(&format!("assets/{path}")) {
+        Some(file) => (
+            StatusCode::OK,
+            [("Content-Type", content_type(&path))],
+            file.data.to_vec(),
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "asset not found").into_response(),
+    }
+}
+
+#[cfg(any(test, not(debug_assertions)))]
+fn normalize_asset_path(path: &str) -> Option<String> {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut segments: Vec<&str> = Vec::with_capacity(4);
+    for segment in trimmed.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            return None;
+        }
+        if segment.contains('\\') {
+            return None;
+        }
+        segments.push(segment);
+    }
+
+    if segments.is_empty() {
+        None
+    } else {
+        Some(segments.join("/"))
+    }
+}
+
+#[cfg(any(test, not(debug_assertions)))]
+fn content_type(path: &str) -> &'static str {
+    let (_, extension) = path.rsplit_once('.').unwrap_or(("", ""));
+    match extension.to_ascii_lowercase().as_str() {
+        "html" => "text/html",
+        "css" => "text/css; charset=utf-8",
+        "js" => "application/javascript",
+        "mjs" => "application/javascript",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(debug_assertions)]
+    use super::{content_type, normalize_asset_path};
+    #[cfg(not(debug_assertions))]
+    use super::{content_type, normalize_asset_path, ASSETS_ROUTE};
+
+    #[test]
+    fn normalize_asset_path_rejects_traversal_and_empty_paths() {
+        assert_eq!(normalize_asset_path(""), None);
+        assert_eq!(normalize_asset_path("../index.html"), None);
+        assert_eq!(normalize_asset_path("dir/../../etc"), None);
+    }
+
+    #[test]
+    fn normalize_asset_path_cleans_redundant_segments() {
+        assert_eq!(
+            normalize_asset_path("/assets/./bundle.css"),
+            Some("assets/bundle.css".to_string())
+        );
+    }
+
+    #[test]
+    fn content_type_guesses_common_extensions() {
+        assert_eq!(content_type("index.html"), "text/html");
+        assert_eq!(content_type("styles/main.css"), "text/css; charset=utf-8");
+        assert_eq!(content_type("app.js"), "application/javascript");
+        assert_eq!(content_type("image.png"), "image/png");
+        assert_eq!(content_type("docs/README.txt"), "text/plain; charset=utf-8");
+        assert_eq!(content_type("bundle.unknown"), "application/octet-stream");
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_assets_route_pattern_uses_catch_all() {
+        assert_eq!(ASSETS_ROUTE, "/assets/{*path}");
     }
 }
 

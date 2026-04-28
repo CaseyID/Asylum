@@ -268,7 +268,10 @@ fn parse_atom(clause: &str) -> Option<Token> {
     for (sym, op) in ops {
         if let Some(idx) = clause.find(sym) {
             let key = clause[..idx].trim().to_string();
-            let value = clause[idx + sym.len()..].trim().trim_matches('"').to_string();
+            let value = clause[idx + sym.len()..]
+                .trim()
+                .trim_matches('"')
+                .to_string();
             if key.is_empty() {
                 return None;
             }

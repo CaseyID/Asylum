@@ -1,0 +1,735 @@
+use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
+
+use anyhow::{anyhow, Context, Result};
+
+use crate::runtime::RuntimePaths;
+
+const LABEL: &str = "dev.asylum.daemon";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceBackend {
+    Launchd,
+    SystemdUser,
+    PidFallback,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServiceState {
+    Running,
+    Stopped,
+    Unknown(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct ServiceRenderConfig {
+    pub binary: PathBuf,
+    pub config: PathBuf,
+    pub database: PathBuf,
+    pub bind: String,
+    pub log: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServiceManager {
+    backend: ServiceBackend,
+    paths: RuntimePaths,
+    binary: PathBuf,
+}
+
+impl ServiceManager {
+    pub fn new(paths: RuntimePaths) -> Result<Self> {
+        let binary = std::env::current_exe().context("locate asylum executable")?;
+        Ok(Self::with_backend(paths, binary, select_backend()))
+    }
+
+    pub fn with_backend(paths: RuntimePaths, binary: PathBuf, backend: ServiceBackend) -> Self {
+        Self {
+            backend,
+            paths,
+            binary,
+        }
+    }
+
+    pub fn backend(&self) -> ServiceBackend {
+        self.backend
+    }
+
+    pub fn start(&self, bind: &str) -> Result<()> {
+        self.paths.ensure_dirs()?;
+        match self.backend {
+            ServiceBackend::Launchd => self.start_launchd(bind),
+            ServiceBackend::SystemdUser => self.start_systemd(bind),
+            ServiceBackend::PidFallback => self.start_pid_fallback(bind),
+        }
+    }
+
+    pub fn stop(&self) -> Result<()> {
+        match self.backend {
+            ServiceBackend::Launchd => {
+                let plist = self.launchd_plist_path();
+                let _ = ProcessCommand::new("launchctl")
+                    .arg("unload")
+                    .arg(&plist)
+                    .status();
+                self.stop_pid_fallback()
+            }
+            ServiceBackend::SystemdUser => {
+                let _ = ProcessCommand::new("systemctl")
+                    .arg("--user")
+                    .arg("stop")
+                    .arg("asylum.service")
+                    .status();
+                self.stop_pid_fallback()
+            }
+            ServiceBackend::PidFallback => self.stop_pid_fallback(),
+        }
+    }
+
+    pub fn restart(&self, bind: &str) -> Result<()> {
+        self.stop()?;
+        self.start(bind)
+    }
+
+    pub fn status(&self) -> ServiceState {
+        if let Some(pid) = self.read_pid() {
+            if process_is_running(pid) && self.pid_identity(pid) == PidIdentity::Matches {
+                return ServiceState::Running;
+            }
+            return ServiceState::Stopped;
+        }
+        match self.backend {
+            ServiceBackend::Launchd => command_status("launchctl", &["list", LABEL]),
+            ServiceBackend::SystemdUser => {
+                command_status("systemctl", &["--user", "is-active", "asylum.service"])
+            }
+            ServiceBackend::PidFallback => ServiceState::Stopped,
+        }
+    }
+
+    pub fn render_config(&self, bind: &str) -> ServiceRenderConfig {
+        ServiceRenderConfig {
+            binary: self.binary.clone(),
+            config: self.paths.config.clone(),
+            database: self.paths.database.clone(),
+            bind: bind.to_string(),
+            log: self.paths.log.clone(),
+        }
+    }
+
+    pub fn launchd_plist_text(&self, bind: &str) -> String {
+        render_launchd_plist(&self.render_config(bind))
+    }
+
+    pub fn systemd_unit_text(&self, bind: &str) -> String {
+        render_systemd_unit(&self.render_config(bind))
+    }
+
+    fn start_launchd(&self, bind: &str) -> Result<()> {
+        let plist = self.launchd_plist_path();
+        if let Some(parent) = plist.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&plist, self.launchd_plist_text(bind))?;
+        let _ = ProcessCommand::new("launchctl")
+            .arg("unload")
+            .arg(&plist)
+            .status();
+        let status = ProcessCommand::new("launchctl")
+            .arg("load")
+            .arg(&plist)
+            .status()
+            .context("run launchctl load")?;
+        if status.success() {
+            Ok(())
+        } else {
+            self.start_pid_fallback(bind)
+        }
+    }
+
+    fn start_systemd(&self, bind: &str) -> Result<()> {
+        let unit = self.systemd_unit_path();
+        if let Some(parent) = unit.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&unit, self.systemd_unit_text(bind))?;
+        let _ = ProcessCommand::new("systemctl")
+            .arg("--user")
+            .arg("daemon-reload")
+            .status();
+        let status = ProcessCommand::new("systemctl")
+            .arg("--user")
+            .arg("start")
+            .arg("asylum.service")
+            .status()
+            .context("run systemctl --user start")?;
+        if status.success() {
+            Ok(())
+        } else {
+            self.start_pid_fallback(bind)
+        }
+    }
+
+    fn start_pid_fallback(&self, bind: &str) -> Result<()> {
+        if let Some(pid) = self.read_pid() {
+            if process_is_running(pid) && self.pid_identity(pid) == PidIdentity::Matches {
+                return Ok(());
+            }
+            self.remove_pid_files();
+        }
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.paths.log)
+            .with_context(|| format!("open log {}", self.paths.log.display()))?;
+        let err_log = log.try_clone()?;
+        let child = ProcessCommand::new(&self.binary)
+            .arg("serve")
+            .arg("--config")
+            .arg(&self.paths.config)
+            .arg("--database")
+            .arg(&self.paths.database)
+            .arg("--bind")
+            .arg(bind)
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(err_log))
+            .spawn()
+            .with_context(|| format!("start {}", self.binary.display()))?;
+        fs::write(&self.paths.pid, child.id().to_string())?;
+        fs::write(
+            self.pid_metadata_path(),
+            self.pid_metadata(child.id(), bind),
+        )?;
+        Ok(())
+    }
+
+    fn stop_pid_fallback(&self) -> Result<()> {
+        let Some(pid) = self.read_pid() else {
+            return Ok(());
+        };
+        if process_is_running(pid) && self.pid_identity(pid) == PidIdentity::Matches {
+            let _ = ProcessCommand::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .status();
+        }
+        self.remove_pid_files();
+        Ok(())
+    }
+
+    fn read_pid(&self) -> Option<u32> {
+        fs::read_to_string(&self.paths.pid)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+    }
+
+    fn pid_identity(&self, pid: u32) -> PidIdentity {
+        classify_pid_identity(
+            &self.binary,
+            pid,
+            fs::read_to_string(self.pid_metadata_path()).ok().as_deref(),
+            process_argv(pid).as_deref(),
+        )
+    }
+
+    fn pid_metadata(&self, pid: u32, bind: &str) -> String {
+        format!(
+            "pid={pid}\nbinary={}\ncommand=serve\nconfig={}\ndatabase={}\nbind={bind}\n",
+            self.binary.display(),
+            self.paths.config.display(),
+            self.paths.database.display(),
+        )
+    }
+
+    fn pid_metadata_path(&self) -> PathBuf {
+        metadata_path_for_pidfile(&self.paths.pid)
+    }
+
+    fn remove_pid_files(&self) {
+        let _ = fs::remove_file(&self.paths.pid);
+        let _ = fs::remove_file(self.pid_metadata_path());
+    }
+
+    fn launchd_plist_path(&self) -> PathBuf {
+        dirs::home_dir()
+            .unwrap_or_else(|| self.paths.home.clone())
+            .join("Library")
+            .join("LaunchAgents")
+            .join("dev.asylum.daemon.plist")
+    }
+
+    fn systemd_unit_path(&self) -> PathBuf {
+        dirs::home_dir()
+            .unwrap_or_else(|| self.paths.home.clone())
+            .join(".config")
+            .join("systemd")
+            .join("user")
+            .join("asylum.service")
+    }
+}
+
+pub fn select_backend() -> ServiceBackend {
+    if cfg!(target_os = "macos") && command_exists("launchctl") {
+        ServiceBackend::Launchd
+    } else if cfg!(target_os = "linux") && command_exists("systemctl") {
+        ServiceBackend::SystemdUser
+    } else {
+        ServiceBackend::PidFallback
+    }
+}
+
+pub fn render_launchd_plist(config: &ServiceRenderConfig) -> String {
+    let binary = xml_escape(&config.binary.display().to_string());
+    let config_path = xml_escape(&config.config.display().to_string());
+    let database = xml_escape(&config.database.display().to_string());
+    let bind = xml_escape(&config.bind);
+    let log = xml_escape(&config.log.display().to_string());
+    format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n",
+            "<plist version=\"1.0\">\n",
+            "  <dict>\n",
+            "    <key>Label</key>\n",
+            "    <string>{label}</string>\n",
+            "    <key>ProgramArguments</key>\n",
+            "    <array>\n",
+            "      <string>{binary}</string>\n",
+            "      <string>serve</string>\n",
+            "      <string>--config</string>\n",
+            "      <string>{config_path}</string>\n",
+            "      <string>--database</string>\n",
+            "      <string>{database}</string>\n",
+            "      <string>--bind</string>\n",
+            "      <string>{bind}</string>\n",
+            "    </array>\n",
+            "    <key>StandardOutPath</key>\n",
+            "    <string>{log}</string>\n",
+            "    <key>StandardErrorPath</key>\n",
+            "    <string>{log}</string>\n",
+            "    <key>RunAtLoad</key>\n",
+            "    <true/>\n",
+            "    <key>KeepAlive</key>\n",
+            "    <true/>\n",
+            "  </dict>\n",
+            "</plist>\n",
+        ),
+        label = LABEL,
+        binary = binary,
+        config_path = config_path,
+        database = database,
+        bind = bind,
+        log = log,
+    )
+}
+
+pub fn render_systemd_unit(config: &ServiceRenderConfig) -> String {
+    format!(
+        concat!(
+            "[Unit]\n",
+            "Description=Asylum Control Plane\n",
+            "After=network-online.target\n\n",
+            "[Service]\n",
+            "Type=simple\n",
+            "ExecStart={} serve --config {} --database {} --bind {}\n",
+            "Restart=on-failure\n",
+            "RestartSec=3\n",
+            "StandardOutput=append:{}\n",
+            "StandardError=append:{}\n\n",
+            "[Install]\n",
+            "WantedBy=default.target\n",
+        ),
+        systemd_quote_arg(&config.binary.display().to_string()),
+        systemd_quote_arg(&config.config.display().to_string()),
+        systemd_quote_arg(&config.database.display().to_string()),
+        systemd_quote_arg(&config.bind),
+        systemd_setting_path(&config.log.display().to_string()),
+        systemd_setting_path(&config.log.display().to_string()),
+    )
+}
+
+pub fn command_exists(command: &str) -> bool {
+    if command.contains(std::path::MAIN_SEPARATOR) {
+        return PathBuf::from(command).is_file();
+    }
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| dir.join(command).is_file())
+}
+
+fn process_is_running(pid: u32) -> bool {
+    ProcessCommand::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PidIdentity {
+    Matches,
+    Mismatch,
+    Unknown,
+}
+
+fn pid_metadata_matches(binary: &Path, pid: u32, content: &str) -> bool {
+    let mut metadata_pid = None;
+    let mut metadata_binary = None;
+    let mut metadata_command = None;
+    for line in content.lines() {
+        if let Some(value) = line.strip_prefix("pid=") {
+            metadata_pid = value.parse::<u32>().ok();
+        } else if let Some(value) = line.strip_prefix("binary=") {
+            metadata_binary = Some(value);
+        } else if let Some(value) = line.strip_prefix("command=") {
+            metadata_command = Some(value);
+        }
+    }
+    let binary = binary.display().to_string();
+    metadata_pid == Some(pid)
+        && metadata_binary == Some(binary.as_str())
+        && metadata_command == Some("serve")
+}
+
+fn classify_pid_identity(
+    binary: &Path,
+    pid: u32,
+    metadata: Option<&str>,
+    argv: Option<&[String]>,
+) -> PidIdentity {
+    let metadata_match =
+        metadata.map_or(false, |content| pid_metadata_matches(binary, pid, content));
+
+    if let Some(argv) = argv {
+        if !command_argv_matches_asylum(binary, argv) {
+            return PidIdentity::Mismatch;
+        }
+        return match metadata {
+            Some(_) if metadata_match => PidIdentity::Matches,
+            Some(_) => PidIdentity::Mismatch,
+            None => PidIdentity::Unknown,
+        };
+    }
+
+    if metadata.is_none() {
+        PidIdentity::Unknown
+    } else if metadata_match {
+        PidIdentity::Matches
+    } else {
+        PidIdentity::Mismatch
+    }
+}
+
+fn metadata_path_for_pidfile(pidfile: &Path) -> PathBuf {
+    let file_name = pidfile
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| format!("{value}.meta"))
+        .unwrap_or_else(|| "asylum.pid.meta".to_string());
+    pidfile.with_file_name(file_name)
+}
+
+fn process_argv(pid: u32) -> Option<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        let content = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        if content.is_empty() {
+            return None;
+        }
+        let argv = content
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).to_string())
+            .collect::<Vec<_>>();
+        if argv.is_empty() {
+            None
+        } else {
+            Some(argv)
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+fn command_argv_matches_asylum(binary: &Path, argv: &[String]) -> bool {
+    let binary = binary.display().to_string();
+    let Some(argv0) = argv.first() else {
+        return false;
+    };
+    let executable_matches = argv0 == &binary
+        || (Path::new(argv0).file_name() == binary_path_basename(binary.as_str())
+            && !argv0.contains(std::path::MAIN_SEPARATOR));
+    executable_matches && argv.iter().any(|part| part == "serve")
+}
+
+fn binary_path_basename(binary: &str) -> Option<&std::ffi::OsStr> {
+    Path::new(binary).file_name()
+}
+
+fn command_status(command: &str, args: &[&str]) -> ServiceState {
+    match ProcessCommand::new(command).args(args).status() {
+        Ok(status) if status.success() => ServiceState::Running,
+        Ok(_) => ServiceState::Stopped,
+        Err(error) => ServiceState::Unknown(error.to_string()),
+    }
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn systemd_quote_arg(value: &str) -> String {
+    let escaped = value.chars().fold(String::new(), |mut output, character| {
+        match character {
+            '\\' => output.push_str("\\\\"),
+            '"' => output.push_str("\\\""),
+            '%' => output.push_str("%%"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character if character.is_control() => {
+                output.push_str(&format!("\\x{:02x}", character as u32));
+            }
+            character => output.push(character),
+        }
+        output
+    });
+    format!("\"{escaped}\"")
+}
+
+fn systemd_setting_path(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| match character {
+            '%' => "%%".chars().collect::<Vec<_>>(),
+            ' ' => "\\x20".chars().collect::<Vec<_>>(),
+            '\t' => "\\x09".chars().collect::<Vec<_>>(),
+            '\n' => "\\x0a".chars().collect::<Vec<_>>(),
+            '\\' => "\\x5c".chars().collect::<Vec<_>>(),
+            other => vec![other],
+        })
+        .collect()
+}
+
+impl std::fmt::Display for ServiceBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServiceBackend::Launchd => formatter.write_str("launchd"),
+            ServiceBackend::SystemdUser => formatter.write_str("systemd user"),
+            ServiceBackend::PidFallback => formatter.write_str("pid fallback"),
+        }
+    }
+}
+
+impl std::fmt::Display for ServiceState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServiceState::Running => formatter.write_str("running"),
+            ServiceState::Stopped => formatter.write_str("stopped"),
+            ServiceState::Unknown(message) => write!(formatter, "unknown: {message}"),
+        }
+    }
+}
+
+pub fn service_state_from_health(healthy: bool, service_state: ServiceState) -> ServiceState {
+    if healthy {
+        ServiceState::Running
+    } else {
+        service_state
+    }
+}
+
+pub fn require_binary() -> Result<PathBuf> {
+    std::env::current_exe().map_err(|error| anyhow!("locate asylum executable: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render_config() -> ServiceRenderConfig {
+        ServiceRenderConfig {
+            binary: PathBuf::from("/usr/local/bin/asylum"),
+            config: PathBuf::from("/tmp/asylum/config.toml"),
+            database: PathBuf::from("/tmp/asylum/asylum.sqlite3"),
+            bind: "127.0.0.1:7717".to_string(),
+            log: PathBuf::from("/tmp/asylum/logs/asylum.log"),
+        }
+    }
+
+    #[test]
+    fn launchd_renderer_uses_product_paths() {
+        let plist = render_launchd_plist(&render_config());
+        assert!(plist.contains("<string>/usr/local/bin/asylum</string>"));
+        assert!(plist.contains("<string>--config</string>"));
+        assert!(plist.contains("<string>/tmp/asylum/config.toml</string>"));
+        assert!(plist.contains("<string>/tmp/asylum/asylum.sqlite3</string>"));
+        assert!(plist.contains("<string>/tmp/asylum/logs/asylum.log</string>"));
+    }
+
+    #[test]
+    fn systemd_renderer_uses_product_paths() {
+        let unit = render_systemd_unit(&render_config());
+        assert!(unit.contains("ExecStart=\"/usr/local/bin/asylum\" serve --config \"/tmp/asylum/config.toml\" --database \"/tmp/asylum/asylum.sqlite3\" --bind \"127.0.0.1:7717\""));
+        assert!(unit.contains("StandardOutput=append:/tmp/asylum/logs/asylum.log"));
+    }
+
+    #[test]
+    fn systemd_renderer_escapes_spaces_and_specifiers() {
+        let config = ServiceRenderConfig {
+            binary: PathBuf::from("/opt/Asylum %bin/asylum"),
+            config: PathBuf::from("/tmp/asylum config/config%.toml"),
+            database: PathBuf::from("/tmp/asylum data/asylum%.sqlite3"),
+            bind: "127.0.0.1:7717".to_string(),
+            log: PathBuf::from("/tmp/asylum logs/asylum%.log"),
+        };
+        let unit = render_systemd_unit(&config);
+        assert!(unit.contains("\"/opt/Asylum %%bin/asylum\""));
+        assert!(unit.contains("\"/tmp/asylum config/config%%.toml\""));
+        assert!(unit.contains("\"/tmp/asylum data/asylum%%.sqlite3\""));
+        assert!(unit.contains("StandardOutput=append:/tmp/asylum\\x20logs/asylum%%.log"));
+        assert!(unit.contains("StandardError=append:/tmp/asylum\\x20logs/asylum%%.log"));
+    }
+
+    #[test]
+    fn systemd_execstart_args_escape_control_characters() {
+        let rendered = systemd_quote_arg("/tmp/asylum\nbin/\u{0007}asylum");
+        assert_eq!(rendered, "\"/tmp/asylum\\nbin/\\x07asylum\"");
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\u{0007}'));
+    }
+
+    #[test]
+    fn pid_metadata_requires_matching_binary_pid_and_command() {
+        let binary = PathBuf::from("/usr/local/bin/asylum");
+        let content = "pid=42\nbinary=/usr/local/bin/asylum\ncommand=serve\n";
+        assert!(pid_metadata_matches(&binary, 42, content));
+        assert!(!pid_metadata_matches(&binary, 7, content));
+        assert!(!pid_metadata_matches(
+            &binary,
+            42,
+            "pid=42\nbinary=/bin/sleep\ncommand=serve\n"
+        ));
+        assert!(!pid_metadata_matches(
+            &binary,
+            42,
+            "pid=42\nbinary=/usr/local/bin/asylum\ncommand=status\n"
+        ));
+    }
+
+    #[test]
+    fn pid_identity_prefers_metadata_when_argv_is_missing() {
+        let binary = PathBuf::from("/usr/local/bin/asylum");
+        let metadata = "pid=42\nbinary=/usr/local/bin/asylum\ncommand=serve\n";
+        assert_eq!(
+            classify_pid_identity(&binary, 42, Some(metadata), None),
+            PidIdentity::Matches
+        );
+        assert_eq!(
+            classify_pid_identity(
+                &binary,
+                42,
+                Some(metadata),
+                Some(&argv(&["/bin/sleep", "100"]))
+            ),
+            PidIdentity::Mismatch
+        );
+        assert_eq!(
+            classify_pid_identity(
+                &binary,
+                42,
+                Some(metadata),
+                Some(&argv(&["/usr/local/bin/asylum", "serve"]))
+            ),
+            PidIdentity::Matches
+        );
+        assert_eq!(
+            classify_pid_identity(
+                &binary,
+                42,
+                None,
+                Some(&argv(&["/usr/local/bin/asylum", "serve"]))
+            ),
+            PidIdentity::Unknown
+        );
+        assert_eq!(
+            classify_pid_identity(
+                &binary,
+                42,
+                Some("pid=42\nbinary=/bin/asylum\ncommand=serve\n"),
+                None
+            ),
+            PidIdentity::Mismatch
+        );
+    }
+
+    #[test]
+    fn command_argv_matching_requires_executable_identity() {
+        let binary = PathBuf::from("/usr/local/bin/asylum");
+        assert!(command_argv_matches_asylum(
+            &binary,
+            &argv(&["/usr/local/bin/asylum", "serve"])
+        ));
+        assert!(command_argv_matches_asylum(
+            &binary,
+            &argv(&["asylum", "serve"])
+        ));
+        assert!(!command_argv_matches_asylum(
+            &binary,
+            &argv(&["/usr/local/bin/asylum-helper", "serve"])
+        ));
+        assert!(!command_argv_matches_asylum(
+            &binary,
+            &argv(&["sh", "-c", "/usr/local/bin/asylum serve"])
+        ));
+        assert!(!command_argv_matches_asylum(
+            &binary,
+            &argv(&[
+                "/usr/local/bin/asylum-helper",
+                "--old",
+                "/usr/local/bin/asylum",
+                "serve"
+            ])
+        ));
+        assert!(!command_argv_matches_asylum(
+            &binary,
+            &argv(&["/usr/local/bin/asylum serve"])
+        ));
+        assert!(!command_argv_matches_asylum(
+            &binary,
+            &argv(&["/usr/local/bin/asylum", "serve worker"])
+        ));
+        assert!(command_argv_matches_asylum(
+            &PathBuf::from("/Applications/Asylum Bin/asylum"),
+            &argv(&["/Applications/Asylum Bin/asylum", "serve"])
+        ));
+    }
+
+    #[test]
+    fn healthy_service_state_wins_for_status() {
+        assert_eq!(
+            service_state_from_health(true, ServiceState::Stopped),
+            ServiceState::Running
+        );
+        assert_eq!(
+            service_state_from_health(false, ServiceState::Stopped),
+            ServiceState::Stopped
+        );
+    }
+
+    fn argv(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+}

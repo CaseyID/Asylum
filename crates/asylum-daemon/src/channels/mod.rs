@@ -48,7 +48,11 @@ pub struct SeedConfig {
 }
 
 pub fn seed_builtin_channels(store: &Store, seed: SeedConfig) -> Result<()> {
-    let ntfy_status = if seed.ntfy_configured { "live" } else { "configured" };
+    let ntfy_status = if seed.ntfy_configured {
+        "live"
+    } else {
+        "configured"
+    };
     seed_one(
         store,
         NTFY_DEFAULT_ID,
