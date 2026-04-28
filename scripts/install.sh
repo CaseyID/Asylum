@@ -739,6 +739,7 @@ asylum_main() {
   asylum_next_steps
 }
 
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+INSTALLER_SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
+if [[ -z "$INSTALLER_SCRIPT_SOURCE" || "$INSTALLER_SCRIPT_SOURCE" == "${0}" ]]; then
   asylum_main "$@"
 fi
