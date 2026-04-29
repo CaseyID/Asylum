@@ -58,14 +58,23 @@ pub enum NodeLiveness {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CapabilitySnapshot {
+    #[serde(default)]
     pub browser_attach: bool,
+    #[serde(default)]
     pub native_attach: bool,
+    #[serde(default)]
     pub send_input: bool,
+    #[serde(default)]
     pub interrupt: bool,
+    #[serde(default)]
     pub stop: bool,
+    #[serde(default)]
     pub resume: bool,
+    #[serde(default)]
     pub structured_events: bool,
+    #[serde(default)]
     pub transcript_export: bool,
 }
 
@@ -238,5 +247,64 @@ mod tests {
         assert_eq!(round_trip.tokens_out, 34);
         assert_eq!(round_trip.tool_calls, 5);
         assert_eq!(round_trip.idle_seconds, 7);
+    }
+
+    // H4 fix: CapabilitySnapshot must tolerate JSON that is missing some or all fields,
+    // so that adding new capability flags does not break existing stored rows.
+
+    #[test]
+    fn capability_snapshot_partial_json_defaults_missing_fields_to_false() {
+        // Only browser_attach and send_input are present; all others must default.
+        let json = r#"{"browser_attach": true, "send_input": true}"#;
+        let snap: CapabilitySnapshot = serde_json::from_str(json).unwrap();
+        assert!(snap.browser_attach);
+        assert!(snap.send_input);
+        assert!(!snap.native_attach);
+        assert!(!snap.interrupt);
+        assert!(!snap.stop);
+        assert!(!snap.resume);
+        assert!(!snap.structured_events);
+        assert!(!snap.transcript_export);
+    }
+
+    #[test]
+    fn capability_snapshot_empty_object_deserializes_to_all_defaults() {
+        let snap: CapabilitySnapshot = serde_json::from_str("{}").unwrap();
+        assert_eq!(snap, CapabilitySnapshot::default());
+        assert!(!snap.browser_attach);
+        assert!(!snap.native_attach);
+        assert!(!snap.send_input);
+        assert!(!snap.interrupt);
+        assert!(!snap.stop);
+        assert!(!snap.resume);
+        assert!(!snap.structured_events);
+        assert!(!snap.transcript_export);
+    }
+
+    #[test]
+    fn capability_snapshot_full_roundtrip() {
+        let original = CapabilitySnapshot {
+            browser_attach: true,
+            native_attach: true,
+            send_input: true,
+            interrupt: true,
+            stop: true,
+            resume: false,
+            structured_events: false,
+            transcript_export: false,
+        };
+        let serialized = serde_json::to_string(&original).unwrap();
+        let deserialized: CapabilitySnapshot = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(original, deserialized);
+        // Verify the JSON contains the expected keys.
+        let v: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(v["browser_attach"], true);
+        assert_eq!(v["native_attach"], true);
+        assert_eq!(v["send_input"], true);
+        assert_eq!(v["interrupt"], true);
+        assert_eq!(v["stop"], true);
+        assert_eq!(v["resume"], false);
+        assert_eq!(v["structured_events"], false);
+        assert_eq!(v["transcript_export"], false);
     }
 }
