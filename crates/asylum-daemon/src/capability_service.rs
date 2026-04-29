@@ -115,8 +115,21 @@ impl CapabilityService {
         let service = self.clone();
         tokio::spawn(async move {
             let mut rx = engine.subscribe();
-            while let Ok(event) = rx.recv().await {
-                service.process_hook_event(event).await;
+            // Use an explicit match so Lagged (consumer fell behind) is treated
+            // as a recoverable warning rather than terminating the loop.  Only
+            // Closed (sender dropped) should stop hook processing.
+            loop {
+                match rx.recv().await {
+                    Ok(event) => service.process_hook_event(event).await,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            skipped = n,
+                            "hook broadcast channel lagged; {} events dropped, continuing",
+                            n
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
         });
 
@@ -1144,9 +1157,9 @@ impl CapabilityService {
 
         let is_allowed = match &self.auth_mode {
             AuthMode::Disabled => true,
-            AuthMode::OwnerToken { expected_hashes } => expected_hashes
-                .iter()
-                .any(|expected| expected == &token_hash),
+            AuthMode::OwnerToken { config_token_hash } => {
+                config_token_hash.as_deref() == Some(token_hash.as_str())
+            }
         };
 
         if !is_allowed {
@@ -1469,16 +1482,23 @@ impl CapabilityService {
     }
 
     /// Validate a raw token value (no "Bearer " prefix).
+    ///
+    /// The static config token (no DB row) is matched by its hash directly.
+    /// Every DB-issued token goes through `find_token_by_hash`, which enforces
+    /// `revoked = 0 AND expires_at >= now`, so revocation and expiry take effect
+    /// immediately on the next request without a daemon restart.
     pub fn validate_owner_token_value(&self, token: &str) -> bool {
         match self.auth_mode {
             AuthMode::Disabled => true,
             AuthMode::OwnerToken {
-                ref expected_hashes,
+                ref config_token_hash,
             } => {
                 let hash = crate::auth::hash_token(token);
-                if expected_hashes.iter().any(|expected| expected == &hash) {
+                // Short-circuit only for the static config token; it has no DB row.
+                if config_token_hash.as_deref() == Some(hash.as_str()) {
                     return true;
                 }
+                // All DB-issued tokens must pass the live revocation + expiry check.
                 self.store
                     .find_token_by_hash(&hash)
                     .ok()
@@ -1934,7 +1954,7 @@ mod tests {
         let service = CapabilityService::new(
             store,
             AuthMode::OwnerToken {
-                expected_hashes: vec![hash_token(raw)],
+                config_token_hash: Some(hash_token(raw)),
             },
             test_app_config(),
         );
@@ -1960,7 +1980,7 @@ mod tests {
         let service = CapabilityService::new(
             store,
             AuthMode::OwnerToken {
-                expected_hashes: vec![hash_token("bootstrap")],
+                config_token_hash: Some(hash_token("bootstrap")),
             },
             test_app_config(),
         );
@@ -2011,5 +2031,97 @@ mod tests {
         assert_eq!(send_failure.status, "failed");
         assert_eq!(send_failure.result["error"], "node not found");
         Ok(())
+    }
+
+    /// H1: a DB-issued token that is revoked must no longer authenticate, even
+    /// though it was once valid (i.e. the in-memory snapshot, if it existed,
+    /// would still match).  After `store.revoke_token`, the next call to
+    /// `validate_owner_token_value` must return false because we always consult
+    /// `find_token_by_hash` for DB-issued tokens.
+    #[tokio::test]
+    async fn revoked_db_token_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+
+        // Issue and persist a DB token.
+        let issued = issue_owner_token("revoke-test", &["*".to_string()], Some(3600))?;
+        store.insert_token(
+            issued.token_id,
+            &issued.name,
+            &issued.stored_hash,
+            &serde_json::to_string(&issued.scope)?,
+            issued.expires_at_epoch_secs,
+        )?;
+
+        // No config-static token; auth relies entirely on the DB.
+        let service = CapabilityService::new(
+            store.clone(),
+            AuthMode::OwnerToken {
+                config_token_hash: None,
+            },
+            test_app_config(),
+        );
+
+        // Token is valid before revocation.
+        assert!(
+            service.validate_owner_token_value(&issued.raw_token),
+            "token should authenticate before revocation"
+        );
+
+        // Revoke it.
+        store.revoke_token(issued.token_id)?;
+
+        // Token must now be rejected — revocation is enforced on every request.
+        assert!(
+            !service.validate_owner_token_value(&issued.raw_token),
+            "revoked token must not authenticate"
+        );
+        Ok(())
+    }
+
+    /// H2: the hook consumer must survive a broadcast::Lagged error and continue
+    /// processing subsequent events.
+    ///
+    /// Proof-of-concept: subscribe first (so the receiver is live), then
+    /// without draining, flood the 256-slot channel with 300 messages.  The
+    /// next recv() will return Err(Lagged(n)) because the slow consumer fell
+    /// behind.  Assert Lagged is returned, then assert that the receiver
+    /// recovers and can read subsequent messages — i.e. the channel is NOT
+    /// closed and a simple `continue` in the production loop is the right fix.
+    #[tokio::test]
+    async fn hook_consumer_continues_after_broadcast_lag() {
+        use tokio::sync::broadcast::error::RecvError;
+
+        let engine = crate::hooks::HookEngine::new();
+
+        // Subscribe first so this receiver is registered and can fall behind.
+        let mut rx = engine.subscribe();
+
+        // Flood the 256-slot channel with 300 messages without draining rx.
+        // This forces the internal ring buffer to wrap, dropping the oldest
+        // 44 messages from rx's perspective.
+        for i in 0..300u32 {
+            engine.post(HookEvent {
+                event: format!("schedule.test.{i}"),
+                node_id: None,
+                payload: serde_json::json!({}),
+            });
+        }
+
+        // First recv must be Lagged because we overflowed without draining.
+        let first = rx.recv().await;
+        assert!(
+            matches!(first, Err(RecvError::Lagged(_))),
+            "expected Lagged on first recv after overflow, got {first:?}"
+        );
+
+        // After a Lagged the receiver is repositioned to the oldest retained
+        // message.  Subsequent recvs must succeed — the channel is still open.
+        let second = rx.recv().await;
+        assert!(
+            matches!(second, Ok(_)),
+            "consumer should recover after Lagged and read the next retained message, got {second:?}"
+        );
     }
 }

@@ -34,7 +34,7 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let was_bare = cli.command.is_none();
     let paths = RuntimePaths::from_env(cli.config.clone())?;
-    let client = AsylumClient::from_env();
+    let client = runtime_client(&paths)?;
     let command = cli.command.unwrap_or(Command::Cockpit);
 
     match command {
@@ -1400,6 +1400,38 @@ mod tests {
 
         let client = runtime_client(&paths)?;
         assert_eq!(client.base_url(), "http://example.test:9900");
+
+        restore_env("ASYLUM_BIND", prev_bind);
+        restore_env("ASYLUM_BASE_URL", prev_base_url);
+        Ok(())
+    }
+
+    #[test]
+    fn data_plane_arms_use_runtime_client_url_from_config() -> Result<()> {
+        // Verify that runtime_client (used by all dispatch arms after H3 fix)
+        // resolves the base URL from config `listen`, not the hard-coded default.
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let tempdir = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_values(Some(tempdir.path().to_path_buf()), None, None, None);
+        write_config_with_listen(&paths, "127.0.0.1:9999")?;
+
+        let prev_bind = env::var_os("ASYLUM_BIND");
+        let prev_base_url = env::var_os("ASYLUM_BASE_URL");
+        env::remove_var("ASYLUM_BIND");
+        env::remove_var("ASYLUM_BASE_URL");
+
+        let client = runtime_client(&paths)?;
+        // The data-plane client must NOT point at the hard-coded default (7717).
+        assert_ne!(
+            client.base_url(),
+            "http://127.0.0.1:7717",
+            "data-plane client must not use hard-coded default when config overrides listen"
+        );
+        assert_eq!(
+            client.base_url(),
+            "http://127.0.0.1:9999",
+            "data-plane client must use config listen address"
+        );
 
         restore_env("ASYLUM_BIND", prev_bind);
         restore_env("ASYLUM_BASE_URL", prev_base_url);

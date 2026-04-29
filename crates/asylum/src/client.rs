@@ -20,8 +20,10 @@ pub struct AsylumClient {
 }
 
 impl AsylumClient {
+    #[allow(dead_code)]
     const DEFAULT_BASE_URL: &'static str = "http://127.0.0.1:7717";
 
+    #[allow(dead_code)]
     pub fn from_env() -> Self {
         let base_url =
             env::var("ASYLUM_BASE_URL").unwrap_or_else(|_| Self::DEFAULT_BASE_URL.to_string());
