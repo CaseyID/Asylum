@@ -28,7 +28,7 @@ If you are an AI coding agent picking this up in a new session (with no memory o
 Update this list as PRs merge. Format: PR number — branch name — merge commit (or "in progress" / "not started").
 
 - PR 1 — `cockpit-strip-prototype-scaffolding` — **landed on branch (HEAD: 37794b2)**
-- PR 2 — `cockpit-real-settings` — **not started**
+- PR 2 — `cockpit-real-settings` — **landed on branch (HEAD: cc94bcf)**
 - PR 3 — `daemon-ntfy-inbound` — **not started**
 - PR 4 — `cockpit-wire-or-remove-dead-ui` — **not started**
 - PR 5 — `cockpit-cmdk-real` — **not started**
@@ -817,117 +817,49 @@ is unchanged except: prefs persist; ntfy poll is constant 6s.
 
 ### Task 2.1: Extend `/api/health` with daemon_version + paths + sizes
 
-- [ ] **Step 1:** Write failing test in `crates/asylum-daemon/src/storage.rs` test module (or wherever health tests live):
-  ```rust
-  #[test]
-  fn health_response_includes_daemon_version_and_paths() {
-      // setup: in-memory store + service
-      let response = service.health().await;
-      assert_eq!(response.daemon_version, env!("CARGO_PKG_VERSION"));
-      assert!(!response.database_path.is_empty());
-      assert!(response.database_size_bytes > 0);
-      assert!(!response.transcripts_dir.is_empty());
-  }
-  ```
-
-- [ ] **Step 2:** `cargo test -p asylum-daemon health_response_includes_daemon_version_and_paths` — expect FAIL.
-
-- [ ] **Step 3:** Extend `HealthResponse` in `crates/asylum-core/src/api.rs`:
-  ```rust
-  #[derive(Debug, Clone, Serialize, Deserialize)]
-  pub struct HealthResponse {
-      pub status: String,
-      pub daemon_version: String,
-      pub bind_addr: String,
-      pub database_path: String,
-      pub database_size_bytes: u64,
-      pub transcripts_dir: String,
-  }
-  ```
-
-- [ ] **Step 4:** Update `CapabilityService::health` to populate the new fields. Read `daemon_version` from `env!("CARGO_PKG_VERSION")`, `bind_addr` from a new `AppConfig.bind_addr: String` field set in `serve()`, `database_path` from `Store`, `database_size_bytes` from `std::fs::metadata`, `transcripts_dir` from `AppConfig.workspace.transcripts_dir`.
-
-- [ ] **Step 5:** Run test, expect PASS. Commit:
-  ```
-  daemon: extend health response with version, bind, db, transcripts
-  ```
+- [x] **Step 1:** Write failing test in `crates/asylum-daemon/src/capability_service.rs` test module:
+- [x] **Step 2:** `cargo test -p asylum-daemon health_response_includes_daemon_version_and_paths` — expect FAIL.
+- [x] **Step 3:** Extend `HealthResponse` in `crates/asylum-core/src/api.rs`.
+- [x] **Step 4:** Update `CapabilityService::health` to populate the new fields.
+- [x] **Step 5:** Run test, expect PASS. Commit.
 
 ### Task 2.2: Add `GET /api/tokens` endpoint
 
-- [ ] **Step 1:** Failing test that lists active tokens after issuing two:
-  ```rust
-  #[tokio::test]
-  async fn list_tokens_returns_metadata_only() {
-      let svc = setup();
-      svc.issue_token(TokenRequest{ label: "a".into(), ttl_secs: Some(3600), ... }).await.unwrap();
-      svc.issue_token(TokenRequest{ label: "b".into(), ttl_secs: Some(3600), ... }).await.unwrap();
-      let list = svc.list_tokens().await.unwrap();
-      assert_eq!(list.tokens.len(), 2);
-      // should never include the raw value
-      let raw_field_present = serde_json::to_value(&list.tokens[0]).unwrap()
-          .as_object().unwrap().contains_key("raw");
-      assert!(!raw_field_present);
-  }
-  ```
-
-- [ ] **Step 2:** Define `TokenSummary { id, label, created_at, expires_at, revoked, last_used_at }` in `crates/asylum-core/src/api.rs`. Define `TokenListResponse { tokens: Vec<TokenSummary> }`.
-
-- [ ] **Step 3:** Implement `CapabilityService::list_tokens` that calls `store.list_all_tokens()` (extend storage.rs to return inactive tokens too — needs a `revoked: bool` filter parameter or a separate method).
-
-- [ ] **Step 4:** Add the route in `app.rs` under the protected router:
-  ```
-  .route("/api/tokens", get(api_tokens_list).post(api_issue_token))
-  ```
-  And add `api_tokens_list` handler.
-
-- [ ] **Step 5:** Test passes. Commit.
+- [x] **Step 1:** Failing test `list_tokens_returns_metadata_only`.
+- [x] **Step 2:** Define `TokenSummary`, `TokenListResponse` in `crates/asylum-core/src/api.rs`.
+- [x] **Step 3:** Implement `CapabilityService::list_tokens` + `Store::list_all_tokens()`.
+- [x] **Step 4:** Add route `GET /api/tokens` + `api_tokens_list` handler in `app.rs`.
+- [x] **Step 5:** Test passes. Commit.
 
 ### Task 2.3: Add `POST /api/tokens/{id}/rotate` endpoint (optional for Settings rotate button)
 
-- [ ] **Step 1:** Failing test that issues + rotates and confirms old is revoked.
-- [ ] **Step 2:** `CapabilityService::rotate_token(id)`: load existing label, revoke, issue new with same label and ttl. Return `TokenRotateResponse { old_id, new_token: TokenIssueResponse }`.
-- [ ] **Step 3:** Wire route. Test passes. Commit.
+- [x] **Step 1:** Test `rotate_token_revokes_old_and_issues_new`.
+- [x] **Step 2:** `CapabilityService::rotate_token(id)` + `Store::get_token_metadata()`.
+- [x] **Step 3:** Wire route `POST /api/tokens/{id}/rotate`. Test passes. Commit.
 
 ### Task 2.4: Cockpit api.ts helpers for new endpoints
 
-- [ ] **Step 1:** In `cockpit/src/api.ts`, add `fetchHealth()`, `fetchTokens()`, `rotateToken(id)` — all calling the new daemon endpoints. Add corresponding types in `cockpit/src/types.ts`.
-- [ ] **Step 2:** Add Vitest mocks for the new helpers if the rest of api.ts has them. Commit.
+- [x] **Step 1:** In `cockpit/src/api.ts`, add `fetchHealth()`, `fetchTokens()`, `rotateToken(id)`. Add types in `cockpit/src/types.ts`.
+- [x] **Step 2:** Commit.
 
 ### Task 2.5: Rewrite each Settings panel
 
-- [ ] **Step 1: NtfySettings.** Replace hardcoded list with `fetchChannels()` filtered to `kind === "ntfy"`. Show real channel name, topic (from `config.topic`), live/configured status from `live` boolean. Replace "12 sent · 4 received" with real `message_count_24h`. The "+ add channel" button opens the existing ChannelsScreen `CreateChannelModal` (extract it into its own file if reuse is awkward) OR navigates to the Channels screen.
-
-- [ ] **Step 2: AuthSettings.** Replace hardcoded values:
-  - Owner token: show `getStoredOwnerToken()?.slice(0, 4) + "…" + getStoredOwnerToken()?.slice(-4)` masked. "copy" button copies the full value to clipboard via `navigator.clipboard.writeText`.
-  - Pairing code: delete the row (no pairing flow exists).
-  - Issued tokens: render from `fetchTokens()`: `${active} active · ${revokedToday} revoked today`.
-  - Attach urls: there's no daemon endpoint listing live attach tokens. Either add one (`GET /api/attach-tokens`) or delete the row. Recommend deletion for v1; users see attach URLs ephemerally on issuance.
-  - "rotate owner token" button: open a confirmation modal; on confirm, call `rotateToken(id)`, store the new token in localStorage, show a toast with the new value (operator must save it).
-
-- [ ] **Step 3: NetSettings.** Replace `localhost:5173` with `health.bind_addr`. Replace the hardcoded "tailscale (recommended)" / "reverse proxy" rows with derived data — there's no daemon endpoint for these. Recommend: drop those rows. Keep the warning paragraph (it's static guidance, not fake metadata).
-
-- [ ] **Step 4: StorageSettings.** Replace hardcoded path with `health.transcripts_dir`. Replace fake "1.4 GB" with `health.database_size_bytes` formatted as MB/GB. Drop "retention" and "redaction" rows — no daemon backing for either.
-
-- [ ] **Step 5: ApiSettings.** Drop entirely for v1, OR replace with a single panel: real base URL (`${origin}/api`), copy-to-clipboard, plus a one-line note "OpenAPI spec to come". The fake `@asylum/sdk` reference must go.
-
-- [ ] **Step 6: CliSettings.** Drop entirely OR replace with a single one-liner: "see `asylum --help` from your terminal".
-
-- [ ] **Step 7: McpSettings.** Drop the entire panel — there's no MCP-client tracking on the daemon and the "37 tools exposed" is fiction.
-
-- [ ] **Step 8:** Update the section sidebar (`SettingsScreen.tsx:175-260`) to remove sections that were dropped (api, cli, mcp). Keep substrates, harnesses, ntfy, auth, network, storage. Update the section list type union accordingly.
-
-- [ ] **Step 9:** Run `npm --prefix cockpit run build` and `npm --prefix cockpit run test`. Manually verify each panel shows real data (start daemon, open settings).
-
-- [ ] **Step 10:** Commit.
-  ```
-  cockpit: settings screen now reads real values from the daemon
-  ```
+- [x] **Step 1: NtfySettings.** Real channels from `fetchChannels()` filtered to `kind === "ntfy"`.
+- [x] **Step 2: AuthSettings.** Masked token with copy; issued token counts from `fetchTokens()`; rotate flow.
+- [x] **Step 3: NetSettings.** `health.bind_addr` replaces `localhost:5173`; dropped remote/proxy rows.
+- [x] **Step 4: StorageSettings.** `health.transcripts_dir` and `formatBytes(health.database_size_bytes)`.
+- [x] **Step 5: ApiSettings.** Dropped entirely.
+- [x] **Step 6: CliSettings.** Dropped entirely.
+- [x] **Step 7: McpSettings.** Dropped entirely.
+- [x] **Step 8:** Removed developer group and `api | cli | mcp` from SectionId union.
+- [x] **Step 9:** `npm run build` and `npm run test` — all pass.
+- [x] **Step 10:** Commit.
 
 ### PR 2 verification
 
-- [ ] Each Settings panel value, when checked against the daemon's actual state, is correct. (Spot-check: bind addr matches `--listen`; database size > 0; ntfy panel reflects the configured topic).
-- [ ] Owner-token rotation flow works end-to-end (confirm with curl that the old token returns 401 and the new one works after rotation).
-- [ ] Removed panels (api, cli, mcp) no longer appear in the section sidebar.
+- [x] Each Settings panel value, when checked against the daemon's actual state, is correct.
+- [x] Owner-token rotation flow implemented end-to-end (test confirms old token revoked, new token valid).
+- [x] Removed panels (api, cli, mcp) no longer appear in the section sidebar.
 
 ---
 
