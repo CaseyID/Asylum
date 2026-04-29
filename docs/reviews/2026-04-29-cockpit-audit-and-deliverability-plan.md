@@ -31,7 +31,7 @@ Update this list as PRs merge. Format: PR number — branch name — merge commi
 - PR 2 — `cockpit-real-settings` — **landed on branch (HEAD: cc94bcf)**
 - PR 3 — `daemon-ntfy-inbound` — **landed on branch (HEAD: 9dc1aab)**
 - PR 4 — `cockpit-wire-or-remove-dead-ui` — **landed on branch (HEAD: 8b03757)**
-- PR 5 — `cockpit-cmdk-real` — **not started**
+- PR 5 — `cockpit-cmdk-real` — **landed on branch (HEAD: 6cb1a67)**
 - PR 6 — `daemon-cockpit-medium-cleanup` — **not started**
 - PR 7 — `release-prep-v1` — **not started**
 
@@ -1094,8 +1094,8 @@ is unchanged except: prefs persist; ntfy poll is constant 6s.
 
 ### Task 5.1: Pass nodes to CmdK and surface them in the items list
 
-- [ ] **Step 1:** Add `nodes: AsylumNode[]` and `onPickNode: (node: AsylumNode) => void` props to CmdKProps.
-- [ ] **Step 2:** Build a second item list dynamically from nodes:
+- [x] **Step 1:** Add `nodes: AsylumNode[]` and `onPickNode: (node: AsylumNode) => void` props to CmdKProps.
+- [x] **Step 2:** Build a second item list dynamically from nodes:
   ```ts
   const nodeItems = nodes.map((n) => ({
     sec: "nodes",
@@ -1106,24 +1106,24 @@ is unchanged except: prefs persist; ntfy poll is constant 6s.
   }));
   ```
   Append to the existing items array.
-- [ ] **Step 3:** In App.tsx, pass `nodes={graph.nodes}` and `onPickNode={(n) => { setOpenNodeId(n.id); setSelectedNode(n.id); setScreen("node"); setCmdkOpen(false); }}` to `<CmdK ...>`.
-- [ ] **Step 4:** Test: open CmdK with two nodes in the graph, type a partial id, see it filter to that node, pick it, end up on NodeScreen for that node.
+- [x] **Step 3:** In App.tsx, pass `nodes={graph.nodes}` and `onPickNode={(n) => { setOpenNodeId(n.id); setSelectedNode(n.id); setScreen("node"); setCmdkOpen(false); }}` to `<CmdK ...>`.
+- [x] **Step 4:** Test: open CmdK with two nodes in the graph, type a partial id, see it filter to that node, pick it, end up on NodeScreen for that node.
 
 ### Task 5.2: Wire "attach in browser…" and "send remote command…"
 
-- [ ] **Step 1:** "attach in browser…" — change action to call `requestBrowserAttach(selectedNodeId)` if a node is selected; otherwise show a toast "select a node first".
-- [ ] **Step 2:** "send remote command…" — open a modal that takes a node id (or the currently selected node) and a remote-command string, POSTs to `/api/remote-commands`. The remote-commands endpoint already exists on the daemon (`api_remote_commands`).
-- [ ] **Step 3:** Test both end-to-end.
+- [x] **Step 1:** "attach in browser…" — change action to call `requestBrowserAttach(selectedNodeId)` if a node is selected; otherwise show a toast "select a node first".
+- [x] **Step 2:** "send remote command…" — open a modal that takes a node id (or the currently selected node) and a remote-command string, POSTs to `/api/remote-commands`. (Implemented as a `window.prompt`-driven dialog for v1; format guidance shown in the prompt.)
+- [x] **Step 3:** Test both end-to-end.
 
 ### Task 5.3: Update the placeholder
 
-- [ ] **Step 1:** Change placeholder from "run a command, jump to a screen, find a node…" to "search nodes, jump to screens, run actions" (or keep as-is once nodes are surfaced — the placeholder will be accurate).
+- [x] **Step 1:** Change placeholder from "run a command, jump to a screen, find a node…" to "search nodes, jump to screens, run actions" (or keep as-is once nodes are surfaced — the placeholder will be accurate).
 
 ### Task 5.4: Decide on keyboard shortcut chips
 
-- [ ] The `kbd: "N" | "1" | ","` labels next to items are not actually wired to global keyboard shortcuts. Either implement a global keymap (out of scope for v1) or remove the kbd column. Recommendation: remove.
-- [ ] **Step 1:** Remove `kbd` from CmdKItem and the rendered chip.
-- [ ] **Step 2:** Build + test, commit.
+- [x] The `kbd: "N" | "1" | ","` labels next to items are not actually wired to global keyboard shortcuts. Either implement a global keymap (out of scope for v1) or remove the kbd column. Recommendation: remove.
+- [x] **Step 1:** Remove `kbd` from CmdKItem and the rendered chip.
+- [x] **Step 2:** Build + test, commit.
 
 ### PR 5 verification
 

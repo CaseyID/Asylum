@@ -375,6 +375,20 @@ export async function rotateToken(id: string): Promise<TokenRotateResponse> {
   return request<TokenRotateResponse>(`/tokens/${id}/rotate`, { method: "POST" });
 }
 
+export interface RemoteCommandResponse {
+  kind: string;
+  status: string;
+  node_id: string | null;
+  result: unknown;
+}
+
+export async function sendRemoteCommand(command: string): Promise<RemoteCommandResponse> {
+  return request<RemoteCommandResponse>("/remote-commands", {
+    method: "POST",
+    body: JSON.stringify({ command }),
+  });
+}
+
 // — observe websocket —
 
 export interface ObserveSocketOptions {
