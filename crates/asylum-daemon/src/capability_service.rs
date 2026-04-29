@@ -115,8 +115,21 @@ impl CapabilityService {
         let service = self.clone();
         tokio::spawn(async move {
             let mut rx = engine.subscribe();
-            while let Ok(event) = rx.recv().await {
-                service.process_hook_event(event).await;
+            // Use an explicit match so Lagged (consumer fell behind) is treated
+            // as a recoverable warning rather than terminating the loop.  Only
+            // Closed (sender dropped) should stop hook processing.
+            loop {
+                match rx.recv().await {
+                    Ok(event) => service.process_hook_event(event).await,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            skipped = n,
+                            "hook broadcast channel lagged; {} events dropped, continuing",
+                            n
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
         });
 
@@ -2065,5 +2078,50 @@ mod tests {
             "revoked token must not authenticate"
         );
         Ok(())
+    }
+
+    /// H2: the hook consumer must survive a broadcast::Lagged error and continue
+    /// processing subsequent events.
+    ///
+    /// Proof-of-concept: subscribe first (so the receiver is live), then
+    /// without draining, flood the 256-slot channel with 300 messages.  The
+    /// next recv() will return Err(Lagged(n)) because the slow consumer fell
+    /// behind.  Assert Lagged is returned, then assert that the receiver
+    /// recovers and can read subsequent messages — i.e. the channel is NOT
+    /// closed and a simple `continue` in the production loop is the right fix.
+    #[tokio::test]
+    async fn hook_consumer_continues_after_broadcast_lag() {
+        use tokio::sync::broadcast::error::RecvError;
+
+        let engine = crate::hooks::HookEngine::new();
+
+        // Subscribe first so this receiver is registered and can fall behind.
+        let mut rx = engine.subscribe();
+
+        // Flood the 256-slot channel with 300 messages without draining rx.
+        // This forces the internal ring buffer to wrap, dropping the oldest
+        // 44 messages from rx's perspective.
+        for i in 0..300u32 {
+            engine.post(HookEvent {
+                event: format!("schedule.test.{i}"),
+                node_id: None,
+                payload: serde_json::json!({}),
+            });
+        }
+
+        // First recv must be Lagged because we overflowed without draining.
+        let first = rx.recv().await;
+        assert!(
+            matches!(first, Err(RecvError::Lagged(_))),
+            "expected Lagged on first recv after overflow, got {first:?}"
+        );
+
+        // After a Lagged the receiver is repositioned to the oldest retained
+        // message.  Subsequent recvs must succeed — the channel is still open.
+        let second = rx.recv().await;
+        assert!(
+            matches!(second, Ok(_)),
+            "consumer should recover after Lagged and read the next retained message, got {second:?}"
+        );
     }
 }
