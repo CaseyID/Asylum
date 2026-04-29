@@ -24,9 +24,10 @@ use uuid::Uuid;
 use crate::attach::AttachTokenIssuer;
 use crate::auth::{issue_owner_token, AuthMode};
 use crate::channels::{
-    descriptor_from_row, message_record_from_row, render_template, require_channel,
+    descriptor_from_row, message_record_from_row, ntfy_inbound, render_template, require_channel,
     seed_builtin_channels, SeedConfig, NTFY_DEFAULT_ID,
 };
+use crate::channels::ntfy_inbound::NtfyInboundConfig;
 use crate::harness::HarnessRegistry;
 use crate::hooks::{
     evaluate_filter, event_catalog, firing_record_from_row, rule_from_row, HookEngine, HookEvent,
@@ -57,6 +58,7 @@ pub struct AppConfig {
     pub ntfy_server: Option<String>,
     pub ntfy_topic: Option<String>,
     pub ntfy_token: Option<String>,
+    pub ntfy_poll_interval_seconds: Option<u64>,
     pub harness: HarnessConfig,
     pub loon: LoonConfig,
 }
@@ -162,14 +164,53 @@ impl CapabilityService {
                 });
             }
         });
+
+        if let (Some(server), Some(topic)) = (&self.config.ntfy_server, &self.config.ntfy_topic) {
+            let cfg = NtfyInboundConfig {
+                server: server.clone(),
+                topic: topic.clone(),
+                channel_id: NTFY_DEFAULT_ID.to_string(),
+                poll_interval_seconds: self.config.ntfy_poll_interval_seconds.unwrap_or(15),
+                token: self.config.ntfy_token.clone(),
+            };
+            let service = self.clone();
+            tokio::spawn(async move {
+                ntfy_inbound::run(service, cfg).await;
+            });
+        }
     }
 
-    fn post_hook_event(&self, event: &str, node_id: Option<Uuid>, payload: JsonValue) {
+    pub(crate) fn post_hook_event(&self, event: &str, node_id: Option<Uuid>, payload: JsonValue) {
         self.hook_engine.post(HookEvent {
             event: event.to_string(),
             node_id,
             payload,
         });
+    }
+
+    /// Insert an inbound channel message and fire the `channel.inbound` hook event.
+    /// Used by the HTTP inbound handler and the ntfy subscriber.
+    pub(crate) fn record_channel_inbound(
+        &self,
+        channel_id: &str,
+        sender: &str,
+        subject: &str,
+        body: &str,
+        replies: &[String],
+    ) -> Result<()> {
+        self.store
+            .insert_channel_message(channel_id, "in", sender, subject, body, replies)?;
+        self.post_hook_event(
+            "channel.inbound",
+            None,
+            serde_json::json!({
+                "channel_id": channel_id,
+                "sender": sender,
+                "subject": subject,
+                "body": body,
+            }),
+        );
+        Ok(())
     }
 
     async fn process_hook_event(&self, event: HookEvent) {
@@ -1671,25 +1712,13 @@ impl CapabilityService {
 
     pub async fn channel_inbound(&self, id: &str, request: ChannelInboundRequest) -> Result<()> {
         require_channel(&self.store, id)?;
-        self.store.insert_channel_message(
+        self.record_channel_inbound(
             id,
-            "in",
             &request.sender,
             &request.subject,
             &request.body,
             &request.replies,
-        )?;
-        self.post_hook_event(
-            "channel.inbound",
-            None,
-            serde_json::json!({
-                "channel_id": id,
-                "sender": request.sender,
-                "subject": request.subject,
-                "body": request.body,
-            }),
-        );
-        Ok(())
+        )
     }
 
     pub async fn list_hooks(&self) -> Result<HookListResponse> {
@@ -1992,6 +2021,7 @@ mod tests {
             ntfy_server: core.ntfy.server,
             ntfy_topic: core.ntfy.topic,
             ntfy_token: core.ntfy.token,
+            ntfy_poll_interval_seconds: Some(core.ntfy.poll_interval_seconds),
             harness: core.harness,
             loon: core.loon,
         }

@@ -13,7 +13,7 @@ axum = { version = "0.8", features = ["ws", "macros", "query"] }
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "5"
 portable-pty = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rust-embed = "8" # Used to embed cockpit/dist for release binary asset serving
 serde = { version = "1", features = ["derive"] }
