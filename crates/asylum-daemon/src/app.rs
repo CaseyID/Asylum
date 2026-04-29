@@ -95,11 +95,24 @@ pub async fn serve(bind: SocketAddr, database: String, config: AsylumConfig) -> 
     } else {
         config.base_url.clone()
     };
+    let transcripts_dir = config
+        .harness
+        .default_workspace_root
+        .as_ref()
+        .map(|p| p.join("transcripts").display().to_string())
+        .unwrap_or_else(|| {
+            // fall back to ~/.asylum/transcripts if no workspace root is configured
+            std::env::var("HOME")
+                .map(|h| format!("{h}/.asylum/transcripts"))
+                .unwrap_or_else(|_| ".asylum/transcripts".to_string())
+        });
     let service = CapabilityService::new(
         store,
         auth_mode,
         AppConfig {
             base_url,
+            bind_addr: format!("{bind}"),
+            transcripts_dir,
             workspace_recent_limit: config.workspace.recent_limit,
             ntfy_server: config.ntfy.server,
             ntfy_topic: config.ntfy.topic,
@@ -141,8 +154,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/nodes/{id}/attach/native-target",
             post(api_node_attach_native),
         )
-        .route("/api/tokens", post(api_issue_token))
+        .route("/api/tokens", get(api_tokens_list).post(api_issue_token))
         .route("/api/tokens/{id}", delete(api_revoke_token))
+        .route("/api/tokens/{id}/rotate", post(api_token_rotate))
         .route("/api/harnesses", get(api_harnesses))
         .route("/api/substrates", get(api_substrates))
         .route("/api/harness-descriptors", get(api_harness_descriptors))
@@ -535,6 +549,31 @@ pub async fn api_revoke_token(
         Ok(false) => StatusCode::NOT_FOUND,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+pub async fn api_tokens_list(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<asylum_core::api::TokenListResponse>, AppError> {
+    let response = state
+        .service
+        .list_tokens()
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(response))
+}
+
+pub async fn api_token_rotate(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<asylum_core::api::TokenRotateResponse>, AppError> {
+    let id = Uuid::parse_str(&id)
+        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "invalid token id".to_string()))?;
+    let response = state
+        .service
+        .rotate_token(id)
+        .await
+        .map_err(|e| AppError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(response))
 }
 
 pub async fn api_notifications(
