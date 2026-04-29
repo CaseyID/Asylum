@@ -202,14 +202,6 @@ function ChannelDetail({
           <div className="g">⌖</div>
           <div className="t">adapter not built</div>
           <div className="d">{ch.detail}</div>
-          <div className="row" style={{ marginTop: 16 }}>
-            <Btn size="sm" icon="git-pull-request">
-              view spec
-            </Btn>
-            <Btn size="sm" kind="ghost" icon="thumbs-up">
-              upvote
-            </Btn>
-          </div>
         </div>
       )}
     </div>

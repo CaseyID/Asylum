@@ -15,6 +15,7 @@ import {
   interruptNode,
   postNodeInput,
   requestBrowserAttach,
+  requestNativeTarget,
   setStoredOwnerToken,
   stopNode,
 } from "./api";
@@ -35,6 +36,7 @@ import { ChatScreen } from "./screens/ChatScreen";
 import { FirstRunScreen } from "./screens/FirstRunScreen";
 import type { GraphNode } from "./components/Graph";
 import type { InspectorAction } from "./components/Inspector";
+import type { NodeScreenAction } from "./screens/NodeScreen";
 import { useUiPrefs } from "./lib/uiPrefs";
 import type {
   AsylumNode,
@@ -263,7 +265,7 @@ export function App() {
     setScreen("node");
   };
 
-  async function handleNodeAction(target: AsylumNode | undefined, action: InspectorAction, _payload?: string) {
+  async function handleNodeAction(target: AsylumNode | undefined, action: InspectorAction | NodeScreenAction, _payload?: string) {
     if (!target) return;
     try {
       if (action === "attach") {
@@ -272,6 +274,13 @@ export function App() {
         if (typeof window !== "undefined" && r.attach_url) {
           window.open(r.attach_url, "_blank", "noopener,noreferrer");
         }
+      } else if (action === "native-attach") {
+        const r = await requestNativeTarget(target.id);
+        const cmd = [r.command, ...r.args].join(" ");
+        if (typeof navigator !== "undefined" && navigator.clipboard) {
+          await navigator.clipboard.writeText(cmd);
+        }
+        setLocalNotice("native attach command copied to clipboard");
       } else if (action === "send") {
         setSelectedNode(target.id);
       } else if (action === "interrupt") {
