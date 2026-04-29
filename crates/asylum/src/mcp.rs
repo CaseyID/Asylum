@@ -69,9 +69,10 @@ pub async fn run_stdio_server(client: Arc<AsylumClient>) -> Result<()> {
             continue;
         }
 
-        let response = match serde_json::from_str::<RpcRequest>(trimmed) {
+        // M7: JSON-RPC notifications (id=None) must not receive a response.
+        let maybe_response = match serde_json::from_str::<RpcRequest>(trimmed) {
             Ok(request) => handle_request(&client, request).await,
-            Err(err) => RpcResponse {
+            Err(err) => Some(RpcResponse {
                 jsonrpc: "2.0",
                 id: Value::Null,
                 result: None,
@@ -80,13 +81,15 @@ pub async fn run_stdio_server(client: Arc<AsylumClient>) -> Result<()> {
                     message: format!("invalid JSON-RPC request: {err}"),
                     data: None,
                 }),
-            },
+            }),
         };
 
-        let response = serde_json::to_string(&response)?;
-        writer.write_all(response.as_bytes())?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
+        if let Some(response) = maybe_response {
+            let response = serde_json::to_string(&response)?;
+            writer.write_all(response.as_bytes())?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
+        }
     }
 
     Ok(())
@@ -94,6 +97,7 @@ pub async fn run_stdio_server(client: Arc<AsylumClient>) -> Result<()> {
 
 fn tool_definitions() -> Vec<ToolSpec> {
     vec![
+        // — node lifecycle —
         ToolSpec {
             name: "node.create",
             description: "Create a new node",
@@ -138,7 +142,7 @@ fn tool_definitions() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "node.interrupt",
-            description: "Interrupt a node",
+            description: "Interrupt a node (send SIGINT)",
             input_schema: json!({
                 "type":"object",
                 "properties":{"node_id":{"type":"string"}},
@@ -147,7 +151,7 @@ fn tool_definitions() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "node.stop",
-            description: "Stop a node",
+            description: "Stop a node gracefully",
             input_schema: json!({
                 "type":"object",
                 "properties":{"node_id":{"type":"string"}},
@@ -155,8 +159,129 @@ fn tool_definitions() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "node.archive",
+            description: "Archive a node and export its transcript",
+            input_schema: json!({
+                "type":"object",
+                "properties":{"node_id":{"type":"string"}},
+                "required":["node_id"]
+            }),
+        },
+        ToolSpec {
+            name: "node.events",
+            description: "List events for a node",
+            input_schema: json!({
+                "type":"object",
+                "properties":{"node_id":{"type":"string"}},
+                "required":["node_id"]
+            }),
+        },
+        ToolSpec {
+            name: "node.fork",
+            description: "Fork a node into a new node inheriting harness/substrate/workspace",
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "node_id":{"type":"string"},
+                    "role_hint":{"type":"string"},
+                    "workspace":{"type":"string"},
+                    "description":{"type":"string"},
+                },
+                "required":["node_id"]
+            }),
+        },
+        ToolSpec {
+            name: "node.attach_url",
+            description: "Issue browser attach URL for a node (alias for attach_url.issue)",
+            input_schema: json!({
+                "type":"object",
+                "properties":{"node_id":{"type":"string"}},
+                "required":["node_id"]
+            }),
+        },
+        // — graph —
+        ToolSpec {
             name: "graph.get",
-            description: "Fetch current graph",
+            description: "Fetch current node graph (nodes + relationships)",
+            input_schema: json!({"type":"object","properties":{}}),
+        },
+        ToolSpec {
+            name: "relationship.create",
+            description: "Create a relationship between two nodes",
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "source_node_id":{"type":"string"},
+                    "target_node_id":{"type":"string"},
+                    "kind":{"type":"string","description":"e.g. spawned_for, parent_of"},
+                    "label":{"type":"string"},
+                },
+                "required":["source_node_id","target_node_id","kind"]
+            }),
+        },
+        ToolSpec {
+            name: "relationship.list",
+            description: "List all relationships in the graph",
+            input_schema: json!({"type":"object","properties":{}}),
+        },
+        // — hooks —
+        ToolSpec {
+            name: "hook.list",
+            description: "List all automation hooks",
+            input_schema: json!({"type":"object","properties":{}}),
+        },
+        ToolSpec {
+            name: "hook.create",
+            description: "Create an automation hook",
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "name":{"type":"string"},
+                    "event":{"type":"string"},
+                    "filter":{"type":"string"},
+                    "actions":{"type":"array","items":{"type":"object"}},
+                    "enabled":{"type":"boolean"},
+                },
+                "required":["name","event","actions"]
+            }),
+        },
+        ToolSpec {
+            name: "hook.delete",
+            description: "Delete an automation hook by id",
+            input_schema: json!({
+                "type":"object",
+                "properties":{"hook_id":{"type":"string"}},
+                "required":["hook_id"]
+            }),
+        },
+        ToolSpec {
+            name: "hook.firings",
+            description: "List recent hook firing records",
+            input_schema: json!({"type":"object","properties":{}}),
+        },
+        // — channels —
+        ToolSpec {
+            name: "channel.list",
+            description: "List notification channels",
+            input_schema: json!({"type":"object","properties":{}}),
+        },
+        ToolSpec {
+            name: "channel.send",
+            description: "Send a notification via a channel",
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "channel_id":{"type":"string"},
+                    "title":{"type":"string"},
+                    "body":{"type":"string"},
+                },
+                "required":["channel_id","title","body"]
+            }),
+        },
+        // — system —
+        ToolSpec {
+            name: "health.get",
+            description: "Check daemon health",
             input_schema: json!({"type":"object","properties":{}}),
         },
         ToolSpec {
@@ -168,11 +293,17 @@ fn tool_definitions() -> Vec<ToolSpec> {
                 "required":["node_id"]
             }),
         },
+        // Skipped (out of scope for v1 MCP): token management (security-sensitive),
+        // substrate/harness descriptors (static metadata), recipe spawning,
+        // workspace operations, artifact refs, decision request/resolve.
     ]
 }
 
-async fn handle_request(client: &AsylumClient, request: RpcRequest) -> RpcResponse {
+/// M7: Returns None for JSON-RPC notifications (id is absent); caller must not send a response.
+async fn handle_request(client: &AsylumClient, request: RpcRequest) -> Option<RpcResponse> {
+    let is_notification = request.id.is_none();
     let request_id = request.id.unwrap_or(Value::Null);
+
     let mut response = match request.method.as_str() {
         "initialize" => RpcResponse {
             jsonrpc: "2.0",
@@ -184,6 +315,10 @@ async fn handle_request(client: &AsylumClient, request: RpcRequest) -> RpcRespon
             })),
             error: None,
         },
+        "notifications/initialized" | "notifications/cancelled" => {
+            // well-known notification types — no response
+            return None;
+        }
         "tools/list" => RpcResponse {
             jsonrpc: "2.0",
             id: Value::Null,
@@ -199,19 +334,32 @@ async fn handle_request(client: &AsylumClient, request: RpcRequest) -> RpcRespon
             error: None,
         },
         "tools/call" => handle_tools_call(client, request.params).await,
-        _ => RpcResponse {
-            jsonrpc: "2.0",
-            id: Value::Null,
-            result: None,
-            error: Some(RpcError {
-                code: -32601,
-                message: format!("method not found: {}", request.method),
-                data: None,
-            }),
-        },
+        unknown => {
+            if is_notification {
+                // Unknown notification — log and discard; do not reply
+                eprintln!("[mcp] received unknown JSON-RPC notification '{unknown}'; ignoring");
+                return None;
+            }
+            RpcResponse {
+                jsonrpc: "2.0",
+                id: Value::Null,
+                result: None,
+                error: Some(RpcError {
+                    code: -32601,
+                    message: format!("method not found: {unknown}"),
+                    data: None,
+                }),
+            }
+        }
     };
+
+    if is_notification {
+        // Even if we built a response, do not send for notifications
+        return None;
+    }
+
     response.id = request_id;
-    response
+    Some(response)
 }
 
 async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcResponse {
@@ -286,11 +434,57 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
                 Err(err) => rpc_error(-32000, &format!("node.stop failed: {err}")),
             }
         }
-        "graph.get" => match client.graph().await {
-            Ok(response) => content_result(json!({ "graph": response.graph })),
-            Err(err) => rpc_error(-32000, &format!("graph.get failed: {err}")),
-        },
-        "attach_url.issue" => {
+        "node.archive" => {
+            let node_id = match parse_node_id(&params.arguments) {
+                Ok(node_id) => node_id,
+                Err(err) => return rpc_error(-32602, &err),
+            };
+            match client.archive_node(node_id).await {
+                Ok(()) => content_result(json!({"ok":true})),
+                Err(err) => rpc_error(-32000, &format!("node.archive failed: {err}")),
+            }
+        }
+        "node.events" => {
+            let node_id = match parse_node_id(&params.arguments) {
+                Ok(node_id) => node_id,
+                Err(err) => return rpc_error(-32602, &err),
+            };
+            match client.node_events(node_id).await {
+                Ok(response) => content_result(json!({ "events": response.events })),
+                Err(err) => rpc_error(-32000, &format!("node.events failed: {err}")),
+            }
+        }
+        "node.fork" => {
+            #[derive(Deserialize)]
+            struct ForkArgs {
+                node_id: String,
+                role_hint: Option<String>,
+                workspace: Option<String>,
+                description: Option<String>,
+            }
+            let args: ForkArgs = match serde_json::from_value(params.arguments) {
+                Ok(a) => a,
+                Err(err) => return rpc_error(-32602, &format!("node.fork: invalid args: {err}")),
+            };
+            let node_id = match parse_node_id_str(&args.node_id) {
+                Ok(id) => id,
+                Err(err) => return rpc_error(-32602, &err),
+            };
+            let path = format!("/api/nodes/{node_id}/fork");
+            let body = json!({
+                "role_hint": args.role_hint,
+                "workspace": args.workspace,
+                "description": args.description,
+            });
+            match client
+                .send_request_json::<Value, _>(reqwest::Method::POST, &path, Some(&body))
+                .await
+            {
+                Ok(v) => content_result(v),
+                Err(err) => rpc_error(-32000, &format!("node.fork failed: {err}")),
+            }
+        }
+        "node.attach_url" | "attach_url.issue" => {
             let node_id = match parse_node_id(&params.arguments) {
                 Ok(node_id) => node_id,
                 Err(err) => return rpc_error(-32602, &err),
@@ -302,6 +496,121 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
                 Err(err) => rpc_error(-32000, &format!("attach_url.issue failed: {err}")),
             }
         }
+        "graph.get" => match client.graph().await {
+            Ok(response) => content_result(json!({ "graph": response.graph })),
+            Err(err) => rpc_error(-32000, &format!("graph.get failed: {err}")),
+        },
+        "relationship.create" => {
+            #[derive(Deserialize)]
+            struct RelArgs {
+                source_node_id: String,
+                target_node_id: String,
+                kind: String,
+                label: Option<String>,
+            }
+            let args: RelArgs = match serde_json::from_value(params.arguments) {
+                Ok(a) => a,
+                Err(err) => {
+                    return rpc_error(-32602, &format!("relationship.create: invalid args: {err}"))
+                }
+            };
+            let body = json!({
+                "source_node_id": args.source_node_id,
+                "target_node_id": args.target_node_id,
+                "kind": args.kind,
+                "label": args.label,
+            });
+            match client
+                .send_request_json::<Value, _>(reqwest::Method::POST, "/api/relationships", Some(&body))
+                .await
+            {
+                Ok(v) => content_result(v),
+                Err(err) => rpc_error(-32000, &format!("relationship.create failed: {err}")),
+            }
+        }
+        "relationship.list" => {
+            match client
+                .send_request_json::<Value, ()>(reqwest::Method::GET, "/api/relationships", None)
+                .await
+            {
+                Ok(v) => content_result(v),
+                Err(err) => rpc_error(-32000, &format!("relationship.list failed: {err}")),
+            }
+        }
+        "hook.list" => {
+            match client
+                .send_request_json::<Value, ()>(reqwest::Method::GET, "/api/hooks", None)
+                .await
+            {
+                Ok(v) => content_result(v),
+                Err(err) => rpc_error(-32000, &format!("hook.list failed: {err}")),
+            }
+        }
+        "hook.create" => {
+            match client
+                .send_request_json::<Value, _>(
+                    reqwest::Method::POST,
+                    "/api/hooks",
+                    Some(&params.arguments),
+                )
+                .await
+            {
+                Ok(v) => content_result(v),
+                Err(err) => rpc_error(-32000, &format!("hook.create failed: {err}")),
+            }
+        }
+        "hook.delete" => {
+            let hook_id = extract_arg_string(&params.arguments, "hook_id")
+                .ok_or_else(|| "missing hook_id".to_string());
+            match hook_id {
+                Err(err) => rpc_error(-32602, &err),
+                Ok(id) => {
+                    let path = format!("/api/hooks/{id}");
+                    match client
+                        .send_request_no_content_pub(reqwest::Method::DELETE, &path, None::<&()>)
+                        .await
+                    {
+                        Ok(()) => content_result(json!({"ok":true})),
+                        Err(err) => rpc_error(-32000, &format!("hook.delete failed: {err}")),
+                    }
+                }
+            }
+        }
+        "hook.firings" => {
+            match client
+                .send_request_json::<Value, ()>(reqwest::Method::GET, "/api/hooks/firings", None)
+                .await
+            {
+                Ok(v) => content_result(v),
+                Err(err) => rpc_error(-32000, &format!("hook.firings failed: {err}")),
+            }
+        }
+        "channel.list" => {
+            match client
+                .send_request_json::<Value, ()>(reqwest::Method::GET, "/api/channels", None)
+                .await
+            {
+                Ok(v) => content_result(v),
+                Err(err) => rpc_error(-32000, &format!("channel.list failed: {err}")),
+            }
+        }
+        "channel.send" => {
+            match client
+                .send_request_json::<Value, _>(
+                    reqwest::Method::POST,
+                    "/api/channels/inbound",
+                    Some(&params.arguments),
+                )
+                .await
+            {
+                Ok(v) => content_result(v),
+                Err(err) => rpc_error(-32000, &format!("channel.send failed: {err}")),
+            }
+        }
+        "health.get" => match client.health().await {
+            Ok(response) => content_result(json!({ "status": response.status })),
+            Err(err) => rpc_error(-32000, &format!("health.get failed: {err}")),
+        },
         unknown => rpc_error(-32601, &format!("tool not found: {unknown}")),
     }
 }
@@ -396,11 +705,45 @@ mod tests {
         assert!(names.contains(&"node.create"));
         assert!(names.contains(&"graph.get"));
         assert!(names.contains(&"attach_url.issue"));
+        assert!(names.contains(&"node.fork"));
+        assert!(names.contains(&"hook.list"));
+        assert!(names.contains(&"channel.list"));
+        assert!(names.contains(&"relationship.create"));
+        assert!(names.contains(&"health.get"));
     }
 
     #[test]
     fn parse_node_id_works() {
         let parsed = parse_node_id(&json!({"node_id": "00000000-0000-0000-0000-000000000001"}));
         assert!(parsed.is_ok());
+    }
+
+    #[tokio::test]
+    async fn notification_returns_none() {
+        use std::sync::Arc;
+        let client = Arc::new(AsylumClient::new("http://127.0.0.1:1", Option::<String>::None));
+        // notifications/initialized has no id — must return None
+        let req = RpcRequest {
+            _jsonrpc: Some("2.0".to_string()),
+            id: None,
+            method: "notifications/initialized".to_string(),
+            params: None,
+        };
+        let result = handle_request(&client, req).await;
+        assert!(result.is_none(), "notification must not produce a response");
+    }
+
+    #[tokio::test]
+    async fn unknown_notification_returns_none() {
+        use std::sync::Arc;
+        let client = Arc::new(AsylumClient::new("http://127.0.0.1:1", Option::<String>::None));
+        let req = RpcRequest {
+            _jsonrpc: Some("2.0".to_string()),
+            id: None,
+            method: "unknown/method".to_string(),
+            params: None,
+        };
+        let result = handle_request(&client, req).await;
+        assert!(result.is_none(), "unknown notification must not produce a response");
     }
 }

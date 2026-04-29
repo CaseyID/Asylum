@@ -188,6 +188,27 @@ impl AsylumClient {
             .await
     }
 
+    /// Generic JSON request returning a deserialized value. Used by the MCP layer for
+    /// capabilities not yet wrapped in dedicated methods.
+    pub async fn send_request_json<T: DeserializeOwned, P: Serialize + ?Sized>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        payload: Option<&P>,
+    ) -> Result<T> {
+        self.send_request(method, path, payload).await
+    }
+
+    /// Generic no-content request. Used by the MCP layer.
+    pub async fn send_request_no_content_pub(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        payload: Option<&(impl Serialize + ?Sized)>,
+    ) -> Result<()> {
+        self.send_request_no_content(method, path, payload).await
+    }
+
     pub async fn issue_token(&self, request: TokenRequest) -> Result<TokenIssueResponse> {
         self.send_request(reqwest::Method::POST, "/api/tokens", Some(&request))
             .await
