@@ -1,6 +1,5 @@
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::Read;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -1028,11 +1027,15 @@ fn run_logs(paths: &RuntimePaths, tail: bool) -> Result<()> {
         println!("No log file yet.");
         return Ok(());
     }
-    let mut content = String::new();
-    fs::File::open(&paths.log)?.read_to_string(&mut content)?;
-    let lines = content.lines().rev().take(80).collect::<Vec<_>>();
-    for line in lines.into_iter().rev() {
-        println!("{line}");
+    // Shell out to tail so large log files are not fully slurped into memory (L7).
+    let status = ProcessCommand::new("tail")
+        .arg("-n")
+        .arg("80")
+        .arg(&paths.log)
+        .status()
+        .context("run tail -n 80")?;
+    if !status.success() {
+        return Err(anyhow!("tail exited with {status}"));
     }
     Ok(())
 }
@@ -1107,15 +1110,14 @@ async fn run_update(
     }
 
     let doctor_result = run_doctor(paths, client, false).await;
-    if restart_error.is_none() {
-        return doctor_result;
-    }
-    if doctor_result.is_ok() {
-        if let Some(restart_error) = restart_error {
-            return Err(restart_error);
+    match (restart_error, doctor_result) {
+        (None, result) => result,
+        (Some(restart_err), Ok(())) => Err(restart_err),
+        (Some(restart_err), Err(doctor_err)) => {
+            // Surface both: restart failure context prepended to doctor error (L8).
+            Err(anyhow!("{restart_err:#}; doctor also reported: {doctor_err:#}"))
         }
     }
-    doctor_result
 }
 
 async fn restart_service_after_update(

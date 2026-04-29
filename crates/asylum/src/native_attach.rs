@@ -2,16 +2,26 @@ use std::fmt::Write as _;
 
 use asylum_core::api::NativeAttachResponse;
 
+/// Single-quote-escape a shell token so it is safe to use in a shell command line (L9).
+/// Any single-quote in the value is replaced with `'\''` (end quote, literal ', reopen quote).
+fn shell_quote(s: &str) -> String {
+    let escaped = s.replace('\'', r"'\''");
+    format!("'{escaped}'")
+}
+
+/// Returns true if the string needs quoting (contains any shell-special character).
+fn needs_quoting(s: &str) -> bool {
+    s.chars().any(|c| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '_' | '.' | '/' | ':' | '@'))
+}
+
 pub fn render_native_attach_command(target: &NativeAttachResponse) -> String {
     let mut output = String::new();
     let _ = write!(output, "{}", target.command);
 
     for arg in &target.args {
         output.push(' ');
-        if arg.contains(' ') {
-            output.push('"');
-            output.push_str(arg);
-            output.push('"');
+        if needs_quoting(arg) {
+            output.push_str(&shell_quote(arg));
         } else {
             output.push_str(arg);
         }
@@ -24,7 +34,13 @@ pub fn render_native_attach_command(target: &NativeAttachResponse) -> String {
     let env = target
         .environment
         .iter()
-        .map(|(name, value)| format!("{name}={value}"))
+        .map(|(name, value)| {
+            if needs_quoting(value) {
+                format!("{name}={}", shell_quote(value))
+            } else {
+                format!("{name}={value}")
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ");
     format!("{env} {output}")

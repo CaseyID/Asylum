@@ -11,6 +11,7 @@ use asylum_core::api::CreateNodeRequest;
 
 #[derive(Deserialize)]
 struct RpcRequest {
+    #[serde(rename = "jsonrpc")]
     _jsonrpc: Option<String>,
     id: Option<Value>,
     method: String,
