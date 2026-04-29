@@ -1276,7 +1276,8 @@ fn hydrate_node_telemetry(conn: &Connection, node: &mut NodeRecord) -> Result<()
             .map(|text| text.to_string())
         {
             Some(text) => {
-                let len = text.len();
+                // Use codepoint count so non-ASCII text doesn't inflate token estimates (L4).
+                let len = text.chars().count();
                 match kind {
                     NodeEventKind::OutputChunk => {
                         last_output_chunk_at = Some(created_at);

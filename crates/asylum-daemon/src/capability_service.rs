@@ -97,12 +97,14 @@ impl CapabilityService {
         } else {
             None
         };
-        let _ = seed_builtin_channels(
+        if let Err(err) = seed_builtin_channels(
             &store,
             SeedConfig {
                 ntfy_configured: config.ntfy_server.is_some() && config.ntfy_topic.is_some(),
             },
-        );
+        ) {
+            tracing::error!(error = %err, "failed to seed built-in channels at startup");
+        }
         let hook_engine = HookEngine::new();
         Self {
             store,

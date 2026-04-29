@@ -104,7 +104,10 @@ pub fn evaluate_filter(filter: &str, payload: &JsonValue) -> bool {
     }
     match parse_filter(trimmed) {
         Ok(expr) => expr.evaluate(payload),
-        Err(_) => true,
+        Err(err) => {
+            tracing::warn!(filter = %trimmed, error = %err, "hook filter parse failed — event blocked (fail-closed)");
+            false
+        }
     }
 }
 
