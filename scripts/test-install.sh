@@ -487,9 +487,25 @@ if checksum_probe_output="$((
 else
   checksum_probe_rc=$?
 fi
-check assert_eq "$checksum_probe_rc" "0" "checksum verification skipped when probe files missing"
-check assert_contains "$checksum_probe_output" "skipped" "checksum probe returns skipped status"
+# H9: missing checksum data is now a hard fail by default (was silent skip).
+check assert_nonzero "$checksum_probe_rc" "checksum verification hard-fails when probe files missing"
+check assert_contains "$checksum_probe_output" "Cannot verify download integrity" "checksum probe surfaces hard-fail error"
+check assert_contains "$checksum_probe_output" "ASYLUM_SKIP_CHECKSUM=1" "checksum probe documents bypass env var"
 check assert_not_contains "$checksum_probe_output" "curl" "checksum probe suppresses curl errors"
+
+# H9: ASYLUM_SKIP_CHECKSUM=1 opts the user into the unsafe path with warning.
+if checksum_skip_output="$((
+  asylum_download() { return 22; }
+  asylum_download_quiet() { return 22; }
+  ASYLUM_SKIP_CHECKSUM=1 asylum_verify_archive v0.0.0 asylum-check.tar.gz "$checksum_probe_archive" "$checksum_probe_dir"
+) 2>&1)"; then
+  checksum_skip_rc=0
+else
+  checksum_skip_rc=$?
+fi
+check assert_eq "$checksum_skip_rc" "0" "ASYLUM_SKIP_CHECKSUM=1 succeeds when probe files missing"
+check assert_contains "$checksum_skip_output" "ASYLUM_SKIP_CHECKSUM=1 set" "ASYLUM_SKIP_CHECKSUM emits loud warning"
+check assert_contains "$checksum_skip_output" "skipped" "ASYLUM_SKIP_CHECKSUM emits skipped status"
 
 checksum_verified_dir="$(mktemp -d)"
 checksum_verified_archive="${checksum_verified_dir}/archive.bin"
@@ -520,6 +536,8 @@ checksum_missing_tool_dir="$(mktemp -d)"
 checksum_missing_tool_archive="${checksum_missing_tool_dir}/archive.bin"
 : > "$checksum_missing_tool_archive"
 printf 'abc  archive.bin\n' > "${checksum_missing_tool_dir}/checksums.txt"
+
+# H9 (a): hard-fail when both sha256sum and shasum are absent.
 if missing_tool_output="$((
   PATH="${checksum_missing_tool_dir}"
   if asylum_verify_with_checksum_file "${checksum_missing_tool_dir}/checksums.txt" "$checksum_missing_tool_archive" "archive.bin"; then
@@ -533,8 +551,94 @@ if missing_tool_output="$((
 else
   missing_tool_rc=$?
 fi
-check assert_eq "$missing_tool_rc" "0" "checksum verification succeeds when hash tools are missing"
-check assert_contains "$missing_tool_output" "skipped" "checksum verification reports skipped when hash tools are missing"
+check assert_nonzero "$missing_tool_rc" "checksum verification hard-fails when hash tools are missing"
+check assert_contains "$missing_tool_output" "Cannot verify download integrity" "missing-tool hard-fail error message is clear"
+check assert_contains "$missing_tool_output" "ASYLUM_SKIP_CHECKSUM=1" "missing-tool hard-fail documents bypass env var"
+
+# H9 (b/c): explicit success when ASYLUM_SKIP_CHECKSUM=1 is set, with loud warning.
+if missing_tool_skip_output="$((
+  PATH="${checksum_missing_tool_dir}"
+  ASYLUM_SKIP_CHECKSUM=1 asylum_verify_with_checksum_file "${checksum_missing_tool_dir}/checksums.txt" "$checksum_missing_tool_archive" "archive.bin"
+) 2>&1)"; then
+  missing_tool_skip_rc=0
+else
+  missing_tool_skip_rc=$?
+fi
+check assert_eq "$missing_tool_skip_rc" "0" "ASYLUM_SKIP_CHECKSUM=1 lets caller into unverified path"
+check assert_contains "$missing_tool_skip_output" "ASYLUM_SKIP_CHECKSUM=1 set" "skip-checksum prints loud warning"
+check assert_contains "$missing_tool_skip_output" "may be tampered" "skip-checksum warning explains the risk"
+check assert_contains "$missing_tool_skip_output" "skipped" "skip-checksum still prints skipped status to caller"
+
+# H9 signature paths: exercise asylum_verify_checksum_signature directly.
+sig_test_dir="$(mktemp -d)"
+sig_test_checksums="${sig_test_dir}/checksums.txt"
+printf 'dummy  archive.bin\n' > "$sig_test_checksums"
+empty_path_dir="$(mktemp -d)"
+
+# H9 (d): no signature file present at all -> warn + proceed.
+set +e
+direct_sig_warn="$(
+  PATH="${empty_path_dir}"
+  ASYLUM_RELEASE_PUBKEY=""
+  ASYLUM_RELEASE_PUBKEY_DEFAULT=""
+  asylum_verify_checksum_signature "$sig_test_checksums" "${sig_test_dir}/checksums.txt.minisig" 2>&1
+)"
+direct_sig_warn_rc=$?
+set -e
+check assert_eq "$direct_sig_warn_rc" "0" "no-sig-file path proceeds (returns 0)"
+check assert_contains "$direct_sig_warn" "checksum file is unsigned" "no-sig-file emits unsigned warning"
+check assert_contains "$direct_sig_warn" "no checksums.txt.minisig found" "no-sig-file warning names the file"
+
+# H9 (e): minisign absent, signature file present -> warn + proceed.
+sig_present_file="${sig_test_dir}/checksums.txt.minisig"
+printf 'fake-sig\n' > "$sig_present_file"
+set +e
+minisign_absent_warn="$(
+  PATH="${empty_path_dir}"
+  ASYLUM_RELEASE_PUBKEY="RWfake"
+  asylum_verify_checksum_signature "$sig_test_checksums" "$sig_present_file" 2>&1
+)"
+minisign_absent_rc=$?
+set -e
+check assert_eq "$minisign_absent_rc" "0" "minisign-absent path proceeds (returns 0)"
+check assert_contains "$minisign_absent_warn" "minisign not on PATH" "minisign-absent warning names the missing tool"
+
+# H9: pubkey missing, signature file present, minisign present -> warn + proceed.
+fake_minisign_dir="$(mktemp -d)"
+cat > "${fake_minisign_dir}/minisign" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "${fake_minisign_dir}/minisign"
+set +e
+no_pubkey_warn="$(
+  PATH="${fake_minisign_dir}:${PATH}"
+  ASYLUM_RELEASE_PUBKEY=""
+  ASYLUM_RELEASE_PUBKEY_DEFAULT=""
+  asylum_verify_checksum_signature "$sig_test_checksums" "$sig_present_file" 2>&1
+)"
+no_pubkey_rc=$?
+set -e
+check assert_eq "$no_pubkey_rc" "0" "no-pubkey path proceeds when minisign+sig present"
+check assert_contains "$no_pubkey_warn" "no Asylum release pubkey configured" "no-pubkey warning is clear"
+
+# H9: minisign verification failure aborts.
+fake_minisign_fail_dir="$(mktemp -d)"
+cat > "${fake_minisign_fail_dir}/minisign" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "${fake_minisign_fail_dir}/minisign"
+set +e
+sig_fail_out="$(
+  PATH="${fake_minisign_fail_dir}:${PATH}"
+  ASYLUM_RELEASE_PUBKEY="RWfake"
+  asylum_verify_checksum_signature "$sig_test_checksums" "$sig_present_file" 2>&1
+)"
+sig_fail_rc=$?
+set -e
+check assert_nonzero "$sig_fail_rc" "minisign failure aborts"
+check assert_contains "$sig_fail_out" "signature failed verification" "minisign failure error is clear"
 
 if [[ $failures -gt 0 ]]; then
   echo "FAILED: ${failures} checks failed"

@@ -5,6 +5,16 @@ set -euo pipefail
 REPO_SLUG="CaseyID/Asylum"
 GITHUB_API_URL="https://api.github.com/repos/${REPO_SLUG}/releases"
 GITHUB_RELEASE_URL="https://github.com/${REPO_SLUG}/releases"
+
+# ASYLUM_RELEASE_PUBKEY: minisign public key (single line, "RWxxxx..." format).
+# When non-empty (either the embedded constant below or the env var override),
+# the installer requires a valid checksums.txt.minisig signature alongside the
+# checksum file. Until the maintainer publishes a release-signing key, the
+# constant is empty: the installer prints a "warning: checksum file is
+# unsigned" line and proceeds with checksum-only verification. Once a key is
+# published, paste it into ASYLUM_RELEASE_PUBKEY_DEFAULT below and every
+# existing installer download immediately upgrades to verified-mode.
+ASYLUM_RELEASE_PUBKEY_DEFAULT=""
 COLOR_LABEL=""
 COLOR_OK=""
 COLOR_WARN=""
@@ -267,6 +277,48 @@ asylum_hash_command() {
   fi
 }
 
+asylum_release_pubkey() {
+  # Env override wins over the embedded constant.
+  if [[ -n "${ASYLUM_RELEASE_PUBKEY:-}" ]]; then
+    printf '%s' "$ASYLUM_RELEASE_PUBKEY"
+    return
+  fi
+  printf '%s' "$ASYLUM_RELEASE_PUBKEY_DEFAULT"
+}
+
+# Verify checksums.txt with minisign if we can; emit a warning otherwise.
+# Returns 0 on (signature verified) OR (unsigned, proceeding with hash-only).
+# Returns 1 only on an explicit signature failure.
+asylum_verify_checksum_signature() {
+  local checksum_file=$1
+  local sig_file=$2
+  local pubkey
+  pubkey="$(asylum_release_pubkey)"
+
+  if [[ ! -f "$sig_file" ]]; then
+    asylum_warn "warning: checksum file is unsigned (no checksums.txt.minisig found)"
+    return 0
+  fi
+
+  if ! command -v minisign >/dev/null 2>&1; then
+    asylum_warn "warning: checksum file is unsigned (minisign not on PATH; install minisign to enable signature verification)"
+    return 0
+  fi
+
+  if [[ -z "$pubkey" ]]; then
+    asylum_warn "warning: checksum file is unsigned (no Asylum release pubkey configured; set ASYLUM_RELEASE_PUBKEY or wait for a signed release)"
+    return 0
+  fi
+
+  if minisign -V -P "$pubkey" -m "$checksum_file" -x "$sig_file" >/dev/null 2>&1; then
+    printf 'Signature: %s\n' "$(asylum_colorize "$COLOR_OK" "verified")"
+    return 0
+  fi
+
+  asylum_error "checksums.txt signature failed verification with configured pubkey"
+  return 1
+}
+
 asylum_verify_with_checksum_file() {
   local checksum_file=$1
   local archive_path=$2
@@ -275,8 +327,15 @@ asylum_verify_with_checksum_file() {
   hash_cmd="$(asylum_hash_command)"
 
   if [[ "$hash_cmd" == "none" ]]; then
-    printf 'skipped\n'
-    return 0
+    if [[ "${ASYLUM_SKIP_CHECKSUM:-0}" == "1" ]]; then
+      asylum_warn "ASYLUM_SKIP_CHECKSUM=1 set; downloading without integrity verification."
+      asylum_warn "This is unsafe: the binary you install may be tampered with."
+      printf 'skipped\n'
+      return 0
+    fi
+    asylum_error "Cannot verify download integrity: install one of sha256sum or shasum and re-run."
+    asylum_error "To bypass (NOT RECOMMENDED), re-run with ASYLUM_SKIP_CHECKSUM=1."
+    return 1
   fi
 
   local expected
@@ -311,11 +370,20 @@ asylum_verify_archive() {
   local archive_path=$3
   local tmpdir=$4
   local checksum_url="${GITHUB_RELEASE_URL}/download/${version}/checksums.txt"
+  local sig_url="${GITHUB_RELEASE_URL}/download/${version}/checksums.txt.minisig"
   local sha_url="${GITHUB_RELEASE_URL}/download/${version}/${asset_name}.sha256"
   local checksum_file="${tmpdir}/checksums.txt"
+  local sig_file="${tmpdir}/checksums.txt.minisig"
   local direct_sha_file="${tmpdir}/${asset_name}.sha256"
 
   if asylum_download_quiet "$checksum_url" "$checksum_file"; then
+    # Best-effort signature fetch. Absent signature is acceptable today;
+    # mandatory once a pubkey is published. Errors here are silent — the
+    # signature verifier handles "no sig file" with a warning.
+    asylum_download_quiet "$sig_url" "$sig_file" || rm -f "$sig_file"
+    if ! asylum_verify_checksum_signature "$checksum_file" "$sig_file" >&2; then
+      return 1
+    fi
     local checksum_status
     if ! checksum_status="$(asylum_verify_with_checksum_file "$checksum_file" "$archive_path" "$asset_name")"; then
       return 1
@@ -339,8 +407,17 @@ asylum_verify_archive() {
     return 1
   fi
 
-  printf 'skipped\n'
-  return 0
+  # Neither checksum file nor per-archive sha256 was reachable. This used to
+  # be a silent skip. Treat as the same "no integrity tool / no integrity
+  # data" condition: hard fail unless ASYLUM_SKIP_CHECKSUM=1.
+  if [[ "${ASYLUM_SKIP_CHECKSUM:-0}" == "1" ]]; then
+    asylum_warn "ASYLUM_SKIP_CHECKSUM=1 set; no checksum data was available, proceeding without verification."
+    printf 'skipped\n'
+    return 0
+  fi
+  asylum_error "Cannot verify download integrity: no checksum data could be fetched from the release."
+  asylum_error "To bypass (NOT RECOMMENDED), re-run with ASYLUM_SKIP_CHECKSUM=1."
+  return 1
 }
 
 asylum_extract_binary() {
