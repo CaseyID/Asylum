@@ -97,6 +97,7 @@ dependencies = [
  "asylum-daemon",
  "clap",
  "dirs",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
