@@ -37,7 +37,7 @@ type TranscriptEntry =
   | { kind: "prompt" };
 
 // ─── observe ws event shape ──────────────────────────────────────────────────
-// matches NodeEvent on the daemon side (asylum-core::node).
+// matches NodeEvent on the daemon side (asylum-core::event).
 
 interface NodeEvent {
   id?: string;
@@ -182,15 +182,6 @@ export function NodeSession({
         const targetNode = typeof body.node_id === "string" ? body.node_id : (evt.node_id ?? node.id);
         setEntries(p => [...p, { kind: "attach", node: targetNode, url }]);
         if (onAttach) onAttach(targetNode);
-        return;
-      }
-      case "tool_call": {
-        const name = typeof body.name === "string" ? body.name : (typeof body.tool === "string" ? body.tool : "tool");
-        const args = (body.args && typeof body.args === "object") ? body.args as Record<string, unknown> : undefined;
-        const output = typeof body.output === "string" ? body.output : undefined;
-        const stateRaw = typeof body.state === "string" ? body.state : "ok";
-        const state: "ok" | "pending" | "error" = stateRaw === "pending" || stateRaw === "error" ? stateRaw : "ok";
-        setEntries(p => [...p, { kind: "tool", name, args, output, state }]);
         return;
       }
       default: {

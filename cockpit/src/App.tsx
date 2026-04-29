@@ -192,7 +192,9 @@ export function App() {
         if (fresh.length === 0) return;
         const latest = fresh[fresh.length - 1];
         lastSeenMessageId.current = latest.id;
-        setToasts(() => [
+        // Append to existing toasts rather than replacing; cap at 3 (L14).
+        setToasts((prev) => [
+          ...prev,
           {
             id: "t-" + latest.id,
             from: latest.sender,
@@ -202,7 +204,7 @@ export function App() {
             body: latest.subject ? `${latest.subject}\n${latest.body}` : latest.body,
             replies: latest.replies,
           },
-        ]);
+        ].slice(-3));
       } catch {
         /* silent — surface via Logs screen */
       }
