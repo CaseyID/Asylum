@@ -1,68 +1,205 @@
-// ports prototype SettingsScreen plus NtfySettings, AuthSettings, NetSettings,
-// StorageSettings, ApiSettings, CliSettings, McpSettings
+// SettingsScreen — real daemon-backed values; no static mockup data.
+// Panels: substrates, harnesses, ntfy channels, auth & tokens, network, storage.
+// API/CLI/MCP panels dropped — those features don't exist yet.
 import { useEffect, useState, type JSX } from "react";
 import { Btn, Panel, Pill, Tag } from "../lib/ui";
-import { fetchHarnessDescriptors, fetchSubstrateDescriptors } from "../api";
-import type { HarnessDescriptor, SubstrateDescriptor } from "../types";
+import {
+  fetchChannels,
+  fetchHarnessDescriptors,
+  fetchHealth,
+  fetchSubstrateDescriptors,
+  fetchTokens,
+  getStoredOwnerToken,
+  rotateToken,
+  setStoredOwnerToken,
+} from "../api";
+import type { ChannelDescriptor, HarnessDescriptor, HealthResponse, SubstrateDescriptor, TokenSummary } from "../types";
+
+// ─── helpers ──────────────────────────────────────────────────────
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function maskToken(token: string): string {
+  if (!token || token.length < 8) return "••••••••";
+  return `${token.slice(0, 4)}…${token.slice(-4)}`;
+}
+
+function isTokenActive(t: TokenSummary): boolean {
+  return !t.revoked && t.expires_at_epoch_secs > Math.floor(Date.now() / 1000);
+}
+
+// ─── NtfySettings ─────────────────────────────────────────────────
 
 function NtfySettings() {
+  const [channels, setChannels] = useState<ChannelDescriptor[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchChannels()
+      .then((all) => {
+        if (!cancelled) setChannels(all.filter((c) => c.kind === "ntfy"));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (channels.length === 0) {
+    return (
+      <Panel eyebrow="ntfy channels">
+        <div className="muted" style={{ padding: "12px 0" }}>
+          no ntfy channels configured — add one via the Channels screen.
+        </div>
+      </Panel>
+    );
+  }
+
   return (
-    <Panel eyebrow="ntfy channels" flush actions={<Btn size="sm" icon="plus">add channel</Btn>}>
-      {(
-        [
-          ["asylum-aaron", "ntfy.sh/asylum-aaron-7c2af", "12 sent · 4 received"],
-          ["asylum-oncall", "ntfy.sh/asylum-oncall", "0 sent · 0 received"],
-        ] as [string, string, string][]
-      ).map(([n, t, m]) => (
-        <div key={n} className="connection-row">
+    <Panel eyebrow="ntfy channels" flush>
+      {channels.map((c) => (
+        <div key={c.id} className="connection-row">
           <div className="ico">∝</div>
           <div>
-            <div className="name">{n}</div>
+            <div className="name">{c.name}</div>
             <div className="meta">
-              {t} · {m}
+              {c.detail || c.label} · {c.message_count_24h} msgs (24h)
             </div>
           </div>
-          <Pill status="running">subscribed</Pill>
-          <Btn size="sm" kind="ghost" icon="more-horizontal" iconOnly />
+          <Pill status={c.live ? "running" : "idle"}>{c.live ? "subscribed" : "configured"}</Pill>
         </div>
       ))}
     </Panel>
   );
 }
 
+// ─── AuthSettings ─────────────────────────────────────────────────
+
 function AuthSettings() {
+  const [tokens, setTokens] = useState<TokenSummary[] | null>(null);
+  const [copyNotice, setCopyNotice] = useState(false);
+  const [rotating, setRotating] = useState(false);
+  const [rotateError, setRotateError] = useState<string | null>(null);
+  const [newTokenNotice, setNewTokenNotice] = useState<string | null>(null);
+
+  const ownerToken = getStoredOwnerToken();
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchTokens()
+      .then((res) => {
+        if (!cancelled) setTokens(res.tokens);
+      })
+      .catch(() => {
+        if (!cancelled) setTokens([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const activeCount = tokens ? tokens.filter(isTokenActive).length : 0;
+  const revokedCount = tokens ? tokens.filter((t) => t.revoked).length : 0;
+
+  function handleCopy() {
+    if (!ownerToken) return;
+    navigator.clipboard.writeText(ownerToken).then(() => {
+      setCopyNotice(true);
+      setTimeout(() => setCopyNotice(false), 2000);
+    });
+  }
+
+  async function handleRotate() {
+    if (!tokens) return;
+    // pragmatic v1: rotate the first active token found.
+    // if there are multiple active tokens, the operator should use the CLI.
+    const firstActive = tokens.find(isTokenActive);
+    if (!firstActive) {
+      setRotateError("no active token to rotate");
+      return;
+    }
+    if (activeCount > 1) {
+      setRotateError("multiple active tokens — rotate via CLI to avoid ambiguity");
+      return;
+    }
+    if (!window.confirm("rotate owner token? the current token will be revoked and a new one issued. you must save the new value.")) {
+      return;
+    }
+    setRotating(true);
+    setRotateError(null);
+    try {
+      const result = await rotateToken(firstActive.id);
+      setStoredOwnerToken(result.new_token.raw_token);
+      setNewTokenNotice(result.new_token.raw_token);
+      const updated = await fetchTokens();
+      setTokens(updated.tokens);
+    } catch (err) {
+      setRotateError(String(err));
+    } finally {
+      setRotating(false);
+    }
+  }
+
   return (
     <Panel eyebrow="tokens">
       <div className="kv">
         <span className="k">owner token</span>
         <span className="v">
-          a8x7…b91 <Btn size="sm" kind="ghost" icon="copy" iconOnly />
+          {ownerToken ? maskToken(ownerToken) : <em className="muted">not stored locally</em>}{" "}
+          {ownerToken && (
+            <Btn size="sm" kind="ghost" icon="copy" iconOnly onClick={handleCopy} />
+          )}
+          {copyNotice && <span className="muted" style={{ marginLeft: 6, fontSize: 11 }}>copied</span>}
         </span>
-        <span className="k">pairing code</span>
-        <span className="v">ASLM-2F9D-C014</span>
         <span className="k">issued tokens</span>
-        <span className="v">3 active · 0 revoked today</span>
-        <span className="k">attach urls</span>
-        <span className="v">2 active · ttl 3600s</span>
+        <span className="v">
+          {tokens === null
+            ? "loading…"
+            : `${activeCount} active · ${revokedCount} revoked`}
+        </span>
       </div>
+      {newTokenNotice && (
+        <div
+          style={{
+            marginTop: 10,
+            padding: 10,
+            background: "var(--status-waiting-bg)",
+            border: "1px solid rgba(245,180,84,0.35)",
+            fontFamily: "var(--font-mono)",
+            fontSize: 11,
+            wordBreak: "break-all",
+          }}
+        >
+          new token (save this now — shown once):{" "}
+          <strong>{newTokenNotice}</strong>
+        </div>
+      )}
+      {rotateError && (
+        <div style={{ marginTop: 8, color: "var(--status-errored)", fontSize: 12 }}>
+          {rotateError}
+        </div>
+      )}
       <div className="hr" />
-      <Btn icon="rotate-ccw" size="sm">
-        rotate owner token
+      <Btn icon="rotate-ccw" size="sm" onClick={handleRotate} disabled={rotating}>
+        {rotating ? "rotating…" : "rotate owner token"}
       </Btn>
     </Panel>
   );
 }
 
-function NetSettings() {
+// ─── NetSettings ──────────────────────────────────────────────────
+
+function NetSettings({ health }: { health: HealthResponse | null }) {
   return (
     <Panel eyebrow="network exposure">
       <div className="kv">
         <span className="k">bind</span>
-        <span className="v">localhost:5173</span>
-        <span className="k">remote access</span>
-        <span className="v">tailscale (recommended)</span>
-        <span className="k">reverse proxy</span>
-        <span className="v">none configured</span>
+        <span className="v mono">{health ? health.bind_addr : "loading…"}</span>
       </div>
       <div
         style={{
@@ -81,95 +218,32 @@ function NetSettings() {
   );
 }
 
-function StorageSettings() {
+// ─── StorageSettings ──────────────────────────────────────────────
+
+function StorageSettings({ health }: { health: HealthResponse | null }) {
   return (
-    <Panel eyebrow="storage & retention">
+    <Panel eyebrow="storage">
       <div className="kv">
         <span className="k">transcripts</span>
-        <span className="v">~/Library/Asylum/transcripts · 1.4 GB</span>
-        <span className="k">retention</span>
-        <span className="v">30 days (rolling)</span>
-        <span className="k">redaction</span>
-        <span className="v">on (api keys, jwt-like)</span>
+        <span className="v mono">{health ? health.transcripts_dir : "loading…"}</span>
+        <span className="k">database</span>
+        <span className="v">
+          {health ? (
+            <>
+              <span className="mono">{health.database_path}</span>
+              {" · "}
+              {formatBytes(health.database_size_bytes)}
+            </>
+          ) : (
+            "loading…"
+          )}
+        </span>
       </div>
     </Panel>
   );
 }
 
-function ApiSettings() {
-  const origin = window.location.origin;
-  return (
-    <Panel eyebrow="api & sdk">
-      <div className="kv">
-        <span className="k">base url</span>
-        <span className="v">{origin}/api/v1</span>
-        <span className="k">openapi</span>
-        <span className="v">/openapi.json (37 endpoints)</span>
-        <span className="k">sdk</span>
-        <span className="v">@asylum/sdk@0.1.0 (typescript)</span>
-      </div>
-      <div className="hr" />
-      <div className="muted mono" style={{ fontSize: 11, marginBottom: 6 }}>
-        quickstart
-      </div>
-      <pre
-        style={{
-          background: "var(--bg-sunken)",
-          padding: 12,
-          fontFamily: "var(--font-mono)",
-          fontSize: 11.5,
-          color: "var(--fg)",
-          border: "1px solid var(--border-subtle)",
-          overflow: "auto",
-          margin: 0,
-        }}
-      >{`import { Asylum } from "@asylum/sdk";
-const a = new Asylum({ baseUrl, token });
-const node = await a.node.create({ harness: "codex", substrate: "loon-us-west", role: "worker" });
-for await (const ev of a.node.observe(node.id)) console.log(ev);`}</pre>
-    </Panel>
-  );
-}
-
-function CliSettings() {
-  return (
-    <Panel eyebrow="cli">
-      <pre
-        style={{
-          background: "var(--bg-sunken)",
-          padding: 12,
-          fontFamily: "var(--font-mono)",
-          fontSize: 11.5,
-          color: "var(--fg)",
-          border: "1px solid var(--border-subtle)",
-          overflow: "auto",
-          margin: 0,
-        }}
-      >{`$ asylum nodes
-NODE        ROLE              HARNESS       SUBSTRATE       STATE
-cc-7c2af    command-center    codex         local           running
-sup-3d1e    supervisor        claude-code   loon-us-west    running
-…
-$ asylum node send w-2b0c8 "approve"
-$ asylum attach w-9a4f1 --browser`}</pre>
-    </Panel>
-  );
-}
-
-function McpSettings() {
-  return (
-    <Panel eyebrow="mcp server">
-      <div className="kv">
-        <span className="k">endpoint</span>
-        <span className="v">stdio · asylum-mcp</span>
-        <span className="k">tools exposed</span>
-        <span className="v">37 (graph.get, node.create, node.send_input, …)</span>
-        <span className="k">connected clients</span>
-        <span className="v">claude desktop, cursor</span>
-      </div>
-    </Panel>
-  );
-}
+// ─── Section types ────────────────────────────────────────────────
 
 type SectionId =
   | "substrates"
@@ -177,15 +251,15 @@ type SectionId =
   | "ntfy"
   | "auth"
   | "network"
-  | "storage"
-  | "api"
-  | "cli"
-  | "mcp";
+  | "storage";
+
+// ─── SettingsScreen ───────────────────────────────────────────────
 
 export function SettingsScreen(): JSX.Element {
   const [section, setSection] = useState<SectionId>("substrates");
   const [harnesses, setHarnesses] = useState<HarnessDescriptor[]>([]);
   const [substrates, setSubstrates] = useState<SubstrateDescriptor[]>([]);
+  const [health, setHealth] = useState<HealthResponse | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -199,12 +273,15 @@ export function SettingsScreen(): JSX.Element {
         if (!cancelled) setSubstrates(items);
       })
       .catch(() => {});
+    fetchHealth()
+      .then((h) => {
+        if (!cancelled) setHealth(h);
+      })
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
   }, []);
-
-  const origin = window.location.origin;
 
   return (
     <div className="page" style={{ maxWidth: 1120 }}>
@@ -214,8 +291,13 @@ export function SettingsScreen(): JSX.Element {
           <div className="page-sub">
             single-user · bound to{" "}
             <span className="mono" style={{ color: "var(--fg)" }}>
-              {origin}
+              {health ? health.bind_addr : window.location.origin}
             </span>
+            {health && (
+              <span className="muted" style={{ marginLeft: 8 }}>
+                v{health.daemon_version}
+              </span>
+            )}
           </div>
         </div>
       </div>
@@ -238,19 +320,7 @@ export function SettingsScreen(): JSX.Element {
             [
               ["auth", "auth & tokens"],
               ["network", "network exposure"],
-              ["storage", "storage & retention"],
-            ] as [SectionId, string][]
-          ).map(([id, l]) => (
-            <div key={id} className={`item ${section === id ? "active" : ""}`} onClick={() => setSection(id)}>
-              {l}
-            </div>
-          ))}
-          <div className="group">developer</div>
-          {(
-            [
-              ["api", "api & sdk"],
-              ["cli", "cli"],
-              ["mcp", "mcp server"],
+              ["storage", "storage"],
             ] as [SectionId, string][]
           ).map(([id, l]) => (
             <div key={id} className={`item ${section === id ? "active" : ""}`} onClick={() => setSection(id)}>
@@ -261,7 +331,7 @@ export function SettingsScreen(): JSX.Element {
 
         <div>
           {section === "substrates" && (
-            <Panel eyebrow="substrates" flush actions={<Btn size="sm" icon="plus">add substrate</Btn>}>
+            <Panel eyebrow="substrates" flush>
               {substrates.map((s) => (
                 <div key={s.id} className="connection-row">
                   <div className="ico">{s.id === "local" ? "∎" : "L"}</div>
@@ -279,13 +349,12 @@ export function SettingsScreen(): JSX.Element {
                     )}
                   </div>
                   <Pill status={s.healthy ? "running" : "errored"}>{s.healthy ? "healthy" : "unreachable"}</Pill>
-                  <Btn size="sm" kind="ghost" icon="more-horizontal" iconOnly />
                 </div>
               ))}
             </Panel>
           )}
           {section === "harnesses" && (
-            <Panel eyebrow="harnesses" flush actions={<Btn size="sm" icon="plus">install adapter</Btn>}>
+            <Panel eyebrow="harnesses" flush>
               {harnesses.map((h) => (
                 <div key={h.id} className="connection-row" style={{ opacity: h.available ? 1 : 0.55 }}>
                   <div className="ico">{h.name[0].toLowerCase()}</div>
@@ -298,18 +367,14 @@ export function SettingsScreen(): JSX.Element {
                     </div>
                   </div>
                   <Pill status={h.available ? "running" : "idle"}>{h.available ? "installed" : "not built"}</Pill>
-                  <Btn size="sm" kind="ghost" icon="settings" iconOnly />
                 </div>
               ))}
             </Panel>
           )}
           {section === "ntfy" && <NtfySettings />}
           {section === "auth" && <AuthSettings />}
-          {section === "network" && <NetSettings />}
-          {section === "storage" && <StorageSettings />}
-          {section === "api" && <ApiSettings />}
-          {section === "cli" && <CliSettings />}
-          {section === "mcp" && <McpSettings />}
+          {section === "network" && <NetSettings health={health} />}
+          {section === "storage" && <StorageSettings health={health} />}
         </div>
       </div>
     </div>

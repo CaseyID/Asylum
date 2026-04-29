@@ -255,6 +255,41 @@ export interface SubstrateDescriptor {
   nodes: number;
 }
 
+// ─── health / settings ────────────────────────────────────────────
+
+export interface HealthResponse {
+  status: string;
+  daemon_version: string;
+  bind_addr: string;
+  database_path: string;
+  database_size_bytes: number;
+  transcripts_dir: string;
+}
+
+export interface TokenSummary {
+  id: string;
+  label: string;
+  created_at_epoch_secs: number;
+  expires_at_epoch_secs: number;
+  revoked: boolean;
+}
+
+export interface TokenListResponse {
+  tokens: TokenSummary[];
+}
+
+export interface TokenIssueResponse {
+  id: string;
+  raw_token: string;
+  scope: string[];
+  expires_at_epoch_secs: number;
+}
+
+export interface TokenRotateResponse {
+  old_id: string;
+  new_token: TokenIssueResponse;
+}
+
 // ─── derived view types ───────────────────────────────────────────
 
 export type ScreenId =

@@ -14,6 +14,7 @@ import type {
   GraphResponse,
   HarnessDescriptor,
   HarnessKind,
+  HealthResponse,
   HookCreateRequest,
   HookEventCatalogEntry,
   HookFiringRecord,
@@ -25,6 +26,8 @@ import type {
   RecipeSpawnRequest,
   SubstrateDescriptor,
   SubstrateKind,
+  TokenListResponse,
+  TokenRotateResponse,
 } from "./types";
 
 const BASE = "/api";
@@ -356,6 +359,20 @@ export async function forkNode(id: string, req: ForkNodeRequest = {}): Promise<A
     body: JSON.stringify(req),
   });
   return "node" in (data as object) ? (data as { node: AsylumNode }).node : (data as AsylumNode);
+}
+
+// — health & settings —
+
+export async function fetchHealth(): Promise<HealthResponse> {
+  return request<HealthResponse>("/health");
+}
+
+export async function fetchTokens(): Promise<TokenListResponse> {
+  return request<TokenListResponse>("/tokens");
+}
+
+export async function rotateToken(id: string): Promise<TokenRotateResponse> {
+  return request<TokenRotateResponse>(`/tokens/${id}/rotate`, { method: "POST" });
 }
 
 // — observe websocket —
