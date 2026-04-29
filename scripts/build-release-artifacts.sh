@@ -11,6 +11,14 @@ TARGETS="darwin-arm64,darwin-x86_64,linux-arm64,linux-x86_64"
 SKIP_NPM_CI=0
 SKIP_COCKPIT_BUILD=0
 DOCKER_IMAGE="${ASYLUM_RELEASE_DOCKER_IMAGE:-rust:1-bookworm}"
+# rust-cross image bundles cargo-zigbuild + zig + the macOS SDK. Used on Linux
+# hosts to cross-build darwin-arm64, darwin-x86_64, and linux-arm64 without
+# QEMU, osxcross, or any apt installs beyond Docker itself.
+# Pinned to a digest (not :latest) for release reproducibility. To update,
+# pull `ghcr.io/rust-cross/cargo-zigbuild:latest`, grab the new digest from
+# `docker images --digests`, and replace below. The semver-tagged images
+# (0.16.x, 0.17.1) lag behind and ship Rust too old for Cargo.lock v4.
+ZIGBUILD_IMAGE="${ASYLUM_RELEASE_ZIGBUILD_IMAGE:-ghcr.io/rust-cross/cargo-zigbuild@sha256:b66e2a5063921aca74fc53248d75d187b7499fe1e076d78eb7d87ab1dbc52f6a}"
 
 print_help() {
   cat <<'USAGE'
@@ -29,23 +37,20 @@ Options:
   --help                        Show this help.
 
 Releases are built locally (no GitHub Actions). Both Apple Silicon Macs and
-x86_64 Linux hosts can produce all four archives, but the matrix differs:
+x86_64 Linux hosts can produce all four archives — same matrix, different
+mechanisms:
 
-  macOS Apple Silicon (full parity, recommended):
+  macOS Apple Silicon:
     - darwin-arm64: native cargo
     - darwin-x86_64: rustup cross
     - linux-arm64: native Docker (--platform linux/arm64)
     - linux-x86_64: cross-compiled inside an arm64 Linux container
 
   Linux x86_64:
-    - linux-x86_64: native (no Docker)
-    - linux-arm64: Docker --platform linux/arm64 — requires qemu-user-static +
-      binfmt-support (one-time sudo install). Script halts with install
-      instructions if missing.
-    - darwin-arm64, darwin-x86_64: NOT YET supported from Linux. macOS
-      cross-compile needs osxcross + the Apple SDK; not yet integrated.
-      Build those archives on a Mac and merge into the release with
-      publish-release.sh --allow-clobber.
+    - linux-x86_64: native cargo (no Docker)
+    - darwin-arm64, darwin-x86_64, linux-arm64: cross-compiled in the
+      ghcr.io/rust-cross/cargo-zigbuild Docker image (zig as linker; macOS
+      SDK baked into the image). No QEMU, no osxcross, no extra apt installs.
 USAGE
 }
 
@@ -147,71 +152,45 @@ build_macos() {
   local release_name=$1
   local rust_target=$2
   local output_dir=$3
-  require_macos_host "$release_name"
   rustup target add "$rust_target"
   cargo build --release -p asylum --target "$rust_target"
   package_binary "${REPO_ROOT}/target/${rust_target}/release/asylum" "asylum-${release_name}.tar.gz" "$output_dir"
 }
 
+# Cross-compile via rust-cross/cargo-zigbuild Docker image. Handles
+# darwin-arm64, darwin-x86_64, and linux-arm64 from any Linux/x86_64 host.
+# The image bundles zig (the linker), cargo-zigbuild, the Rust toolchain,
+# and the macOS SDK — no host-side install beyond Docker.
+build_via_zigbuild() {
+  local release_name=$1
+  local rust_target=$2
+  local output_dir=$3
+  local scratch_binary="${output_dir}/.asylum-${release_name}"
+
+  require_docker
+
+  docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    -e HOME=/tmp/cargo-home \
+    -e OUTPUT_BIN="/out/.asylum-${release_name}" \
+    -e RUST_TARGET="$rust_target" \
+    -v "${REPO_ROOT}:/work" \
+    -v "${output_dir}:/out" \
+    -w /work \
+    "$ZIGBUILD_IMAGE" \
+    bash -c 'set -euo pipefail
+mkdir -p /tmp/cargo-home
+rustup target add "$RUST_TARGET"
+CARGO_TARGET_DIR=/tmp/asylum-target cargo zigbuild --release -p asylum --target "$RUST_TARGET"
+cp "/tmp/asylum-target/${RUST_TARGET}/release/asylum" "$OUTPUT_BIN"'
+
+  package_binary "$scratch_binary" "asylum-${release_name}.tar.gz" "$output_dir"
+  rm -f "$scratch_binary"
+}
+
 require_docker() {
   if ! command -v docker >/dev/null 2>&1; then
     echo "Docker is required for local Linux release builds." >&2
-    exit 1
-  fi
-}
-
-require_macos_host() {
-  local target=$1
-  if [[ "$(uname -s)" != "Darwin" ]]; then
-    cat >&2 <<EOF
-Cannot build $target on $(uname -s).
-
-macOS release archives must be built on a macOS host. From an Apple Silicon
-Mac, this script will native-compile darwin-arm64 and rustup-cross to
-darwin-x86_64. Cross-compiling to macOS from Linux requires an osxcross-style
-toolchain plus the macOS SDK; that path is not yet integrated.
-
-Workaround: build the macOS archives on a Mac, then publish them into the
-existing release with --allow-clobber:
-  scripts/build-release-artifacts.sh --version <ver> --targets darwin-arm64,darwin-x86_64
-  scripts/publish-release.sh --version <ver> --targets darwin-arm64,darwin-x86_64 --allow-clobber
-EOF
-    exit 1
-  fi
-}
-
-require_emulation_for_platform() {
-  local platform=$1
-  local host_arch
-  host_arch="$(uname -m)"
-  # Map docker --platform to the kernel arch we need to be able to exec.
-  local needed_arch=""
-  case "$platform" in
-    linux/arm64) needed_arch="aarch64" ;;
-    linux/amd64) needed_arch="x86_64" ;;
-    *) return 0 ;;
-  esac
-  case "$host_arch:$needed_arch" in
-    x86_64:x86_64|aarch64:aarch64|arm64:aarch64)
-      return 0 ;;
-  esac
-  # Cross-platform docker run needs binfmt_misc registration for the foreign arch.
-  local marker="/proc/sys/fs/binfmt_misc/qemu-${needed_arch}"
-  if [[ ! -e "$marker" ]]; then
-    cat >&2 <<EOF
-Docker cannot execute $platform binaries on this $host_arch host without
-QEMU user-mode emulation registered with binfmt_misc.
-
-To enable (one-time per host):
-  Debian/Ubuntu: sudo apt install -y qemu-user-static binfmt-support
-  Fedora/RHEL:   sudo dnf install -y qemu-user-static
-  Arch:          sudo pacman -S --needed qemu-user-static-binfmt
-  Or via Docker: docker run --privileged --rm tonistiigi/binfmt --install $needed_arch
-
-After installation, this script will be able to build $platform archives
-locally. Until then, build them on a host with native $needed_arch support
-and merge with --allow-clobber on publish.
-EOF
     exit 1
   fi
 }
@@ -223,7 +202,6 @@ build_linux_native() {
   local scratch_binary="${output_dir}/.asylum-${release_name}"
 
   require_docker
-  require_emulation_for_platform "$platform"
 
   # M17: run as the host user so bind-mounted repo files are not modified as root.
   docker run --rm \
@@ -307,21 +285,30 @@ main() {
     exit 1
   fi
 
+  local host="$(uname -s):$(uname -m)"
+
   if contains_target "darwin-arm64"; then
-    build_macos "darwin-arm64" "aarch64-apple-darwin" "$OUTPUT_DIR"
+    case "$host" in
+      Darwin:*) build_macos "darwin-arm64" "aarch64-apple-darwin" "$OUTPUT_DIR" ;;
+      *)        build_via_zigbuild "darwin-arm64" "aarch64-apple-darwin" "$OUTPUT_DIR" ;;
+    esac
   fi
   if contains_target "darwin-x86_64"; then
-    build_macos "darwin-x86_64" "x86_64-apple-darwin" "$OUTPUT_DIR"
+    case "$host" in
+      Darwin:*) build_macos "darwin-x86_64" "x86_64-apple-darwin" "$OUTPUT_DIR" ;;
+      *)        build_via_zigbuild "darwin-x86_64" "x86_64-apple-darwin" "$OUTPUT_DIR" ;;
+    esac
   fi
   if contains_target "linux-arm64"; then
-    build_linux_native "linux-arm64" "linux/arm64" "$OUTPUT_DIR"
+    case "$host" in
+      # Apple Silicon: native arm64 in Docker, no emulation.
+      Darwin:arm64|Linux:aarch64) build_linux_native "linux-arm64" "linux/arm64" "$OUTPUT_DIR" ;;
+      # Linux x86_64: cross-compile via zigbuild image (no QEMU needed).
+      *)                          build_via_zigbuild "linux-arm64" "aarch64-unknown-linux-gnu" "$OUTPUT_DIR" ;;
+    esac
   fi
   if contains_target "linux-x86_64"; then
-    # On x86_64 Linux hosts, build natively (no Docker/QEMU needed).
-    # On Apple Silicon (arm64) hosts, use the apt-cross-compile path that
-    # runs in an arm64 container (avoids amd64 emulation).
-    # On other hosts (e.g. arm64 Linux), fall through to the same path.
-    case "$(uname -s):$(uname -m)" in
+    case "$host" in
       Linux:x86_64)
         build_linux_native "linux-x86_64" "linux/amd64" "$OUTPUT_DIR"
         ;;
