@@ -406,14 +406,18 @@ async fn handle_node_observe_ws(
     for event in response.events {
         if let Ok(payload) = serde_json::to_string(&event) {
             if socket.send(Message::Text(payload.into())).await.is_err() {
-                break;
+                return;
             }
         }
     }
 
-    let _ = socket
+    if socket
         .send(Message::Text("asylum.observe.ws.initialized".into()))
-        .await;
+        .await
+        .is_err()
+    {
+        return;
+    }
 
     let Ok(Some(node)) = service.store.get_node(node_id) else {
         return;
@@ -430,15 +434,27 @@ async fn handle_node_observe_ws(
     let Ok(mut output) = service.local_substrate.attach(node_id).await else {
         return;
     };
+
+    let (mut send, mut recv) = socket.split();
+
     loop {
-        match output.recv().await {
-            Ok(chunk) => {
-                if socket.send(Message::Text(chunk.into())).await.is_err() {
-                    break;
+        tokio::select! {
+            inbound = recv.next() => match inbound {
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(Message::Ping(payload))) => {
+                    let _ = send.send(Message::Pong(payload)).await;
                 }
-            }
-            Err(RecvError::Lagged(_)) => continue,
-            Err(_) => break,
+                Some(Ok(_)) | Some(Err(_)) => {}
+            },
+            output_chunk = output.recv() => match output_chunk {
+                Ok(chunk) => {
+                    if send.send(Message::Text(chunk.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            },
         }
     }
 }

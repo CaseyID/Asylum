@@ -1193,10 +1193,11 @@ impl CapabilityService {
     pub async fn attach_browser(&self, node_id: Uuid) -> Result<AttachResponse> {
         self.store.get_node(node_id)?.context("node not found")?;
         let token = self.attach_issuer.issue(node_id, 600)?;
+        let fingerprint = &token.raw[..token.raw.len().min(6)];
         self.store.record_event(
             node_id,
             NodeEventKind::AttachIssued,
-            json!({ "token": token.raw }),
+            json!({ "token_fingerprint": fingerprint }),
         )?;
         Ok(AttachResponse {
             url: format!("{}/attach/{}", self.config.base_url, token.raw),
