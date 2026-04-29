@@ -16,6 +16,7 @@ import {
   postNodeInput,
   requestBrowserAttach,
   requestNativeTarget,
+  sendRemoteCommand,
   setStoredOwnerToken,
   stopNode,
 } from "./api";
@@ -466,6 +467,43 @@ export function App() {
           onLaunch={() => {
             setScreen("create");
             setCmdkOpen(false);
+          }}
+          nodes={graph.nodes}
+          onPickNode={(node) => {
+            setOpenNodeId(node.id);
+            setSelectedNode(node.id);
+            setScreen("node");
+            setCmdkOpen(false);
+          }}
+          onAttachInBrowser={() => {
+            const target =
+              graph.nodes.find((n) => n.id === selectedNodeId) ??
+              graph.nodes.find((n) => n.id === openNodeId);
+            setCmdkOpen(false);
+            if (!target) {
+              setLocalNotice("select a node first");
+              return;
+            }
+            void handleNodeAction(target, "attach");
+          }}
+          onSendRemoteCommand={() => {
+            setCmdkOpen(false);
+            const example =
+              "send token=<owner-token> node=<node-id> text=<message>";
+            const raw = window.prompt(
+              `remote command:\n  status token=…\n  ${example}\n  interrupt token=… node=…\n  stop token=… node=…\n  attach token=… node=…`,
+              "",
+            );
+            if (!raw || !raw.trim()) return;
+            sendRemoteCommand(raw.trim())
+              .then((res) => {
+                setLocalNotice(`remote command ${res.kind}: ${res.status}`);
+              })
+              .catch((err) => {
+                setLocalError(
+                  `remote command failed: ${String(err instanceof Error ? err.message : err)}`,
+                );
+              });
           }}
         />
       )}
