@@ -14,11 +14,19 @@ The core product object is the **Node**: a live or resumable harness session run
 
 ## Product Path
 
+### Install
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CaseyID/Asylum/main/scripts/install.sh | bash
+```
+
+The installer downloads the latest release archive from GitHub, verifies its SHA-256 checksum, and installs the `asylum` binary to `~/.local/bin` (or the directory you specify with `--install-dir`).
+
+After install, open a new shell (or run the printed `export PATH=...` line), then:
+
+```bash
 asylum
 ```
-If installed via a piped/noninteractive install, `asylum` may only be on PATH after you restart/open a new shell. Ensure `~/.local/bin` is on PATH, add the printed `export PATH="...` line to your shell config, or run `~/.local/bin/asylum` directly when using the default install directory.
 
 Running bare `asylum` does the product bootstrap path:
 - Runs `asylum setup` if runtime files do not exist.
@@ -26,6 +34,8 @@ Running bare `asylum` does the product bootstrap path:
 - Waits for service health during startup.
 - Opens Cockpit in your browser.
 - Prints the Cockpit URL.
+
+If installed via a piped/noninteractive install, `asylum` may only be on PATH after you restart/open a new shell.
 
 ### Core Commands
 
@@ -42,7 +52,19 @@ asylum logs --tail
 asylum update
 ```
 
-`asylum update` reuses release resolution and fetch flow and then runs a health check afterwards.
+`asylum update` downloads the latest release, verifies its checksum, and restarts the service.
+
+### ntfy Notifications (Optional)
+
+Asylum can send and receive notifications via [ntfy.sh](https://ntfy.sh) or a self-hosted ntfy server. Set these environment variables before `asylum setup`:
+
+```bash
+export ASYLUM_NTFY_SERVER="https://ntfy.sh"   # or your self-hosted URL
+export ASYLUM_NTFY_TOPIC="your-private-topic"
+export ASYLUM_NTFY_TOKEN="your-access-token"  # if your server requires auth
+```
+
+When configured, the daemon subscribes to the topic at startup. Inbound ntfy messages appear as toasts in Cockpit and trigger `channel.inbound` hooks. Nodes can send outbound notifications via `asylum notify send`.
 
 ## Release Artifact Expectations
 
