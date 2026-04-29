@@ -7,6 +7,7 @@ export interface FirstRunScreenProps {
   onReadSpec: () => void;
   harnessCount: number;
   substrateCount: number;
+  nodeCount: number;
 }
 
 const STEPS: [string, string][] = [
@@ -14,7 +15,7 @@ const STEPS: [string, string][] = [
   ["start a command-center", "codex or claude code, with asylum context preloaded"],
   ["ask it to spawn workers", '"refactor the router with 2 workers on loon-us-west"'],
   ["watch the graph", "spawned nodes appear as supervisor / worker cards with explicit edges"],
-  ["inspect any node", "live transcript, capability matrix, decision prompts"],
+  ["inspect any node", "live transcript, capability matrix"],
   ["attach in browser", "real harness ui at any time, no native install required"],
   ["receive ntfy", "remote command channel — reply with `approve`, `attach`, `retry`"],
   ["drive from mcp", "asylum tools available in claude desktop, cursor, anything mcp-capable"],
@@ -27,6 +28,7 @@ export function FirstRunScreen({
   onReadSpec,
   harnessCount,
   substrateCount,
+  nodeCount,
 }: FirstRunScreenProps): JSX.Element {
   return (
     <div className="firstrun">
@@ -35,7 +37,7 @@ export function FirstRunScreen({
           <Wordmark size={20} />
         </div>
         <div className="hero">
-          <div className="mono-eyebrow">{"["} v0.1.0-rc4 · single-user · localhost {"]"}</div>
+          <div className="mono-eyebrow">{"["} asylum · single-user · localhost {"]"}</div>
           <h1>
             a control plane for the agent harnesses you already use.{" "}
             <span className="b">[</span>not a harness<span className="b">]</span>.
@@ -72,7 +74,7 @@ export function FirstRunScreen({
           <span>·</span>
           <span>{substrateCount} substrates configured</span>
           <span>·</span>
-          <span>0 nodes alive</span>
+          <span>{nodeCount} nodes alive</span>
         </div>
       </div>
       <div className="right">

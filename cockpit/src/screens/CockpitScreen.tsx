@@ -4,10 +4,9 @@
 import { type JSX } from "react";
 import { Btn, Empty } from "../lib/ui";
 import { Graph, type GraphNode } from "../components/Graph";
-import { NodeSession, type SpawnEvent, type SessionBus } from "../components/NodeSession";
+import { NodeSession } from "../components/NodeSession";
 import { Inspector, type InspectorAction } from "../components/Inspector";
-import { isCommandCenter } from "../lib/glyphs";
-import type { AsylumNode } from "../types";
+import type { AsylumNode, GraphRelationship } from "../types";
 
 export type GraphLayout = "tree" | "free" | "force" | "swimlanes";
 
@@ -19,13 +18,11 @@ export interface CockpitScreenProps {
   onOpen: (node: AsylumNode) => void;
   layout: GraphLayout;
   setLayout: (layout: GraphLayout) => void;
-  simSpeed: "still" | "slow" | "live";
-  onSpawn: (spawn: SpawnEvent) => void;
   onAction: (action: InspectorAction, payload?: string) => void;
-  sessionBus: { current: SessionBus };
   onExpandToChat: (nodeId: string) => void;
   onLaunchCC: () => void;
   substrates: { id: string; name: string; healthy: boolean; capacity: number }[];
+  relationships: GraphRelationship[];
 }
 
 const LAYOUT_OPTIONS: [GraphLayout, string][] = [
@@ -43,13 +40,11 @@ export function CockpitScreen({
   onOpen,
   layout,
   setLayout,
-  simSpeed,
-  onSpawn,
   onAction,
-  sessionBus,
   onExpandToChat,
   onLaunchCC,
   substrates,
+  relationships,
 }: CockpitScreenProps): JSX.Element {
   const panelNode = selected ?? ccNode;
 
@@ -99,9 +94,6 @@ export function CockpitScreen({
               key={panelNode.id}
               node={panelNode}
               mode="cockpit"
-              onSpawn={onSpawn}
-              simSpeed={simSpeed}
-              onAction={isCommandCenter(panelNode) ? sessionBus : undefined}
               onExpand={() => onExpandToChat(panelNode.id)}
             />
           ) : (
@@ -120,7 +112,7 @@ export function CockpitScreen({
           )}
         </div>
       </div>
-      <Inspector node={selected} onAction={onAction} onOpen={onOpen} />
+      <Inspector node={selected} onAction={onAction} onOpen={onOpen} relationships={relationships} />
     </div>
   );
 }

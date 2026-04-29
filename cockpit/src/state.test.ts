@@ -28,7 +28,7 @@ describe("H5 — ntfy toast interval stability under channel churn", () => {
     vi.useRealTimers();
   });
 
-  it("fires the handler after 9s even when channels ref is updated every 6s", () => {
+  it("fires the handler after 6s even when channels ref is updated partway through", () => {
     // Simulate channelsRef — a mutable container updated externally (like
     // `channelsRef.current = channels` in the separate useEffect).
     const channelsRef = { current: [{ id: "ch-1", kind: "ntfy", live: true }] };
@@ -36,22 +36,23 @@ describe("H5 — ntfy toast interval stability under channel churn", () => {
     const handler = vi.fn();
 
     // Set up the interval once (no channels dep, reads from ref).
+    // ntfy poll cadence is a constant 6s.
     const t = setInterval(() => {
       // Reads current value from ref — never torn down between channel updates.
       const ntfyChannel = channelsRef.current.find((c) => c.kind === "ntfy" && c.live);
       if (ntfyChannel) handler(ntfyChannel.id);
-    }, 9000);
+    }, 6000);
 
-    // Simulate two 6s polls updating the ref (new array reference each time,
+    // Simulate a 3s poll updating the ref (new array reference each time,
     // as setChannels would produce).
-    vi.advanceTimersByTime(6100);
+    vi.advanceTimersByTime(3100);
     channelsRef.current = [{ id: "ch-1", kind: "ntfy", live: true }];
 
-    // Handler must NOT have fired yet — 6.1s < 9s interval.
+    // Handler must NOT have fired yet — 3.1s < 6s interval.
     expect(handler).not.toHaveBeenCalled();
 
-    // Advance past the 9s mark.
-    vi.advanceTimersByTime(3000); // total 9.1s
+    // Advance past the 6s mark.
+    vi.advanceTimersByTime(3000); // total 6.1s
 
     expect(handler).toHaveBeenCalledOnce();
     expect(handler).toHaveBeenCalledWith("ch-1");
@@ -64,15 +65,15 @@ describe("H5 — ntfy toast interval stability under channel churn", () => {
     // causing the interval to be torn down and reset every 6s.
     const handler = vi.fn();
 
-    let t = setInterval(() => handler("fired"), 9000);
+    let t = setInterval(() => handler("fired"), 6000);
 
-    // At 6s — simulate effect cleanup + re-setup (old buggy behaviour).
-    vi.advanceTimersByTime(6100);
+    // At 3s — simulate effect cleanup + re-setup (old buggy behaviour).
+    vi.advanceTimersByTime(3100);
     clearInterval(t);
-    t = setInterval(() => handler("fired"), 9000);
+    t = setInterval(() => handler("fired"), 6000);
 
-    // Advance to what would have been 9s from the original start.
-    vi.advanceTimersByTime(2900); // total 9.0s but interval was reset at 6.1s
+    // Advance to what would have been 6s from the original start.
+    vi.advanceTimersByTime(2900); // total 6.0s but interval was reset at 3.1s
 
     // Handler has NOT fired — the reset stole the remaining time.
     expect(handler).not.toHaveBeenCalled();

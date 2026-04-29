@@ -1,4 +1,4 @@
-/* asylum cockpit — prototype styles */
+/* asylum cockpit styles */
 @import url("./tokens.css");
 
 * { box-sizing: border-box; }
@@ -623,17 +623,6 @@ select.input {
 *::-webkit-scrollbar-thumb { background: var(--border); border-radius: 0; border: 2px solid transparent; background-clip: padding-box; }
 *::-webkit-scrollbar-thumb:hover { background: var(--border-strong); background-clip: padding-box; border: 2px solid transparent; }
 
-/* ─── decision prompt (in node detail) ───────────────── */
-.decision {
-  border: 1px solid rgba(245,180,84,0.35); background: var(--status-waiting-bg);
-  padding: 14px 16px; display: flex; flex-direction: column; gap: 10px;
-}
-.decision .h {
-  display: flex; align-items: center; gap: 8px;
-  font-family: var(--font-mono); font-size: 11px; color: var(--status-waiting);
-}
-.decision .q { font-size: 13px; color: var(--fg); }
-.decision .actions { display: flex; gap: 6px; }
 
 /* ─── chart-y bits ───────────────────────────────────── */
 .spark { display: flex; align-items: flex-end; gap: 1px; height: 18px; }
@@ -685,10 +674,6 @@ select.input {
   border: 1px solid var(--border-subtle); font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted);
 }
 
-/* ─── tweaks panel customizations ─────────────────────── */
-.tweaks-card {
-  font-family: var(--font-sans);
-}
 
 /* node detail layout */
 .node-page { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 0; flex: 1; min-height: 0; }
@@ -938,7 +923,7 @@ select.input {
   padding: 6px 10px;
 }
 
-/* ─── mode-specific tweaks ─────────────────────────────── */
+/* ─── mode-specific styling ────────────────────────────── */
 /* fullscreen: bigger banner padding, more breathing room */
 .session-fullscreen .session-head { padding: 12px 22px; }
 .session-fullscreen .banner { padding: 14px 22px 8px; }
@@ -1424,4 +1409,20 @@ select.input {
   color: var(--fg-subtle);
   width: 16px;
   text-align: right;
+}
+
+/* ─── feedback banners ─────────────────────────────────── */
+.error-banner {
+  position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+  z-index: 50; padding: 8px 18px;
+  background: var(--bg-elev); border: 1px solid var(--status-errored);
+  color: var(--status-errored); font-family: var(--font-mono); font-size: 12px;
+  border-radius: 2px; white-space: nowrap;
+}
+.notice-banner {
+  position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+  z-index: 50; padding: 8px 18px;
+  background: var(--bg-elev); border: 1px solid var(--status-running);
+  color: var(--status-running); font-family: var(--font-mono); font-size: 12px;
+  border-radius: 2px; white-space: nowrap;
 }

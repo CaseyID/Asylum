@@ -33,8 +33,7 @@ export type NodeScreenAction =
   | "fork"
   | "restart"
   | "terminate"
-  | "archive"
-  | "decision";
+  | "archive";
 
 export interface NodeScreenProps {
   node?: AsylumNode;
@@ -148,7 +147,7 @@ export function NodeScreen({ node, nodes, relationships, onBack, onOpen, onActio
         </div>
 
         {tab === "session" && (
-          <NodeSession key={node.id} node={node} mode="fullscreen" simSpeed="slow" />
+          <NodeSession key={node.id} node={node} mode="fullscreen" />
         )}
         {tab === "events" && <EventsView node={node} />}
         {tab === "tools" && <ToolsView />}

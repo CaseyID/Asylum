@@ -18,12 +18,12 @@ import {
   setStoredOwnerToken,
   stopNode,
 } from "./api";
-import { isOperational, selectCommandCenter, useCockpitStore } from "./state";
+import { selectCommandCenter, useCockpitStore } from "./state";
 import { Topbar } from "./components/Topbar";
 import { Nav } from "./components/Nav";
 import { CmdK } from "./components/CmdK";
 import { NtfyToast, type ToastPayload } from "./components/NtfyToast";
-import { CockpitScreen, type GraphLayout } from "./screens/CockpitScreen";
+import { CockpitScreen } from "./screens/CockpitScreen";
 import { FleetScreen } from "./screens/FleetScreen";
 import { NodeScreen } from "./screens/NodeScreen";
 import { CreateScreen } from "./screens/CreateScreen";
@@ -34,9 +34,8 @@ import { SettingsScreen } from "./screens/SettingsScreen";
 import { ChatScreen } from "./screens/ChatScreen";
 import { FirstRunScreen } from "./screens/FirstRunScreen";
 import type { GraphNode } from "./components/Graph";
-import type { SessionBus, SpawnEvent } from "./components/NodeSession";
 import type { InspectorAction } from "./components/Inspector";
-import { isCommandCenter } from "./lib/glyphs";
+import { useUiPrefs } from "./lib/uiPrefs";
 import type {
   AsylumNode,
   ChannelDescriptor,
@@ -45,22 +44,6 @@ import type {
   ScreenId,
   SubstrateDescriptor,
 } from "./types";
-
-interface Tweaks {
-  theme: "dark" | "light";
-  navCollapsed: boolean;
-  graphLayout: GraphLayout;
-  simSpeed: "still" | "slow" | "live";
-  ntfyEnabled: boolean;
-}
-
-const DEFAULT_TWEAKS: Tweaks = {
-  theme: "dark",
-  navCollapsed: false,
-  graphLayout: "tree",
-  simSpeed: "slow",
-  ntfyEnabled: true,
-};
 
 export function App() {
   const {
@@ -73,10 +56,7 @@ export function App() {
     setCommandCenterSelection,
   } = useCockpitStore();
 
-  const [tweaks, setTweaks] = useState<Tweaks>(DEFAULT_TWEAKS);
-  const setTweak = useCallback(<K extends keyof Tweaks>(k: K, v: Tweaks[K]) => {
-    setTweaks((prev) => ({ ...prev, [k]: v }));
-  }, []);
+  const [uiPrefs, setPref] = useUiPrefs();
 
   const [screen, setScreen] = useState<ScreenId>("cockpit");
   const [openNodeId, setOpenNodeId] = useState<string | undefined>();
@@ -88,19 +68,26 @@ export function App() {
   const [hooks, setHooks] = useState<HookRule[]>([]);
   const [substrates, setSubstrates] = useState<SubstrateDescriptor[]>([]);
   const lastSeenMessageId = useRef<number>(0);
-  const sessionBus = useRef<SessionBus>({});
 
   const [ownerToken, setOwnerToken] = useState("");
   const [tokenDraft, setTokenDraft] = useState("");
   const [authRequired, setAuthRequired] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [localNotice, setLocalNotice] = useState<string | null>(null);
   const [notifications, setNotifications] = useState<NotificationRecord[]>([]);
   const refreshInFlight = useRef(false);
 
   // theme attribute on <html>
   useEffect(() => {
-    document.documentElement.setAttribute("data-theme", tweaks.theme);
-  }, [tweaks.theme]);
+    document.documentElement.setAttribute("data-theme", uiPrefs.theme);
+  }, [uiPrefs.theme]);
+
+  // auto-dismiss notice banner after 2.5s
+  useEffect(() => {
+    if (!localNotice) return;
+    const t = setTimeout(() => setLocalNotice(null), 2500);
+    return () => clearTimeout(t);
+  }, [localNotice]);
 
   // command palette / esc keybinds
   useEffect(() => {
@@ -187,14 +174,10 @@ export function App() {
     channelsRef.current = channels;
   }, [channels]);
 
-  // toast spawner — polls the live ntfy channel for new inbound messages and
-  // surfaces unseen ones as the lower-left toast.
-  // NOTE: reads channel data via channelsRef so that `channels` state updates
-  // (which happen every 6s during polling) do not tear down and restart the
-  // interval — the interval would otherwise never fire at simSpeed=slow (9s
-  // interval vs 6s poll churn).
+  // ntfy toast spawner — polls the live ntfy channel for new inbound messages
+  // and surfaces unseen ones as a lower-left toast.
+  // channelsRef avoids tearing down the timer on every channel-list refresh.
   useEffect(() => {
-    if (!tweaks.ntfyEnabled || tweaks.simSpeed === "still") return;
     let cancelled = false;
     const tick = async () => {
       const ntfyChannel = channelsRef.current.find((c) => c.kind === "ntfy" && c.live);
@@ -206,8 +189,6 @@ export function App() {
         if (fresh.length === 0) return;
         const latest = fresh[fresh.length - 1];
         lastSeenMessageId.current = latest.id;
-        // fold subject into body so the toast renders both lines without changing NtfyToast.
-        // ChannelMessageRecord has no node_id field, so reply is not available.
         setToasts(() => [
           {
             id: "t-" + latest.id,
@@ -220,16 +201,15 @@ export function App() {
           },
         ]);
       } catch {
-        /* silent */
+        /* silent — surface via Logs screen */
       }
     };
-    const interval = tweaks.simSpeed === "live" ? 4000 : 9000;
-    const t = setInterval(tick, interval);
+    const t = setInterval(tick, 6000);
     return () => {
       cancelled = true;
       clearInterval(t);
     };
-  }, [tweaks.ntfyEnabled, tweaks.simSpeed]);
+  }, []);
 
   function dismissToast(id: string) {
     setToasts((prev) => prev.filter((t) => t.id !== id));
@@ -283,49 +263,37 @@ export function App() {
     setScreen("node");
   };
 
-  async function handleNodeAction(target: AsylumNode | undefined, action: InspectorAction, payload?: string) {
+  async function handleNodeAction(target: AsylumNode | undefined, action: InspectorAction, _payload?: string) {
     if (!target) return;
-    const bus = sessionBus.current;
-    const writeSys = (text: string) => bus.pushSystem?.(text);
-    const writeTool = (n: string, args: Record<string, unknown>, output: string, st: "ok" | "pending" | "error" = "ok") =>
-      bus.pushTool?.(n, args, output, st);
     try {
       if (action === "attach") {
         const r = await requestBrowserAttach(target.id);
-        writeTool("node.attach.browser", { node: target.id }, `attach url issued · ttl ${r.expires_in_seconds ?? 3600}s\n${r.attach_url}`);
+        setLocalNotice(`attach url issued · ttl ${r.expires_in_seconds ?? 3600}s`);
         if (typeof window !== "undefined" && r.attach_url) {
           window.open(r.attach_url, "_blank", "noopener,noreferrer");
         }
       } else if (action === "send") {
-        writeSys(`prompting for input to ${target.id} (use the box below to type directly)`);
         setSelectedNode(target.id);
       } else if (action === "interrupt") {
         await interruptNode(target.id);
-        writeTool("node.interrupt", { node: target.id }, "sigint sent");
+        setLocalNotice("interrupt sent");
       } else if (action === "restart") {
         await stopNode(target.id);
-        writeTool("node.restart", { node: target.id }, "stop issued · ctx will reset on relaunch");
+        setLocalNotice("stop issued; node will reset on relaunch");
       } else if (action === "archive") {
         await archiveNode(target.id);
-        writeTool("node.archive", { node: target.id }, "transcript exported · workspace snapshot saved");
+        setLocalNotice("archive issued");
       } else if (action === "terminate") {
         await stopNode(target.id);
-        writeTool("node.terminate", { node: target.id }, "stop issued · resources released");
+        setLocalNotice("stop issued; resources will be released");
       } else if (action === "fork") {
-        try {
-          const newNode = await forkNode(target.id, {});
-          writeTool("node.fork", { source: target.id }, `forked into ${newNode.id}`);
-          setOpenNodeId(newNode.id);
-          setSelectedNode(newNode.id);
-        } catch (err) {
-          writeSys(`fork failed: ${String(err instanceof Error ? err.message : err)}`);
-        }
-      } else if (action === "decision" && payload) {
-        writeSys(`decision on ${target.id}: ${payload}`);
-        writeSys("resume not yet supported — decision recorded but node was not resumed");
+        const newNode = await forkNode(target.id, {});
+        setLocalNotice(`forked into ${newNode.id}`);
+        setOpenNodeId(newNode.id);
+        setSelectedNode(newNode.id);
       }
     } catch (err) {
-      writeSys(`action ${action} failed: ${String(err instanceof Error ? err.message : err)}`);
+      setLocalError(`${action} failed: ${String(err instanceof Error ? err.message : err)}`);
     }
     void refreshAll();
   }
@@ -337,13 +305,6 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [selectedNode],
   );
-
-  const onSpawn = (_spawn: SpawnEvent) => {
-    // canned spawns from the cc session are visual-only until the daemon
-    // emits structured spawn events; trigger an immediate refresh in case
-    // the spawn maps to a real node creation.
-    void refreshAll();
-  };
 
   const liveChannelCount = useMemo(() => channels.filter((c) => c.live).length, [channels]);
   const enabledHookCount = useMemo(() => hooks.filter((h) => h.enabled).length, [hooks]);
@@ -357,8 +318,8 @@ export function App() {
         screen={screen}
         openNodeId={openNode?.id}
         liveCount={liveCount}
-        theme={tweaks.theme}
-        onToggleTheme={() => setTweak("theme", tweaks.theme === "dark" ? "light" : "dark")}
+        theme={uiPrefs.theme}
+        onToggleTheme={() => setPref("theme", uiPrefs.theme === "dark" ? "light" : "dark")}
         onOpenCmdK={() => setCmdkOpen(true)}
       />
 
@@ -404,14 +365,14 @@ export function App() {
         </div>
       )}
 
-      <div className={`body ${tweaks.navCollapsed ? "nav-collapsed" : ""}`}>
+      <div className={`body ${uiPrefs.navCollapsed ? "nav-collapsed" : ""}`}>
         <Nav
-          collapsed={tweaks.navCollapsed}
+          collapsed={uiPrefs.navCollapsed}
           active={screen}
           fleetCount={graph.nodes.length}
           channelCount={liveChannelCount}
           hookCount={enabledHookCount}
-          daemonVersion="asylum 0.1.0-rc4"
+          daemonVersion={undefined}
           bindAddr={typeof window !== "undefined" ? window.location.host : "localhost"}
           onPick={handleSelectScreen}
         />
@@ -425,6 +386,7 @@ export function App() {
                 onReadSpec={() => setScreen("settings")}
                 harnessCount={2}
                 substrateCount={substrates.filter((s) => s.healthy).length}
+                nodeCount={graph.nodes.length}
               />
             ) : (
               <CockpitScreen
@@ -433,18 +395,16 @@ export function App() {
                 selected={selectedNode}
                 onSelect={(n) => setSelectedNode(n.id)}
                 onOpen={handleOpenNode}
-                layout={tweaks.graphLayout}
-                setLayout={(l) => setTweak("graphLayout", l)}
-                simSpeed={tweaks.simSpeed}
-                onSpawn={onSpawn}
+                layout={uiPrefs.graphLayout}
+                setLayout={(l) => setPref("graphLayout", l)}
                 onAction={inspectorAction}
-                sessionBus={sessionBus}
                 onExpandToChat={(id) => {
                   setChatNodeId(id);
                   setScreen("chat");
                 }}
                 onLaunchCC={() => setScreen("create")}
                 substrates={substrates}
+                relationships={graph.relationships}
               />
             )
           )}
@@ -481,9 +441,6 @@ export function App() {
               nodes={graph.nodes}
               chatNodeId={chatNodeId ?? ccNode?.id}
               onSelectChat={setChatNodeId}
-              simSpeed={tweaks.simSpeed}
-              onSpawn={onSpawn}
-              sessionBus={sessionBus}
               onLaunch={() => setScreen("create")}
             />
           )}
@@ -549,10 +506,7 @@ export function App() {
       )}
 
       {localError && <div className="error-banner">{localError}</div>}
-
-      {/* the prototype's notice; preserved as a verifiable signal that
-          we are still consuming the operational gate from state.ts */}
-      {graph.nodes.some((n) => !isOperational(n)) && null}
+      {localNotice && <div className="notice-banner">{localNotice}</div>}
     </div>
   );
 }
