@@ -175,7 +175,7 @@ export async function createNode(payload: CreateNodeRequest): Promise<AsylumNode
 
 async function fallbackPostNodeAction(
   nodeId: string,
-  action: "interrupt" | "stop" | "archive" | "resume",
+  action: "interrupt" | "stop" | "archive",
   body?: Jsonish,
 ): Promise<void> {
   const primary = `/nodes/${nodeId}/${action}`;
@@ -202,7 +202,6 @@ export async function postNodeInput(nodeId: string, input: string): Promise<void
 export const interruptNode = (id: string) => fallbackPostNodeAction(id, "interrupt");
 export const stopNode = (id: string) => fallbackPostNodeAction(id, "stop");
 export const archiveNode = (id: string) => fallbackPostNodeAction(id, "archive");
-export const resumeNode = (id: string) => fallbackPostNodeAction(id, "resume");
 
 export async function requestBrowserAttach(nodeId: string): Promise<AttachBrowserResponse> {
   const data = await request<AttachBrowserResponse | { url: string; expires_in_seconds: number }>(

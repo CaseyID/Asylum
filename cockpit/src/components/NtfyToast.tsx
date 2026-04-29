@@ -3,7 +3,11 @@ import { Icon } from "../lib/icons";
 
 export interface ToastPayload {
   id: string;
+  /** free-form display string (e.g. "ntfy:user@host") */
   from: string;
+  /** node id to target for replies; null when the inbound message record
+   *  carries no node id (ChannelMessageRecord has no node_id field). */
+  nodeId: string | null;
   channel: string;
   subject?: string;
   body: string;
@@ -40,32 +44,40 @@ export function NtfyToast({ toast, onDismiss, onReply }: NtfyToastProps): JSX.El
         <div className="from">{toast.from} → you</div>
         <div>{toast.body}</div>
       </div>
-      <div className="quick">
-        {toast.replies.map((r) => (
-          <button key={r} className="q" onClick={() => sendReply(r)}>
-            {r}
-          </button>
-        ))}
-      </div>
-      <div className="reply">
-        <span className="glyph">{">"}</span>
-        <input
-          placeholder="reply to send command…"
-          value={reply}
-          onChange={(e) => setReply(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && reply.trim()) sendReply(reply);
-          }}
-        />
-        <button
-          className="send"
-          onClick={() => {
-            if (reply.trim()) sendReply(reply);
-          }}
-        >
-          send ↵
-        </button>
-      </div>
+      {toast.nodeId === null ? (
+        <div className="reply-unavailable" style={{ opacity: 0.5, fontSize: "0.8em", padding: "4px 0" }}>
+          reply not available — message has no node target
+        </div>
+      ) : (
+        <>
+          <div className="quick">
+            {toast.replies.map((r) => (
+              <button key={r} className="q" onClick={() => sendReply(r)}>
+                {r}
+              </button>
+            ))}
+          </div>
+          <div className="reply">
+            <span className="glyph">{">"}</span>
+            <input
+              placeholder="reply to send command…"
+              value={reply}
+              onChange={(e) => setReply(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && reply.trim()) sendReply(reply);
+              }}
+            />
+            <button
+              className="send"
+              onClick={() => {
+                if (reply.trim()) sendReply(reply);
+              }}
+            >
+              send ↵
+            </button>
+          </div>
+        </>
+      )}
     </div>
   );
 }

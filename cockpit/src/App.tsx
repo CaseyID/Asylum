@@ -15,7 +15,6 @@ import {
   interruptNode,
   postNodeInput,
   requestBrowserAttach,
-  resumeNode,
   setStoredOwnerToken,
   stopNode,
 } from "./api";
@@ -85,6 +84,7 @@ export function App() {
   const [cmdkOpen, setCmdkOpen] = useState(false);
   const [toasts, setToasts] = useState<ToastPayload[]>([]);
   const [channels, setChannels] = useState<ChannelDescriptor[]>([]);
+  const channelsRef = useRef<ChannelDescriptor[]>([]);
   const [hooks, setHooks] = useState<HookRule[]>([]);
   const [substrates, setSubstrates] = useState<SubstrateDescriptor[]>([]);
   const lastSeenMessageId = useRef<number>(0);
@@ -180,14 +180,25 @@ export function App() {
     setAuthRequired(true);
   };
 
+  // keep channelsRef in sync so the toast interval can read current channels
+  // without listing channels in the interval effect's deps (which would cause
+  // the interval to be torn down and reset on every 6s poll).
+  useEffect(() => {
+    channelsRef.current = channels;
+  }, [channels]);
+
   // toast spawner — polls the live ntfy channel for new inbound messages and
   // surfaces unseen ones as the lower-left toast.
+  // NOTE: reads channel data via channelsRef so that `channels` state updates
+  // (which happen every 6s during polling) do not tear down and restart the
+  // interval — the interval would otherwise never fire at simSpeed=slow (9s
+  // interval vs 6s poll churn).
   useEffect(() => {
     if (!tweaks.ntfyEnabled || tweaks.simSpeed === "still") return;
-    const ntfyChannel = channels.find((c) => c.kind === "ntfy" && c.live);
-    if (!ntfyChannel) return;
     let cancelled = false;
     const tick = async () => {
+      const ntfyChannel = channelsRef.current.find((c) => c.kind === "ntfy" && c.live);
+      if (!ntfyChannel) return;
       try {
         const msgs = await fetchChannelMessages(ntfyChannel.id, 10);
         if (cancelled) return;
@@ -195,11 +206,13 @@ export function App() {
         if (fresh.length === 0) return;
         const latest = fresh[fresh.length - 1];
         lastSeenMessageId.current = latest.id;
-        // fold subject into body so the toast renders both lines without changing NtfyToast
+        // fold subject into body so the toast renders both lines without changing NtfyToast.
+        // ChannelMessageRecord has no node_id field, so reply is not available.
         setToasts(() => [
           {
             id: "t-" + latest.id,
             from: latest.sender,
+            nodeId: null,
             channel: ntfyChannel.name,
             subject: latest.subject,
             body: latest.subject ? `${latest.subject}\n${latest.body}` : latest.body,
@@ -216,7 +229,7 @@ export function App() {
       cancelled = true;
       clearInterval(t);
     };
-  }, [tweaks.ntfyEnabled, tweaks.simSpeed, channels]);
+  }, [tweaks.ntfyEnabled, tweaks.simSpeed]);
 
   function dismissToast(id: string) {
     setToasts((prev) => prev.filter((t) => t.id !== id));
@@ -309,7 +322,7 @@ export function App() {
         }
       } else if (action === "decision" && payload) {
         writeSys(`decision on ${target.id}: ${payload}`);
-        await resumeNode(target.id).catch(() => {});
+        writeSys("resume not yet supported — decision recorded but node was not resumed");
       }
     } catch (err) {
       writeSys(`action ${action} failed: ${String(err instanceof Error ? err.message : err)}`);
@@ -498,7 +511,8 @@ export function App() {
             toast={t}
             onDismiss={() => dismissToast(t.id)}
             onReply={async (text) => {
-              const target = graph.nodes.find((n) => n.id === t.from);
+              if (!t.nodeId) return;
+              const target = graph.nodes.find((n) => n.id === t.nodeId);
               if (target) {
                 try {
                   await postNodeInput(target.id, text);
