@@ -69,25 +69,11 @@ function layoutTree(nodes: GraphNode[], w: number, _h: number): PosMap {
   return positions;
 }
 
-// ─── layout: free / dotted-grid hand-arranged ─────────────────────────
-// hand-tuned poses for the prototype's 8 mock node short-ids; for real
-// daemon nodes the ids won't match, so unknown ids fall back to a grid.
+// ─── layout: free / 4-column grid by node order ───────────────────────
 function layoutFree(nodes: GraphNode[], _w: number, _h: number): PosMap {
-  const seed: Record<string, Pos> = {
-    "cc-7c2af":  { x: 120, y: 60 },
-    "sup-3d1e":  { x: 380, y: 220 },
-    "sup-aa01":  { x: 120, y: 280 },
-    "asst-d2c9": { x: 600, y: 60 },
-    "w-9a4f1":   { x: 240, y: 400 },
-    "w-2b0c8":   { x: 460, y: 400 },
-    "w-4e7b":    { x: 660, y: 320 },
-    "w-1f3a":    { x: 60,  y: 440 },
-  };
   const positions: PosMap = {};
   nodes.forEach((gn, i) => {
-    const sid = shortNodeId(gn.node.id);
-    if (seed[sid]) positions[gn.node.id] = seed[sid];
-    else positions[gn.node.id] = { x: 80 + (i % 4) * 200, y: 60 + Math.floor(i / 4) * 160 };
+    positions[gn.node.id] = { x: 80 + (i % 4) * 200, y: 60 + Math.floor(i / 4) * 160 };
   });
   return positions;
 }

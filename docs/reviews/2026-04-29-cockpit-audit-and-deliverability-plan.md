@@ -27,7 +27,7 @@ If you are an AI coding agent picking this up in a new session (with no memory o
 
 Update this list as PRs merge. Format: PR number — branch name — merge commit (or "in progress" / "not started").
 
-- PR 1 — `cockpit-strip-prototype-scaffolding` — **not started**
+- PR 1 — `cockpit-strip-prototype-scaffolding` — **landed on branch (HEAD: 37794b2)**
 - PR 2 — `cockpit-real-settings` — **not started**
 - PR 3 — `daemon-ntfy-inbound` — **not started**
 - PR 4 — `cockpit-wire-or-remove-dead-ui` — **not started**
@@ -420,7 +420,7 @@ Each PR below is independently testable, lands one cohesive change, and produces
 
 ### Task 1.1: Add `useUiPrefs` hook for persisted preferences
 
-- [ ] **Step 1:** Write failing test `cockpit/src/lib/uiPrefs.test.ts`:
+- [x] **Step 1:** Write failing test `cockpit/src/lib/uiPrefs.test.ts`:
   ```ts
   import { describe, it, expect, beforeEach } from "vitest";
   import { renderHook, act } from "@testing-library/react";
@@ -460,9 +460,9 @@ Each PR below is independently testable, lands one cohesive change, and produces
   });
   ```
 
-- [ ] **Step 2:** Run `npm --prefix cockpit run test -- uiPrefs` — expect FAIL ("file not found").
+- [x] **Step 2:** Run `npm --prefix cockpit run test -- uiPrefs` — expect FAIL ("file not found").
 
-- [ ] **Step 3:** Create `cockpit/src/lib/uiPrefs.ts`:
+- [x] **Step 3:** Create `cockpit/src/lib/uiPrefs.ts`:
   ```ts
   import { useCallback, useEffect, useState } from "react";
   import type { GraphLayout } from "../screens/CockpitScreen";
@@ -515,9 +515,9 @@ Each PR below is independently testable, lands one cohesive change, and produces
   }
   ```
 
-- [ ] **Step 4:** Run `npm --prefix cockpit run test -- uiPrefs` — expect PASS.
+- [x] **Step 4:** Run `npm --prefix cockpit run test -- uiPrefs` — expect PASS.
 
-- [ ] **Step 5:** Commit.
+- [x] **Step 5:** Commit.
   ```bash
   git add cockpit/src/lib/uiPrefs.ts cockpit/src/lib/uiPrefs.test.ts
   git commit -m "cockpit: add useUiPrefs persisted-prefs hook"
@@ -525,17 +525,17 @@ Each PR below is independently testable, lands one cohesive change, and produces
 
 ### Task 1.2: Replace `Tweaks` in App.tsx with `useUiPrefs` + drop `simSpeed` / `ntfyEnabled`
 
-- [ ] **Step 1:** In `cockpit/src/App.tsx`, delete the `Tweaks` interface (lines 49-55), the `DEFAULT_TWEAKS` constant (57-63), and the `tweaks` / `setTweak` block (76-79).
+- [x] **Step 1:** In `cockpit/src/App.tsx`, delete the `Tweaks` interface (lines 49-55), the `DEFAULT_TWEAKS` constant (57-63), and the `tweaks` / `setTweak` block (76-79).
 
-- [ ] **Step 2:** Add at the top of `App()`:
+- [x] **Step 2:** Add at the top of `App()`:
   ```ts
   const [uiPrefs, setPref] = useUiPrefs();
   ```
   (and add `import { useUiPrefs } from "./lib/uiPrefs";` at the top of the file.)
 
-- [ ] **Step 3:** Replace every `tweaks.theme` with `uiPrefs.theme`, `tweaks.navCollapsed` with `uiPrefs.navCollapsed`, `tweaks.graphLayout` with `uiPrefs.graphLayout`. Replace every `setTweak("theme", v)` with `setPref("theme", v)` etc. (use replace-all).
+- [x] **Step 3:** Replace every `tweaks.theme` with `uiPrefs.theme`, `tweaks.navCollapsed` with `uiPrefs.navCollapsed`, `tweaks.graphLayout` with `uiPrefs.graphLayout`. Replace every `setTweak("theme", v)` with `setPref("theme", v)` etc. (use replace-all).
 
-- [ ] **Step 4:** Delete the entire ntfy toast effect (lines 183-232), the `tweaks.simSpeed` and `tweaks.ntfyEnabled` references, and the `simSpeed` props passed to `<CockpitScreen>` and `<ChatScreen>`. Replace with:
+- [x] **Step 4:** Delete the entire ntfy toast effect (lines 183-232), the `tweaks.simSpeed` and `tweaks.ntfyEnabled` references, and the `simSpeed` props passed to `<CockpitScreen>` and `<ChatScreen>`. Replace with:
   ```ts
   // ntfy toast spawner — polls the live ntfy channel for new inbound messages
   // and surfaces unseen ones as a lower-left toast.
@@ -576,15 +576,15 @@ Each PR below is independently testable, lands one cohesive change, and produces
   ```
   Notes: poll cadence is a constant 6000ms; the `still`/`live`/`slow` toggle is gone; the effect runs once on mount and tears down on unmount — channel list updates flow through `channelsRef` (already in the file).
 
-- [ ] **Step 5:** Delete the no-op `{graph.nodes.some((n) => !isOperational(n)) && null}` JSX (lines 553-555), and remove the `isOperational` import from line 21 if it's no longer used.
+- [x] **Step 5:** Delete the no-op `{graph.nodes.some((n) => !isOperational(n)) && null}` JSX (lines 553-555), and remove the `isOperational` import from line 21 if it's no longer used.
 
-- [ ] **Step 6:** Delete the `onSpawn` callback (lines 341-346) and the `onSpawn` prop on `<CockpitScreen>` (line 439) and `<ChatScreen>` (line 485). The prop on `NodeSession` chains to `onSpawn` which only fires from `runResponse` (deleted in Task 1.3) — if leaving `onSpawn?` typed-optional in NodeSessionProps is convenient, that's fine; delete the call site here.
+- [x] **Step 6:** Delete the `onSpawn` callback (lines 341-346) and the `onSpawn` prop on `<CockpitScreen>` (line 439) and `<ChatScreen>` (line 485). The prop on `NodeSession` chains to `onSpawn` which only fires from `runResponse` (deleted in Task 1.3) — if leaving `onSpawn?` typed-optional in NodeSessionProps is convenient, that's fine; delete the call site here.
 
-- [ ] **Step 7:** Run `npm --prefix cockpit run build` — expect success (TypeScript will flag any leftover `tweaks.simSpeed` / `tweaks.ntfyEnabled` / unused-import that we missed; fix and rebuild).
+- [x] **Step 7:** Run `npm --prefix cockpit run build` — expect success (TypeScript will flag any leftover `tweaks.simSpeed` / `tweaks.ntfyEnabled` / unused-import that we missed; fix and rebuild).
 
-- [ ] **Step 8:** Run `npm --prefix cockpit run test` — all existing tests should pass (the `state.test.ts` test that referenced `simSpeed` will be updated in Task 1.5).
+- [x] **Step 8:** Run `npm --prefix cockpit run test` — all existing tests should pass (the `state.test.ts` test that referenced `simSpeed` will be updated in Task 1.5).
 
-- [ ] **Step 9:** Commit.
+- [x] **Step 9:** Commit.
   ```bash
   git add cockpit/src/App.tsx
   git commit -m "cockpit: replace Tweaks with useUiPrefs; drop simSpeed and ntfyEnabled"
@@ -592,7 +592,7 @@ Each PR below is independently testable, lands one cohesive change, and produces
 
 ### Task 1.3: Delete `runResponse` / `SessionStep` / `streamText` machinery from NodeSession
 
-- [ ] **Step 1:** In `cockpit/src/components/NodeSession.tsx`, delete:
+- [x] **Step 1:** In `cockpit/src/components/NodeSession.tsx`, delete:
   - Lines 28-33 (`SessionStep` type)
   - Line 39 (`runResponse?:` field in `SessionBus`)
   - Line 45 (`simSpeed?:` field in `NodeSessionProps`)
@@ -603,7 +603,7 @@ Each PR below is independently testable, lands one cohesive change, and produces
 
   Also remove `import { ... }` / fields no longer used after deletion.
 
-- [ ] **Step 2:** In the `onAction` registration block (was lines 163-172), reduce to:
+- [x] **Step 2:** In the `onAction` registration block (was lines 163-172), reduce to:
   ```ts
   useEffect(() => {
     if (!onAction) return;
@@ -617,16 +617,16 @@ Each PR below is independently testable, lands one cohesive change, and produces
 
   Wait — actually we want to do the full removal here in Task 1.4 since the bus is itself prototype residue. Skip the `pushTool` removal in this step to keep the diff narrow; do it in 1.4.
 
-- [ ] **Step 3:** Update `NodeScreen.tsx:151` to remove the `simSpeed="slow"` prop:
+- [x] **Step 3:** Update `NodeScreen.tsx:151` to remove the `simSpeed="slow"` prop:
   ```
   <NodeSession key={node.id} node={node} mode="fullscreen" />
   ```
 
-- [ ] **Step 4:** Update `CockpitScreen.tsx:22,46,103` to remove the `simSpeed` prop and field; same for `ChatScreen.tsx:20,30,90`.
+- [x] **Step 4:** Update `CockpitScreen.tsx:22,46,103` to remove the `simSpeed` prop and field; same for `ChatScreen.tsx:20,30,90`.
 
-- [ ] **Step 5:** Run `npm --prefix cockpit run build` and `npm --prefix cockpit run test` — expect success.
+- [x] **Step 5:** Run `npm --prefix cockpit run build` and `npm --prefix cockpit run test` — expect success.
 
-- [ ] **Step 6:** Commit.
+- [x] **Step 6:** Commit.
   ```bash
   git add cockpit/src/components/NodeSession.tsx cockpit/src/screens/CockpitScreen.tsx cockpit/src/screens/ChatScreen.tsx cockpit/src/screens/NodeScreen.tsx
   git commit -m "cockpit: remove runResponse/streamText simulation machinery"
@@ -634,11 +634,11 @@ Each PR below is independently testable, lands one cohesive change, and produces
 
 ### Task 1.4: Replace imperative `pushSystem`/`pushTool` bus with toast confirmations
 
-- [ ] **Step 1:** In `cockpit/src/components/NodeSession.tsx`, delete the `SessionBus` interface (lines 35-40), the `onAction?:` prop field (line 48), the `onAction` parameter (line 102), and the `useEffect` registering `onAction.current` (now ~163-172 after Task 1.3).
+- [x] **Step 1:** In `cockpit/src/components/NodeSession.tsx`, delete the `SessionBus` interface (lines 35-40), the `onAction?:` prop field (line 48), the `onAction` parameter (line 102), and the `useEffect` registering `onAction.current` (now ~163-172 after Task 1.3).
 
   Also delete the `kind: "sys-line"` entry-type from `TranscriptEntry` (line 61) — without `pushSystem`, no caller emits `sys-line` rows except `initialTranscript` (which already does and should be kept). Wait — `initialTranscript` does emit `sys-line`, and `appendNodeEvent` does too for some kinds. Keep `sys-line`. Just delete the bus.
 
-- [ ] **Step 2:** In `cockpit/src/App.tsx`, replace the entire `handleNodeAction` block (lines 286-329) with a version that uses transient toasts via `setLocalError` for failures and a new `setLocalNotice` for successes. Add at the top of `App()`:
+- [x] **Step 2:** In `cockpit/src/App.tsx`, replace the entire `handleNodeAction` block (lines 286-329) with a version that uses transient toasts via `setLocalError` for failures and a new `setLocalNotice` for successes. Add at the top of `App()`:
   ```ts
   const [localNotice, setLocalNotice] = useState<string | null>(null);
   useEffect(() => {
@@ -685,17 +685,17 @@ Each PR below is independently testable, lands one cohesive change, and produces
   ```
   Note: the `decision` arm is deleted (see Task 1.6).
 
-- [ ] **Step 3:** Add a `<NoticeBanner>` render below `localError` (around line 551):
+- [x] **Step 3:** Add a `<NoticeBanner>` render below `localError` (around line 551):
   ```tsx
   {localNotice && <div className="notice-banner">{localNotice}</div>}
   ```
   And add CSS for `.notice-banner` in `cockpit.css` mirroring `.error-banner` but with `--status-running` foreground.
 
-- [ ] **Step 4:** Delete the `sessionBus` ref (line 91), the `import type { SessionBus }` (line 37), all `sessionBus={sessionBus}` props on `<CockpitScreen>` (line 441) and `<ChatScreen>` (line 486), the `sessionBus` prop in `CockpitScreen.tsx:25,49,104` and `ChatScreen.tsx:22,32,92`, and the conditional `onAction={isCommandCenter(panelNode) ? sessionBus : undefined}` on the `<NodeSession>` calls in those screens.
+- [x] **Step 4:** Delete the `sessionBus` ref (line 91), the `import type { SessionBus }` (line 37), all `sessionBus={sessionBus}` props on `<CockpitScreen>` (line 441) and `<ChatScreen>` (line 486), the `sessionBus` prop in `CockpitScreen.tsx:25,49,104` and `ChatScreen.tsx:22,32,92`, and the conditional `onAction={isCommandCenter(panelNode) ? sessionBus : undefined}` on the `<NodeSession>` calls in those screens.
 
-- [ ] **Step 5:** Run `npm --prefix cockpit run build` and `npm --prefix cockpit run test` — expect success.
+- [x] **Step 5:** Run `npm --prefix cockpit run build` and `npm --prefix cockpit run test` — expect success.
 
-- [ ] **Step 6:** Commit.
+- [x] **Step 6:** Commit.
   ```bash
   git add cockpit/
   git commit -m "cockpit: replace transcript-bus action confirmations with toasts"
@@ -703,7 +703,7 @@ Each PR below is independently testable, lands one cohesive change, and produces
 
 ### Task 1.5: Delete `layoutFree` seed; rename "free" layout to grid behavior; remove dead `decision` enum members and CSS; clean state.test.ts
 
-- [ ] **Step 1:** In `cockpit/src/components/Graph.tsx:75-93`, delete the `seed` map and rewrite `layoutFree` to be a pure grid:
+- [x] **Step 1:** In `cockpit/src/components/Graph.tsx:75-93`, delete the `seed` map and rewrite `layoutFree` to be a pure grid:
   ```ts
   function layoutFree(nodes: GraphNode[], _w: number, _h: number): PosMap {
     const positions: PosMap = {};
@@ -715,17 +715,17 @@ Each PR below is independently testable, lands one cohesive change, and produces
   ```
   Update the comment at lines 72-74 to: `// layout: hand-arranged 4-column grid by node order`.
 
-- [ ] **Step 2:** In `cockpit/src/components/Inspector.tsx:24` and `cockpit/src/screens/NodeScreen.tsx:37`, remove `| "decision"` from the action type unions. In `App.tsx:286-329`, the `decision` arm was already removed in Task 1.4.
+- [x] **Step 2:** In `cockpit/src/components/Inspector.tsx:24` and `cockpit/src/screens/NodeScreen.tsx:37`, remove `| "decision"` from the action type unions. In `App.tsx:286-329`, the `decision` arm was already removed in Task 1.4.
 
-- [ ] **Step 3:** In `cockpit/src/cockpit.css`, delete the `.decision` block (lines 626-640 approximately — search for `.decision`), the `.tweaks-card` rule (line 689), and update line 1's comment to `/* asylum cockpit styles */`. Update line 941 comment from `/* ─── mode-specific tweaks ─── */` to `/* ─── mode-specific styling ─── */`.
+- [x] **Step 3:** In `cockpit/src/cockpit.css`, delete the `.decision` block (lines 626-640 approximately — search for `.decision`), the `.tweaks-card` rule (line 689), and update line 1's comment to `/* asylum cockpit styles */`. Update line 941 comment from `/* ─── mode-specific tweaks ─── */` to `/* ─── mode-specific styling ─── */`.
 
-- [ ] **Step 4:** In `cockpit/src/screens/FirstRunScreen.tsx:17`, remove `, decision prompts` from the description string.
+- [x] **Step 4:** In `cockpit/src/screens/FirstRunScreen.tsx:17`, remove `, decision prompts` from the description string.
 
-- [ ] **Step 5:** In `cockpit/src/state.test.ts:69`, the test's reference to "simulate effect cleanup" can stay as a comment but anywhere it tests `simSpeed` behavior, remove. Read the file and adjust.
+- [x] **Step 5:** In `cockpit/src/state.test.ts:69`, the test's reference to "simulate effect cleanup" can stay as a comment but anywhere it tests `simSpeed` behavior, remove. Read the file and adjust.
 
-- [ ] **Step 6:** Run `npm --prefix cockpit run build` and `npm --prefix cockpit run test` — expect success.
+- [x] **Step 6:** Run `npm --prefix cockpit run build` and `npm --prefix cockpit run test` — expect success.
 
-- [ ] **Step 7:** Commit.
+- [x] **Step 7:** Commit.
   ```bash
   git add cockpit/
   git commit -m "cockpit: delete prototype seed IDs, dead decision action, tweaks CSS"
@@ -733,44 +733,44 @@ Each PR below is independently testable, lands one cohesive change, and produces
 
 ### Task 1.6: Wire `Inspector` parent display
 
-- [ ] **Step 1:** In `cockpit/src/components/Inspector.tsx`, add a `relationships?: GraphRelationship[]` prop to `InspectorProps`.
+- [x] **Step 1:** In `cockpit/src/components/Inspector.tsx`, add a `relationships?: GraphRelationship[]` prop to `InspectorProps`.
 
-- [ ] **Step 2:** In the body of Inspector, replace `["parent", "—"]` (line 84) with parent resolution:
+- [x] **Step 2:** In the body of Inspector, replace `["parent", "—"]` (line 84) with parent resolution:
   ```ts
   const parentRel = relationships?.find((r) => r.target_node_id === node.id);
   const parentLabel = parentRel ? shortNodeId(parentRel.source_node_id) : "—";
   ```
   And pass `["parent", parentLabel]`.
 
-- [ ] **Step 3:** In `cockpit/src/screens/CockpitScreen.tsx` (where `<Inspector node={selected} ...>` is rendered), pass `relationships={...}`. The relationships array is already in the App's graph state — thread it down through CockpitScreenProps.
+- [x] **Step 3:** In `cockpit/src/screens/CockpitScreen.tsx` (where `<Inspector node={selected} ...>` is rendered), pass `relationships={...}`. The relationships array is already in the App's graph state — thread it down through CockpitScreenProps.
 
-- [ ] **Step 4:** Add a Vitest test confirming Inspector renders the parent shortNodeId when given a matching relationship.
+- [x] **Step 4:** Add a Vitest test confirming Inspector renders the parent shortNodeId when given a matching relationship.
 
-- [ ] **Step 5:** Run build + test, commit.
+- [x] **Step 5:** Run build + test, commit.
 
 ### Task 1.7: Hardcoded version cleanup (preview pass for PR 4 health endpoint extension)
 
-- [ ] **Step 1:** Replace `"asylum 0.1.0-rc4"` literal in `App.tsx:414` with `daemonVersion={daemonVersion}` where `daemonVersion` is a state variable initialized to `null` and to be populated by PR 4. Until then, fall through to the `?? "asylum"` default in Nav.tsx:92.
+- [x] **Step 1:** Replace `"asylum 0.1.0-rc4"` literal in `App.tsx:414` with `daemonVersion={daemonVersion}` where `daemonVersion` is a state variable initialized to `null` and to be populated by PR 4. Until then, fall through to the `?? "asylum"` default in Nav.tsx:92.
 
-- [ ] **Step 2:** Replace `[ v0.1.0-rc4 · single-user · localhost ]` in `FirstRunScreen.tsx:38` with `[ asylum · single-user · localhost ]` (drop the version literal entirely until PR 4 wires it).
+- [x] **Step 2:** Replace `[ v0.1.0-rc4 · single-user · localhost ]` in `FirstRunScreen.tsx:38` with `[ asylum · single-user · localhost ]` (drop the version literal entirely until PR 4 wires it).
 
-- [ ] **Step 3:** Replace hardcoded `0 nodes alive` in `FirstRunScreen.tsx:75` with the actual count: thread a `nodeCount` prop down from App.tsx (where `graph.nodes.length` is available) and render `{nodeCount} nodes alive`.
+- [x] **Step 3:** Replace hardcoded `0 nodes alive` in `FirstRunScreen.tsx:75` with the actual count: thread a `nodeCount` prop down from App.tsx (where `graph.nodes.length` is available) and render `{nodeCount} nodes alive`.
 
-- [ ] **Step 4:** Build + test, commit.
+- [x] **Step 4:** Build + test, commit.
 
 ### PR 1 verification
 
-- [ ] `npm --prefix cockpit run build` succeeds
-- [ ] `npm --prefix cockpit run test` all pass
-- [ ] `cargo build --release` succeeds (cockpit assets are baked in)
-- [ ] Manually open the cockpit (in dev: `cargo run -- start` then visit `http://localhost:7717`):
+- [x] `npm --prefix cockpit run build` succeeds
+- [x] `npm --prefix cockpit run test` all pass
+- [x] `cargo build --release` succeeds (cockpit assets are baked in)
+- [x] Manually open the cockpit (in dev: `cargo run -- start` then visit `http://localhost:7717`):
   - Theme toggle persists across reload
   - Nav collapse persists across reload
   - Graph layout selection persists across reload
   - No "Tweaks" anywhere; no `simSpeed` setting reachable
   - Inspector buttons (interrupt, fork, restart, archive, terminate) emit toasts on success and red banners on failure; transcript stays clean of cockpit-synthesized lines
   - Reload while in node-detail screen — no `simSpeed="slow"` prop in dev tools
-- [ ] Grep audit: `rg -i 'simSpeed|tweaks|runResponse|SessionStep|streamText' cockpit/src` returns zero matches.
+- [x] Grep audit: `rg -i 'simSpeed|tweaks|runResponse|SessionStep|streamText' cockpit/src` returns zero matches.
 
 ### PR 1 commit message (final consolidating commit if rebasing)
 

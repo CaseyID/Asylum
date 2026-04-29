@@ -3,10 +3,9 @@
 
 import { type JSX, type ReactNode } from "react";
 import { Btn, Empty } from "../lib/ui";
-import { NodeSession, type SessionBus, type SpawnEvent } from "../components/NodeSession";
+import { NodeSession } from "../components/NodeSession";
 import {
   ROLE_GLYPH,
-  harnessLabel,
   isCommandCenter,
   shortNodeId,
   uiStateOf,
@@ -17,9 +16,6 @@ export interface ChatScreenProps {
   nodes: AsylumNode[];
   chatNodeId?: string;
   onSelectChat: (id: string) => void;
-  simSpeed: "still" | "slow" | "live";
-  onSpawn: (spawn: SpawnEvent) => void;
-  sessionBus: { current: SessionBus };
   onLaunch: () => void;
 }
 
@@ -27,9 +23,6 @@ export function ChatScreen({
   nodes,
   chatNodeId,
   onSelectChat,
-  simSpeed,
-  onSpawn,
-  sessionBus,
   onLaunch,
 }: ChatScreenProps): JSX.Element {
   const cc = nodes.find((n) => isCommandCenter(n));
@@ -87,9 +80,6 @@ export function ChatScreen({
             key={active.id}
             node={active}
             mode="fullscreen"
-            simSpeed={simSpeed}
-            onSpawn={onSpawn}
-            onAction={isCommandCenter(active) ? sessionBus : undefined}
           />
         ) : (
           <Empty glyph="⌬" lead="no nodes" sub="launch a command center to start" />
@@ -132,3 +122,4 @@ function RailItem({
     </div>
   );
 }
+

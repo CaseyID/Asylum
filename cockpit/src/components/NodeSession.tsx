@@ -17,35 +17,10 @@ import type { AsylumNode } from "../types";
 
 export type SessionMode = "cockpit" | "fullscreen";
 
-export interface SpawnEvent {
-  id: string;
-  role: string;
-  harness: string;
-  substrate: string;
-  parent: string;
-}
-
-export type SessionStep =
-  | { kind: "thought"; text: string; delay?: number }
-  | { kind: "tool"; name: string; args?: Record<string, unknown>; output?: string; state?: "ok" | "pending" | "error"; spawn?: SpawnEvent; delay?: number }
-  | { kind: "text"; text: string; delay?: number }
-  | { kind: "list"; items: string[]; delay?: number }
-  | { kind: "attach"; node: string; url: string; delay?: number };
-
-export interface SessionBus {
-  pushSystem?: (text: string) => void;
-  pushTool?: (name: string, args: Record<string, unknown>, output: string, state?: "ok" | "pending" | "error") => void;
-  pushUser?: (text: string) => void;
-  runResponse?: (seq: SessionStep[]) => Promise<void>;
-}
-
 export interface NodeSessionProps {
   node: AsylumNode;
   mode?: SessionMode;
-  simSpeed?: "still" | "slow" | "live";
-  onSpawn?: (spawn: SpawnEvent) => void;
   onAttach?: (nodeId: string) => void;
-  onAction?: { current: SessionBus };
   onExpand?: () => void;
 }
 
@@ -76,10 +51,6 @@ interface NodeEvent {
 const WS_INIT_FRAME = "asylum.observe.ws.initialized";
 const WS_LIVE_UNAVAILABLE = "asylum.observe.ws.live_stream_unavailable";
 
-function sleep(ms: number): Promise<void> {
-  return ms > 0 ? new Promise(r => setTimeout(r, ms)) : Promise.resolve();
-}
-
 // ─── initial transcript ───────────────────────────────────────────────────────
 function initialTranscript(node: AsylumNode): TranscriptEntry[] {
   const isCC = isCommandCenter(node);
@@ -96,10 +67,7 @@ function initialTranscript(node: AsylumNode): TranscriptEntry[] {
 export function NodeSession({
   node,
   mode = "cockpit",
-  simSpeed = "slow",
-  onSpawn,
   onAttach,
-  onAction,
   onExpand,
 }: NodeSessionProps): ReactElement {
   const [entries, setEntries] = useState<TranscriptEntry[]>(() => initialTranscript(node));
@@ -116,60 +84,6 @@ export function NodeSession({
   }, [entries]);
 
   const harnessId = node.harness === "claude_code" ? "claude-code" : "codex";
-
-  const speedMul = simSpeed === "still" ? 0 : simSpeed === "slow" ? 1.6 : 0.6;
-
-  // stream a text entry token-by-token for the live typing effect
-  async function streamText(full: string): Promise<void> {
-    const id = Math.random().toString(36).slice(2, 8);
-    setEntries(p => [...p, { kind: "text", id, text: "" }]);
-    if (simSpeed === "still") {
-      setEntries(p => p.map(e => (e.kind === "text" && "id" in e && e.id === id) ? { ...e, text: full } : e));
-      return;
-    }
-    let cur = "";
-    const tokens = full.split(/(\s+)/);
-    for (const tok of tokens) {
-      cur += tok;
-      const t = cur;
-      setEntries(p => p.map(e => (e.kind === "text" && "id" in e && e.id === id) ? { ...e, text: t } : e));
-      await sleep((22 + Math.random() * 30) * speedMul);
-    }
-  }
-
-  async function runResponse(seq: SessionStep[]): Promise<void> {
-    setStreaming(true);
-    for (const step of seq) {
-      await sleep((step.delay ?? 200) * speedMul);
-      if (step.kind === "thought") {
-        setEntries(p => [...p, { kind: "thought", text: step.text }]);
-      } else if (step.kind === "tool") {
-        setEntries(p => [...p, { kind: "tool", name: step.name, args: step.args, output: step.output, state: step.state ?? "ok" }]);
-        if (step.spawn && onSpawn) onSpawn(step.spawn);
-      } else if (step.kind === "text") {
-        await streamText(step.text);
-      } else if (step.kind === "list") {
-        setEntries(p => [...p, { kind: "list", items: step.items }]);
-      } else if (step.kind === "attach") {
-        setEntries(p => [...p, { kind: "attach", node: step.node, url: step.url }]);
-        if (onAttach) onAttach(step.node);
-      }
-    }
-    setEntries(p => [...p, { kind: "prompt" }]);
-    setStreaming(false);
-  }
-
-  // expose imperative bus to inspector/external callers
-  useEffect(() => {
-    if (!onAction) return;
-    onAction.current = {
-      pushSystem: (text) => setEntries(prev => [...prev, { kind: "sys-line", text }]),
-      pushTool: (name, args, output, state = "ok") =>
-        setEntries(prev => [...prev, { kind: "tool", name, args, output, state }]),
-      pushUser: (text) => setEntries(prev => [...prev, { kind: "user", text }]),
-      runResponse,
-    };
-  });
 
   async function submit(): Promise<void> {
     const v = input.trim();
@@ -267,6 +181,7 @@ export function NodeSession({
         const url = typeof body.url === "string" ? body.url : (typeof body.attach_url === "string" ? body.attach_url : "");
         const targetNode = typeof body.node_id === "string" ? body.node_id : (evt.node_id ?? node.id);
         setEntries(p => [...p, { kind: "attach", node: targetNode, url }]);
+        if (onAttach) onAttach(targetNode);
         return;
       }
       case "tool_call": {

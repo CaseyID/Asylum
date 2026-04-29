@@ -1,6 +1,5 @@
 import { Fragment, type JSX } from "react";
 import { Btn, KV, Pill } from "../lib/ui";
-import { Icon } from "../lib/icons";
 import {
   harnessLabel,
   roleGlyph,
@@ -11,7 +10,7 @@ import {
   uiStateLabel,
   uptimeLabel,
 } from "../lib/glyphs";
-import type { AsylumNode } from "../types";
+import type { AsylumNode, GraphRelationship } from "../types";
 
 export type InspectorAction =
   | "attach"
@@ -20,13 +19,13 @@ export type InspectorAction =
   | "fork"
   | "restart"
   | "terminate"
-  | "archive"
-  | "decision";
+  | "archive";
 
 export interface InspectorProps {
   node?: AsylumNode;
   onAction: (action: InspectorAction, payload?: string) => void;
   onOpen: (node: AsylumNode) => void;
+  relationships?: GraphRelationship[];
 }
 
 const CAPABILITY_KEYS: Array<keyof AsylumNode["capabilities"]> = [
@@ -40,7 +39,7 @@ const CAPABILITY_KEYS: Array<keyof AsylumNode["capabilities"]> = [
   "transcript_export",
 ];
 
-export function Inspector({ node, onAction, onOpen }: InspectorProps): JSX.Element {
+export function Inspector({ node, onAction, onOpen, relationships }: InspectorProps): JSX.Element {
   if (!node) {
     return (
       <div className="inspector">
@@ -57,6 +56,9 @@ export function Inspector({ node, onAction, onOpen }: InspectorProps): JSX.Eleme
   const uiState = uiStateOf(node);
   const telemetry = telemetryFor(node);
   const preview = previewFor(node);
+
+  const parentRel = relationships?.find((r) => r.target_node_id === node.id);
+  const parentLabel = parentRel ? shortNodeId(parentRel.source_node_id) : "—";
 
   return (
     <div className="inspector">
@@ -81,7 +83,7 @@ export function Inspector({ node, onAction, onOpen }: InspectorProps): JSX.Eleme
               ["harness", harnessLabel(node.harness)],
               ["substrate", node.substrate],
               ["workspace", node.workspace ?? "—"],
-              ["parent", "—"],
+              ["parent", parentLabel],
               ["uptime", uptimeLabel(node)],
             ]}
           />
@@ -198,3 +200,4 @@ export function Inspector({ node, onAction, onOpen }: InspectorProps): JSX.Eleme
     </div>
   );
 }
+

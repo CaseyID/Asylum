@@ -3,11 +3,7 @@ import { fetchGraph, interruptNode, archiveNode, stopNode, setStoredOwnerToken }
 import type { ToastPayload } from "./components/NtfyToast";
 
 beforeEach(() => {
-  try {
-    window.localStorage.clear();
-  } catch {
-    // jsdom may not support localStorage.clear in all configurations
-  }
+  window.localStorage.clear();
   vi.restoreAllMocks();
 });
 
