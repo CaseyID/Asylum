@@ -338,12 +338,11 @@ asylum_verify_with_checksum_file() {
     return 1
   fi
 
+  # M14: hard-fail when the archive isn't listed — never fall back to another entry.
   local expected
-  expected="$(awk -v f="$archive_name" '$2 == f || $2 == "*" f { print $1 }' "$checksum_file" | head -n1)"
+  expected="$(awk -v f="$archive_name" '$2 == f || $2 == ("*" f) { print $1 }' "$checksum_file" | head -n1)"
   if [[ -z "$expected" ]]; then
-    expected="$(awk '{print $1; exit}' "$checksum_file")"
-  fi
-  if [[ -z "$expected" ]]; then
+    asylum_error "Checksum entry for ${archive_name} not found in checksums.txt — aborting."
     return 1
   fi
 
@@ -464,6 +463,14 @@ asylum_extract_binary() {
       continue
     fi
     entry_type="${entry_info:0:1}"
+    # M15: reject hardlinks (type 'h') and any non-regular-file type.
+    # Note: GNU tar reports the first instance of a hard-linked inode as '-';
+    # subsequent hard links appear as 'h'. We also reject after extraction via
+    # nlink check so that first-instance hardlinks are caught.
+    if [[ "$entry_type" == "h" ]]; then
+      asylum_error "Archive contains a hardlink for asylum binary — refusing to install."
+      return 1
+    fi
     if [[ "$entry_type" != "-" ]]; then
       continue
     fi
@@ -489,6 +496,14 @@ asylum_extract_binary() {
   fi
   if [[ ! -x "${extract_dir}/${archive_entry}" ]]; then
     asylum_error "Extracted asylum is not executable: ${archive_entry}"
+    return 1
+  fi
+  # M15: post-extraction hardlink check — catches first-instance hardlinks that
+  # GNU tar reports as '-' in the listing but which share an inode with another path.
+  local nlink
+  nlink="$(stat -c '%h' "${extract_dir}/${archive_entry}" 2>/dev/null || stat -f '%l' "${extract_dir}/${archive_entry}" 2>/dev/null || echo 1)"
+  if [[ "$nlink" -gt 1 ]] 2>/dev/null; then
+    asylum_error "Extracted asylum binary is a hardlink (nlink=${nlink}) — refusing to install."
     return 1
   fi
 
@@ -603,16 +618,23 @@ asylum_detect_shell_rc() {
   esac
 }
 
+# M16: single-quote-escape a string for safe embedding inside sh single quotes.
+# Replaces each ' with '"'"' so the result can be wrapped in '...' safely.
+_sq_escape() {
+  printf '%s' "$1" | sed "s/'/'\\''/g"
+}
+
 asylum_render_managed_path_block() {
   local install_dir=$1
   local marker="# Added by Asylum installer"
+  # M16: use single-quoted form so special chars in install_dir are safe.
+  local escaped_dir
+  escaped_dir="$(_sq_escape "$install_dir")"
 
-  cat <<EOF
-$marker
-if [[ ":\$PATH:" != *":${install_dir}:"* ]]; then
-  export PATH="${install_dir}:\$PATH"
-fi
-EOF
+  printf '%s\n' "$marker"
+  printf "if [[ \":\$PATH:\" != *\":'%s':\"* ]]; then\n" "$escaped_dir"
+  printf "  export PATH='%s':\"\$PATH\"\n" "$escaped_dir"
+  printf 'fi\n'
 }
 
 asylum_apply_path_to_shell_rc() {
@@ -634,11 +656,14 @@ asylum_apply_path_to_shell_rc() {
     touch "$rc_file"
   fi
 
+  # M16: all writes to rc_file use atomic temp+mv to avoid partial writes.
   if (( has_managed_block )); then
     local tmp_rc
     local clean_rc
+    local final_rc
     tmp_rc="$(mktemp)"
     clean_rc="$(mktemp)"
+    final_rc="$(mktemp "${rc_file}.tmp.XXXXXX")"
 
     awk -v marker="$marker" '
       $0 == marker { in_block=1; next }
@@ -664,17 +689,20 @@ asylum_apply_path_to_shell_rc() {
       }
     ' "$tmp_rc" > "$clean_rc"
 
-    cat "$clean_rc" > "$rc_file"
-    if [[ -s "$rc_file" ]]; then
-      printf '\n' >> "$rc_file"
+    cat "$clean_rc" > "$final_rc"
+    if [[ -s "$final_rc" ]]; then
+      printf '\n' >> "$final_rc"
     fi
-    asylum_render_managed_path_block "$install_dir" >> "$rc_file"
+    asylum_render_managed_path_block "$install_dir" >> "$final_rc"
+    mv -f "$final_rc" "$rc_file"
     rm -f "$tmp_rc" "$clean_rc"
     return 0
   fi
 
   local tmp_rc
+  local final_rc
   tmp_rc="$(mktemp)"
+  final_rc="$(mktemp "${rc_file}.tmp.XXXXXX")"
   awk '
     { lines[NR]=$0 }
     END {
@@ -688,11 +716,12 @@ asylum_apply_path_to_shell_rc() {
     }
   ' "$rc_file" > "$tmp_rc"
 
-  cat "$tmp_rc" > "$rc_file"
-  if [[ -s "$rc_file" ]]; then
-    printf '\n' >> "$rc_file"
+  cat "$tmp_rc" > "$final_rc"
+  if [[ -s "$final_rc" ]]; then
+    printf '\n' >> "$final_rc"
   fi
-  asylum_render_managed_path_block "$install_dir" >> "$rc_file"
+  asylum_render_managed_path_block "$install_dir" >> "$final_rc"
+  mv -f "$final_rc" "$rc_file"
   rm -f "$tmp_rc"
 }
 

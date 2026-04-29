@@ -200,12 +200,8 @@ pub struct ErrorPayload {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TokenIssueRequest {
-    pub name: String,
-    pub scope: Vec<String>,
-    pub ttl_seconds: Option<u64>,
-}
+// TokenIssueRequest was a duplicate of security::TokenRequest and has been removed (M21).
+// Use security::TokenRequest everywhere.
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenIssueResponse {

@@ -12,6 +12,10 @@ pub struct IssuedToken {
     pub expires_at_epoch_secs: i64,
 }
 
+/// Advisory token scope enum (M21). In v1 (single-user), the daemon grants
+/// full access regardless of scope — this type is published for client-side
+/// documentation and future enforcement. Wiring scope into auth validation
+/// is tracked as a follow-up for multi-user/team support.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenScope {

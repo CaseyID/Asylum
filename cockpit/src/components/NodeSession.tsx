@@ -89,7 +89,7 @@ export function NodeSession({
     const v = input.trim();
     if (!v || streaming) return;
     setInput("");
-    setEntries(p => [...p, { kind: "user", text: v }]);
+    // No optimistic push — rely on the server input_sent event to avoid duplicates.
     try {
       await postNodeInput(node.id, v);
     } catch (err) {

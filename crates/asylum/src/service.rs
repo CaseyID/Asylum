@@ -2,6 +2,9 @@ use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
+
 use anyhow::{anyhow, Context, Result};
 
 use crate::runtime::RuntimePaths;
@@ -184,16 +187,26 @@ impl ServiceManager {
             .open(&self.paths.log)
             .with_context(|| format!("open log {}", self.paths.log.display()))?;
         let err_log = log.try_clone()?;
-        let child = ProcessCommand::new(&self.binary)
-            .arg("serve")
+        let mut cmd = ProcessCommand::new(&self.binary);
+        cmd.arg("serve")
             .arg("--config")
             .arg(&self.paths.config)
             .arg("--database")
             .arg(&self.paths.database)
             .arg("--bind")
             .arg(bind)
+            .stdin(Stdio::null())
             .stdout(Stdio::from(log))
-            .stderr(Stdio::from(err_log))
+            .stderr(Stdio::from(err_log));
+        // Detach from the controlling terminal so the daemon survives shell exit.
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let child = cmd
             .spawn()
             .with_context(|| format!("start {}", self.binary.display()))?;
         fs::write(&self.paths.pid, child.id().to_string())?;

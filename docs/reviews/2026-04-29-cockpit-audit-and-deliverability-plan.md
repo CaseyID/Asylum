@@ -1172,9 +1172,33 @@ Each gets its own commit. Group by file when convenient (e.g., M13–M16 in two 
 
 ### PR 6 verification
 
-- [ ] All 19 Mediums from the prior report addressed (M18 was PR 3).
-- [ ] `cargo test --workspace` passes
-- [ ] `npm --prefix cockpit run test` passes
+- [x] All 19 Mediums from the prior report addressed (M18 was PR 3).
+- [x] `cargo test --workspace` passes (75 tests: 40+4+30+1)
+- [x] `npm --prefix cockpit run test` passes (16 tests)
+
+**Status: PR 6 — daemon-cockpit-medium-cleanup — landed on branch (HEAD: 5842f8a)**
+
+Medium-by-medium status:
+- [x] M1: redact attach token raw value — store only 6-char fingerprint in events table
+- [x] M2: handle_node_observe_ws uses socket.split() + select! (mirrors handle_attach_ws)
+- [x] M3: fork_node propagates relationship-creation error with `?`
+- [x] M4: append_transcript_chunk wrapped in BEGIN IMMEDIATE / COMMIT transaction
+- [x] M5: transcript persistence sink logs warn instead of silently dropping errors
+- [x] M6: UNIQUE index on events(node_id,sequence); record_event wraps SELECT+INSERT in BEGIN IMMEDIATE
+- [x] M7: MCP server returns None for JSON-RPC notifications (id=None); no response sent
+- [x] M8: pid-fallback daemon: stdin=null, pre_exec setsid() via libc
+- [x] M9: Owner token in module-level memory (not localStorage). WS auth still uses query param (pragmatic partial — documented)
+- [x] M10: Drop optimistic user-input push in NodeSession; rely on server input_sent event
+- [x] M11: All useEffect calls in NodeSession already have proper deps arrays (resolved by PR 1)
+- [x] M12: Added missing icons: layout-grid, list, activity, zap, sun, moon, circle
+- [x] M13: publish-release.sh recomputes sha256 for each archive vs checksums.txt before upload
+- [x] M14: install.sh hard-fails when archive absent from checksums.txt (no fallback)
+- [x] M15: hardlink rejection: explicit 'h' type check + post-extraction nlink>1 check
+- [x] M16: rc PATH block single-quote-escaped; atomic temp+mv write for rc file
+- [x] M17: Docker build runs with --user $(id -u):$(id -g); HOME=/tmp/cargo-home
+- [x] M19: MCP exposes 21 tools (node lifecycle, graph, relationships, hooks, channels, health)
+- [x] M20: NodeEvent gets schema_version: u32 (default=1, serde default for existing rows)
+- [x] M21: TokenIssueRequest deleted; TokenScope kept with advisory-only doc comment
 
 ---
 

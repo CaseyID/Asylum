@@ -31,7 +31,6 @@ import type {
 } from "./types";
 
 const BASE = "/api";
-const AUTH_TOKEN_KEY = "asylum.ownerToken";
 
 type Jsonish = Record<string, unknown>;
 
@@ -49,19 +48,17 @@ export class ApiError extends Error {
   }
 }
 
+// M9: keep owner token in module-level memory rather than localStorage.
+// Lost on page reload — cockpit re-prompts (acceptable for single-user tool).
+// This prevents XSS on same origin from leaking the token via localStorage.
+let _ownerToken = "";
+
 export function getStoredOwnerToken(): string {
-  if (typeof window === "undefined") return "";
-  return window.localStorage.getItem(AUTH_TOKEN_KEY) ?? "";
+  return _ownerToken;
 }
 
 export function setStoredOwnerToken(token: string): void {
-  if (typeof window === "undefined") return;
-  const trimmed = token.trim();
-  if (trimmed) {
-    window.localStorage.setItem(AUTH_TOKEN_KEY, trimmed);
-  } else {
-    window.localStorage.removeItem(AUTH_TOKEN_KEY);
-  }
+  _ownerToken = token.trim();
 }
 
 export function hydrateOwnerTokenFromLocation(): string {
