@@ -218,6 +218,7 @@ impl Store {
             );
 
             CREATE INDEX IF NOT EXISTS idx_events_node_seq ON events(node_id, sequence);
+            CREATE UNIQUE INDEX IF NOT EXISTS events_node_seq_unique ON events(node_id, sequence);
             CREATE INDEX IF NOT EXISTS idx_artifacts_node ON artifacts(node_id);
             CREATE INDEX IF NOT EXISTS idx_relationships_source ON relationships(source_node_id);
             CREATE INDEX IF NOT EXISTS idx_relationships_target ON relationships(target_node_id);
@@ -415,23 +416,39 @@ impl Store {
 
     pub fn record_event(&self, node_id: Uuid, kind: NodeEventKind, body: JsonValue) -> Result<i64> {
         let conn = self.conn()?;
-        Self::record_event_with_conn(&conn, node_id, kind, body)
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = Self::record_event_with_conn(&conn, node_id, kind, body);
+        if result.is_ok() {
+            conn.execute_batch("COMMIT")?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        result
     }
 
     pub fn append_transcript_chunk(&self, node_id: Uuid, text: &str) -> Result<i64> {
         let conn = self.conn()?;
-        let event_id = Self::record_event_with_conn(
-            &conn,
-            node_id,
-            NodeEventKind::OutputChunk,
-            serde_json::json!({ "text": text }),
-        )?;
-        let now = OffsetDateTime::now_utc();
-        conn.execute(
-            "INSERT INTO transcript_chunks(node_id,event_id,chunk,created_at) VALUES(?1,?2,?3,?4)",
-            params![node_id.to_string(), event_id, text, now.unix_timestamp()],
-        )?;
-        Ok(event_id)
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<i64> {
+            let event_id = Self::record_event_with_conn(
+                &conn,
+                node_id,
+                NodeEventKind::OutputChunk,
+                serde_json::json!({ "text": text }),
+            )?;
+            let now = OffsetDateTime::now_utc();
+            conn.execute(
+                "INSERT INTO transcript_chunks(node_id,event_id,chunk,created_at) VALUES(?1,?2,?3,?4)",
+                params![node_id.to_string(), event_id, text, now.unix_timestamp()],
+            )?;
+            Ok(event_id)
+        })();
+        if result.is_ok() {
+            conn.execute_batch("COMMIT")?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        result
     }
 
     pub fn list_events(&self, node_id: Uuid) -> Result<Vec<NodeEvent>> {

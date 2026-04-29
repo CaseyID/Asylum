@@ -82,7 +82,9 @@ impl CapabilityService {
         );
         let sink_store = store.clone();
         let local_substrate = LocalSubstrate::new(move |node_id, chunk| {
-            let _ = sink_store.append_transcript_chunk(node_id, chunk);
+            if let Err(e) = sink_store.append_transcript_chunk(node_id, chunk) {
+                tracing::warn!(error = %e, "failed to persist transcript chunk");
+            }
         });
         let loon_substrate = if config.loon.enabled {
             Some(Arc::new(LoonSubstrate::new(
@@ -1931,12 +1933,12 @@ impl CapabilityService {
             })
             .await?;
         let new_id = Uuid::parse_str(&response.node_id)?;
-        let _ = self.store.create_relationship(
+        self.store.create_relationship(
             source_id,
             new_id,
             RelationshipKind::SpawnedFor,
             Some("fork".to_string()),
-        );
+        )?;
         let new_node = self
             .store
             .get_node(new_id)?
