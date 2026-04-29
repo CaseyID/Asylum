@@ -15,7 +15,13 @@ pub struct IssuedOwnerToken {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthMode {
     Disabled,
-    OwnerToken { expected_hashes: Vec<String> },
+    /// `config_token_hash` is the hash of the static owner token from config/env
+    /// (no DB row).  It short-circuits the DB lookup because it has no row to
+    /// check.  Every DB-issued token must still pass through `find_token_by_hash`
+    /// so that revocation and expiry are enforced on every request.
+    OwnerToken {
+        config_token_hash: Option<String>,
+    },
 }
 
 impl AuthMode {
@@ -74,13 +80,13 @@ pub fn validate_header(header: &str, mode: &AuthMode) -> Option<TokenVerificatio
             owner: "disabled".to_string(),
             scopes: vec!["*".to_string()],
         }),
-        AuthMode::OwnerToken { expected_hashes } => {
+        AuthMode::OwnerToken { config_token_hash } => {
             let token = header
                 .strip_prefix("Bearer ")
                 .or_else(|| header.strip_prefix("bearer "));
             token.and_then(|raw| {
                 let hash = hash_token(raw);
-                if expected_hashes.iter().any(|allowed| allowed == &hash) {
+                if config_token_hash.as_deref() == Some(hash.as_str()) {
                     Some(TokenVerification {
                         token_id: Uuid::nil(),
                         owner: "owner".to_string(),

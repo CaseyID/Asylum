@@ -67,25 +67,26 @@ const MISSING_COCKPIT_ASSETS_MESSAGE: &str =
 
 pub async fn serve(bind: SocketAddr, database: String, config: AsylumConfig) -> Result<()> {
     let store = Store::open(database)?;
-    let mut expected_hashes = store
-        .list_active_tokens()?
-        .into_iter()
-        .map(|(_, _, hash, _, _)| hash)
-        .collect::<Vec<_>>();
-    if let Some(owner_token) = config.auth.owner_token.as_deref() {
-        if !owner_token.is_empty() {
-            expected_hashes.push(hash_token(owner_token));
+    // The static config token (from env/flag) has no DB row so we store its hash
+    // separately for a direct short-circuit.  All DB-issued tokens are validated
+    // on every request via find_token_by_hash, which enforces
+    // revoked=0 AND expires_at >= now, so revocation takes effect immediately
+    // without a daemon restart.
+    let config_token_hash = config.auth.owner_token.as_deref().and_then(|t| {
+        if t.is_empty() {
+            None
+        } else {
+            Some(hash_token(t))
         }
-    }
+    });
+    let has_db_tokens = !store.list_active_tokens()?.is_empty();
     let auth_mode = if config.auth.owner_tokens_enabled || config.auth.owner_token.is_some() {
-        expected_hashes.sort();
-        expected_hashes.dedup();
-        if expected_hashes.is_empty() {
+        if config_token_hash.is_none() && !has_db_tokens {
             bail!(
                 "owner-token auth is enabled but no active token or ASYLUM_OWNER_TOKEN/--owner-token was provided"
             );
         }
-        AuthMode::OwnerToken { expected_hashes }
+        AuthMode::OwnerToken { config_token_hash }
     } else {
         AuthMode::Disabled
     };
