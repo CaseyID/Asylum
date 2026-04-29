@@ -14,7 +14,7 @@ GITHUB_RELEASE_URL="https://github.com/${REPO_SLUG}/releases"
 # unsigned" line and proceeds with checksum-only verification. Once a key is
 # published, paste it into ASYLUM_RELEASE_PUBKEY_DEFAULT below and every
 # existing installer download immediately upgrades to verified-mode.
-ASYLUM_RELEASE_PUBKEY_DEFAULT=""
+ASYLUM_RELEASE_PUBKEY_DEFAULT="RWSEo4O44NHaVBVl1XI5eUk7JhvJBxyevCVtAwld6t5J0M5cIi4pS+xu"
 COLOR_LABEL=""
 COLOR_OK=""
 COLOR_WARN=""
