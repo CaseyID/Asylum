@@ -12,6 +12,7 @@ ARTIFACT_DIR=""
 DRY_RUN=0
 ALLOW_CLOBBER=0
 ALLOW_DIRTY=0
+TARGETS="darwin-arm64,darwin-x86_64,linux-arm64,linux-x86_64"
 
 print_help() {
   cat <<'USAGE'
@@ -26,6 +27,11 @@ Options:
   --allow-clobber             Allow overwriting existing release assets via gh upload --clobber.
                               Without this flag, publishing aborts if the release already has assets.
   --allow-dirty               Allow publishing from a dirty working tree (not recommended).
+  --targets <list>            Comma-separated platforms to require + upload.
+                              Default: darwin-arm64,darwin-x86_64,linux-arm64,linux-x86_64
+                              Use this to publish a partial-platform release (e.g. when
+                              only some build hosts are available). Subsequent --allow-clobber
+                              runs from another host can fill in the missing platforms.
   --help                      Show this help.
 
 Safety checks (always enforced unless overridden):
@@ -61,6 +67,10 @@ while [[ $# -gt 0 ]]; do
     --allow-dirty)
       ALLOW_DIRTY=1
       shift
+      ;;
+    --targets)
+      TARGETS="${2:?missing value for --targets}"
+      shift 2
       ;;
     --help)
       print_help
@@ -233,13 +243,20 @@ main() {
     ARTIFACT_DIR="${REPO_ROOT}/dist/release/${tag}"
   fi
 
-  local required=(
-    "asylum-darwin-arm64.tar.gz"
-    "asylum-darwin-x86_64.tar.gz"
-    "asylum-linux-arm64.tar.gz"
-    "asylum-linux-x86_64.tar.gz"
-    "checksums.txt"
-  )
+  local required=("checksums.txt")
+  IFS=',' read -ra _targets <<< "$TARGETS"
+  for t in "${_targets[@]}"; do
+    case "$t" in
+      darwin-arm64|darwin-x86_64|linux-arm64|linux-x86_64)
+        required+=("asylum-${t}.tar.gz")
+        ;;
+      "") ;;
+      *)
+        echo "Unknown target: $t (expected darwin-arm64|darwin-x86_64|linux-arm64|linux-x86_64)" >&2
+        exit 2
+        ;;
+    esac
+  done
   for file in "${required[@]}"; do
     if [[ ! -s "${ARTIFACT_DIR}/${file}" ]]; then
       echo "Missing release artifact: ${ARTIFACT_DIR}/${file}" >&2
