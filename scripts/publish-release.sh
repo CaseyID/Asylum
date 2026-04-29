@@ -304,10 +304,12 @@ main() {
       gh release upload "$tag" "${ARTIFACT_DIR}"/*
     fi
   else
-    # Use the tag name (not HEAD sha) as --target so GitHub binds the release
-    # to the tag's commit, not whatever HEAD happens to be.
+    # Resolve the tag to its commit sha; GitHub's release.target_commitish
+    # accepts a branch name or commit sha, not a tag name.
+    local tag_sha
+    tag_sha="$(git -C "$REPO_ROOT" rev-list -n 1 "$tag")"
     gh release create "$tag" "${ARTIFACT_DIR}"/* \
-      --target "$tag" \
+      --target "$tag_sha" \
       --title "$tag" \
       --notes "Asylum ${tag} binary release."
   fi
