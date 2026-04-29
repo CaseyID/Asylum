@@ -479,6 +479,7 @@ impl Store {
                 kind: event_kind,
                 body,
                 created_at: epoch_to_offset_dt(created_at),
+                schema_version: NodeEvent::default_schema_version(),
             });
         }
         Ok(events)
