@@ -15,6 +15,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
+    path: String,
 }
 
 type ActiveTokenRecord = (Uuid, String, String, i64, bool);
@@ -30,10 +31,12 @@ type NotificationRecord = (
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path_str = path.as_ref().display().to_string();
         let conn = Connection::open(path.as_ref())
             .with_context(|| format!("failed to open store at {:?}", path.as_ref()))?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            path: path_str,
         };
         store.migrate()?;
         Ok(store)
@@ -43,9 +46,14 @@ impl Store {
         let conn = Connection::open_in_memory()?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            path: ":memory:".to_string(),
         };
         store.migrate()?;
         Ok(store)
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
     }
 
     fn conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
@@ -552,6 +560,44 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// Returns ALL tokens (active, expired, revoked) for management UI display.
+    /// Never returns the raw token value or hash — only metadata.
+    pub fn list_all_tokens(&self) -> Result<Vec<asylum_core::api::TokenSummary>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, created_at, expires_at, revoked FROM tokens ORDER BY created_at DESC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(asylum_core::api::TokenSummary {
+                id: row.get::<_, String>(0)?,
+                label: row.get::<_, String>(1)?,
+                created_at_epoch_secs: row.get::<_, i64>(2)?,
+                expires_at_epoch_secs: row.get::<_, i64>(3)?,
+                revoked: row.get::<_, i64>(4)? == 1,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn get_token_metadata(&self, id: Uuid) -> Result<Option<(String, i64, i64)>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, created_at, expires_at FROM tokens WHERE id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .optional()?;
+        Ok(row)
     }
 
     pub fn find_token_by_hash(&self, hash: &str) -> Result<Option<(Uuid, String, String, i64)>> {

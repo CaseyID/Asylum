@@ -51,6 +51,8 @@ use asylum_core::node::NodeRecord;
 #[derive(Clone)]
 pub struct AppConfig {
     pub base_url: String,
+    pub bind_addr: String,
+    pub transcripts_dir: String,
     pub workspace_recent_limit: usize,
     pub ntfy_server: Option<String>,
     pub ntfy_topic: Option<String>,
@@ -735,10 +737,59 @@ impl CapabilityService {
     }
 
     pub async fn health(&self) -> HealthResponse {
+        let database_size_bytes = std::fs::metadata(self.store.path())
+            .map(|m| m.len())
+            .unwrap_or(0);
         HealthResponse {
             status: "ok".to_string(),
-            version: "0.1.0".to_string(),
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            bind_addr: self.config.bind_addr.clone(),
+            database_path: self.store.path().to_string(),
+            database_size_bytes,
+            transcripts_dir: self.config.transcripts_dir.clone(),
         }
+    }
+
+    pub async fn list_tokens(&self) -> Result<asylum_core::api::TokenListResponse> {
+        let tokens = self.store.list_all_tokens()?;
+        Ok(asylum_core::api::TokenListResponse { tokens })
+    }
+
+    pub async fn rotate_token(
+        &self,
+        token_id: Uuid,
+    ) -> Result<asylum_core::api::TokenRotateResponse> {
+        use crate::auth::issue_owner_token;
+        let meta = self
+            .store
+            .get_token_metadata(token_id)?
+            .ok_or_else(|| anyhow!("token not found"))?;
+        let (name, created_at, expires_at) = meta;
+        // preserve the original ttl (seconds from creation to expiry)
+        let ttl_seconds = if expires_at > created_at {
+            Some((expires_at - created_at) as u64)
+        } else {
+            None
+        };
+        self.store.revoke_token(token_id)?;
+        let issued = issue_owner_token(&name, &["owner".to_string()], ttl_seconds)?;
+        self.store.insert_token(
+            issued.token_id,
+            &name,
+            &issued.stored_hash,
+            &serde_json::to_string(&issued.scope)?,
+            issued.expires_at_epoch_secs,
+        )?;
+        let new_token = asylum_core::api::TokenIssueResponse {
+            id: issued.token_id.to_string(),
+            raw_token: issued.raw_token,
+            scope: issued.scope,
+            expires_at_epoch_secs: issued.expires_at_epoch_secs,
+        };
+        Ok(asylum_core::api::TokenRotateResponse {
+            old_id: token_id.to_string(),
+            new_token,
+        })
     }
 
     pub async fn client_config(&self) -> ClientConfigResponse {
@@ -1935,6 +1986,8 @@ mod tests {
         let core = AsylumConfig::default();
         AppConfig {
             base_url: core.base_url,
+            bind_addr: "127.0.0.1:7717".to_string(),
+            transcripts_dir: "/tmp/asylum-test/transcripts".to_string(),
             workspace_recent_limit: core.workspace.recent_limit,
             ntfy_server: core.ntfy.server,
             ntfy_topic: core.ntfy.topic,
@@ -2123,5 +2176,96 @@ mod tests {
             matches!(second, Ok(_)),
             "consumer should recover after Lagged and read the next retained message, got {second:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn health_response_includes_daemon_version_and_paths(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let config = test_app_config();
+        let service = CapabilityService::new(store, AuthMode::Disabled, config);
+        let response = service.health().await;
+        assert_eq!(response.daemon_version, env!("CARGO_PKG_VERSION"));
+        assert!(!response.database_path.is_empty());
+        assert_eq!(response.bind_addr, "127.0.0.1:7717");
+        assert!(!response.transcripts_dir.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_tokens_returns_metadata_only() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(
+            store,
+            AuthMode::OwnerToken {
+                config_token_hash: Some(hash_token("bootstrap")),
+            },
+            test_app_config(),
+        );
+
+        use asylum_core::security::TokenRequest;
+        service
+            .issue_token(TokenRequest {
+                name: "token-a".to_string(),
+                scope: vec!["owner".to_string()],
+                ttl_seconds: Some(3600),
+            })
+            .await?;
+        service
+            .issue_token(TokenRequest {
+                name: "token-b".to_string(),
+                scope: vec!["owner".to_string()],
+                ttl_seconds: Some(3600),
+            })
+            .await?;
+
+        let list = service.list_tokens().await?;
+        assert_eq!(list.tokens.len(), 2);
+
+        // must never include raw_token or hash
+        let token_value = serde_json::to_value(&list.tokens[0]).unwrap();
+        let obj = token_value.as_object().unwrap();
+        assert!(!obj.contains_key("raw_token"), "raw_token must not be in token list");
+        assert!(!obj.contains_key("hash"), "hash must not be in token list");
+        assert!(!obj.contains_key("raw"), "raw must not be in token list");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rotate_token_revokes_old_and_issues_new() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(
+            store.clone(),
+            AuthMode::OwnerToken {
+                config_token_hash: Some(hash_token("bootstrap")),
+            },
+            test_app_config(),
+        );
+
+        use asylum_core::security::TokenRequest;
+        let issued = service
+            .issue_token(TokenRequest {
+                name: "operator".to_string(),
+                scope: vec!["owner".to_string()],
+                ttl_seconds: Some(3600),
+            })
+            .await?;
+
+        let old_id = Uuid::parse_str(&issued.id)?;
+        assert!(service.validate_owner_token_value(&issued.raw_token));
+
+        let rotated = service.rotate_token(old_id).await?;
+        assert_eq!(rotated.old_id, issued.id);
+        // old token must now be revoked
+        assert!(!service.validate_owner_token_value(&issued.raw_token));
+        // new token must be valid
+        assert!(service.validate_owner_token_value(&rotated.new_token.raw_token));
+        Ok(())
     }
 }

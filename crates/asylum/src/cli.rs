@@ -666,7 +666,7 @@ async fn run_start(paths: &RuntimePaths, client: &AsylumClient) -> Result<StartO
                 "Asylum started at {} ({}, version {})",
                 client.base_url(),
                 health.status,
-                health.version
+                health.daemon_version
             );
             Ok(StartOutcome::StartedHealthy)
         }
@@ -707,7 +707,7 @@ async fn run_status(paths: &RuntimePaths, client: &AsylumClient) -> Result<()> {
     println!("Asylum: {service_state}");
     println!("Cockpit: {}", client.base_url());
     match health {
-        Some(health) => println!("Health: {} (version {})", health.status, health.version),
+        Some(health) => println!("Health: {} (version {})", health.status, health.daemon_version),
         None => println!("Health: unavailable"),
     }
     println!("Config: {}", paths.config.display());
@@ -814,7 +814,7 @@ async fn doctor_checks(
         Ok(health) => DoctorCheck::new(
             CheckStatus::Ok,
             "health",
-            format!("{} version {}", health.status, health.version),
+            format!("{} version {}", health.status, health.daemon_version),
         ),
         Err(_) => DoctorCheck::new(
             CheckStatus::Warn,

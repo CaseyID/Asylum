@@ -8,7 +8,11 @@ use crate::relationship::RelationshipRecord;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
-    pub version: String,
+    pub daemon_version: String,
+    pub bind_addr: String,
+    pub database_path: String,
+    pub database_size_bytes: u64,
+    pub transcripts_dir: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -209,6 +213,29 @@ pub struct TokenIssueResponse {
     pub raw_token: String,
     pub scope: Vec<String>,
     pub expires_at_epoch_secs: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TokenSummary {
+    pub id: String,
+    pub label: String,
+    pub created_at_epoch_secs: i64,
+    pub expires_at_epoch_secs: i64,
+    pub revoked: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TokenListResponse {
+    pub tokens: Vec<TokenSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TokenRotateRequest {}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TokenRotateResponse {
+    pub old_id: String,
+    pub new_token: TokenIssueResponse,
 }
 
 pub fn map_graph(nodes: Vec<NodeRecord>, relationships: Vec<RelationshipRecord>) -> GraphRecord {
