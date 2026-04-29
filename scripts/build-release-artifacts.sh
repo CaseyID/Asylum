@@ -28,9 +28,24 @@ Options:
   --docker-image <image>        Rust Docker image for Linux builds. Default: rust:1-bookworm.
   --help                        Show this help.
 
-Linux artifacts are built locally with Docker, not GitHub Actions. The
-linux-x86_64 artifact is cross-compiled from a native arm64 Linux container on
-Apple Silicon Macs so the compiler does not run under amd64 emulation.
+Releases are built locally (no GitHub Actions). Both Apple Silicon Macs and
+x86_64 Linux hosts can produce all four archives, but the matrix differs:
+
+  macOS Apple Silicon (full parity, recommended):
+    - darwin-arm64: native cargo
+    - darwin-x86_64: rustup cross
+    - linux-arm64: native Docker (--platform linux/arm64)
+    - linux-x86_64: cross-compiled inside an arm64 Linux container
+
+  Linux x86_64:
+    - linux-x86_64: native (no Docker)
+    - linux-arm64: Docker --platform linux/arm64 — requires qemu-user-static +
+      binfmt-support (one-time sudo install). Script halts with install
+      instructions if missing.
+    - darwin-arm64, darwin-x86_64: NOT YET supported from Linux. macOS
+      cross-compile needs osxcross + the Apple SDK; not yet integrated.
+      Build those archives on a Mac and merge into the release with
+      publish-release.sh --allow-clobber.
 USAGE
 }
 
@@ -132,6 +147,7 @@ build_macos() {
   local release_name=$1
   local rust_target=$2
   local output_dir=$3
+  require_macos_host "$release_name"
   rustup target add "$rust_target"
   cargo build --release -p asylum --target "$rust_target"
   package_binary "${REPO_ROOT}/target/${rust_target}/release/asylum" "asylum-${release_name}.tar.gz" "$output_dir"
@@ -139,7 +155,63 @@ build_macos() {
 
 require_docker() {
   if ! command -v docker >/dev/null 2>&1; then
-    echo "Docker is required for local Linux release builds on macOS." >&2
+    echo "Docker is required for local Linux release builds." >&2
+    exit 1
+  fi
+}
+
+require_macos_host() {
+  local target=$1
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    cat >&2 <<EOF
+Cannot build $target on $(uname -s).
+
+macOS release archives must be built on a macOS host. From an Apple Silicon
+Mac, this script will native-compile darwin-arm64 and rustup-cross to
+darwin-x86_64. Cross-compiling to macOS from Linux requires an osxcross-style
+toolchain plus the macOS SDK; that path is not yet integrated.
+
+Workaround: build the macOS archives on a Mac, then publish them into the
+existing release with --allow-clobber:
+  scripts/build-release-artifacts.sh --version <ver> --targets darwin-arm64,darwin-x86_64
+  scripts/publish-release.sh --version <ver> --targets darwin-arm64,darwin-x86_64 --allow-clobber
+EOF
+    exit 1
+  fi
+}
+
+require_emulation_for_platform() {
+  local platform=$1
+  local host_arch
+  host_arch="$(uname -m)"
+  # Map docker --platform to the kernel arch we need to be able to exec.
+  local needed_arch=""
+  case "$platform" in
+    linux/arm64) needed_arch="aarch64" ;;
+    linux/amd64) needed_arch="x86_64" ;;
+    *) return 0 ;;
+  esac
+  case "$host_arch:$needed_arch" in
+    x86_64:x86_64|aarch64:aarch64|arm64:aarch64)
+      return 0 ;;
+  esac
+  # Cross-platform docker run needs binfmt_misc registration for the foreign arch.
+  local marker="/proc/sys/fs/binfmt_misc/qemu-${needed_arch}"
+  if [[ ! -e "$marker" ]]; then
+    cat >&2 <<EOF
+Docker cannot execute $platform binaries on this $host_arch host without
+QEMU user-mode emulation registered with binfmt_misc.
+
+To enable (one-time per host):
+  Debian/Ubuntu: sudo apt install -y qemu-user-static binfmt-support
+  Fedora/RHEL:   sudo dnf install -y qemu-user-static
+  Arch:          sudo pacman -S --needed qemu-user-static-binfmt
+  Or via Docker: docker run --privileged --rm tonistiigi/binfmt --install $needed_arch
+
+After installation, this script will be able to build $platform archives
+locally. Until then, build them on a host with native $needed_arch support
+and merge with --allow-clobber on publish.
+EOF
     exit 1
   fi
 }
@@ -151,6 +223,7 @@ build_linux_native() {
   local scratch_binary="${output_dir}/.asylum-${release_name}"
 
   require_docker
+  require_emulation_for_platform "$platform"
 
   # M17: run as the host user so bind-mounted repo files are not modified as root.
   docker run --rm \
@@ -245,12 +318,17 @@ main() {
   fi
   if contains_target "linux-x86_64"; then
     # On x86_64 Linux hosts, build natively (no Docker/QEMU needed).
-    # On Apple Silicon hosts, fall back to the cross-compile path.
-    if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]]; then
-      build_linux_native "linux-x86_64" "linux/amd64" "$OUTPUT_DIR"
-    else
-      build_linux_x86_64 "linux-x86_64" "$OUTPUT_DIR"
-    fi
+    # On Apple Silicon (arm64) hosts, use the apt-cross-compile path that
+    # runs in an arm64 container (avoids amd64 emulation).
+    # On other hosts (e.g. arm64 Linux), fall through to the same path.
+    case "$(uname -s):$(uname -m)" in
+      Linux:x86_64)
+        build_linux_native "linux-x86_64" "linux/amd64" "$OUTPUT_DIR"
+        ;;
+      *)
+        build_linux_x86_64 "linux-x86_64" "$OUTPUT_DIR"
+        ;;
+    esac
   fi
 
   (

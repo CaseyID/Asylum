@@ -70,16 +70,22 @@ npm --prefix cockpit run test
 
 ## Release tracking — read this when finishing a delivery
 
-Asylum is **released manually**. There is no GitHub Actions release pipeline by design. "Merged to main" ≠ "shipped to users."
+Asylum is **released manually**. There is no GitHub Actions release pipeline by design. "Merged to main" ≠ "shipped to users." The point of this section is so a fresh agent session opening this repo can answer the question *"is what's on main actually on a user's machine?"* without guessing.
 
-After completing any delivery cycle (a multi-PR plan from `docs/reviews/` or `docs/handoff/`):
+**Tracking is your job. Cutting is the user's call.**
 
-1. Open [RELEASES.md](RELEASES.md). It has the workflow steps and the ledger.
-2. Decide whether the delivery warrants a release. Doc-only or trivial-internal changes don't; user-facing or shipping-relevant changes do.
-3. If yes: bump version, build, tag, publish, **and update the ledger row** as the final step. The ledger is what makes it real.
-4. If no: still answer "release status" in the delivery handoff with one line ("not released — folded into next cycle, no user-facing change").
+When you finish a delivery cycle (a multi-PR plan from `docs/reviews/` or `docs/handoff/`):
 
-Every plan/handoff document **must** include a "Release status" section that ends with a link to the ledger. If you're authoring a plan and you don't see one, add one.
+1. Open [RELEASES.md](RELEASES.md) and skim the ledger so you know the current published version and what's outstanding.
+2. **Update tracking, always:** the delivery's plan/handoff must end with a "Release status" section that says one of:
+   - `Released as vX.Y.Z` (with link to GitHub release + which platforms shipped)
+   - `On main, not released — awaiting authorization. Last release: vX.Y.Z (date).`
+   - `Doc-only / internal — no release needed. Last release: vX.Y.Z (date).`
+3. **Don't cut a release on your own initiative.** If you think a release is warranted, surface that to the user with a one-line recommendation ("recommend cutting v0.1.3 — first user-facing changes since v0.1.2"). Wait for their go-ahead.
+4. **Exception:** if the user has explicitly authorized autonomous mode for the delivery (e.g., "execute the whole plan and ship it") — then cut the release as the final step and update the ledger.
+5. Whenever you do cut: bump version, build, tag, publish, **update the RELEASES.md ledger row**. The ledger update is what makes it real for the next agent.
+
+Every plan/handoff document must include a "Release status" section that links to the ledger. If you're authoring a plan and you don't see one, add one. If you're picking up an existing plan and the section is missing or stale, fix it before starting work.
 
 ## Conventions to preserve
 
