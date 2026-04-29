@@ -363,8 +363,10 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_filter_falls_back_to_any() {
+    fn unparseable_filter_fails_closed() {
+        // L2: a filter that cannot be parsed must block the event (fail-closed),
+        // not silently pass it through.
         let payload = serde_json::json!({});
-        assert!(evaluate_filter("?(?)*", &payload));
+        assert!(!evaluate_filter("?(?)*", &payload));
     }
 }
