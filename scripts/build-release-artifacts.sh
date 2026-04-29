@@ -241,7 +241,13 @@ main() {
     build_linux_native "linux-arm64" "linux/arm64" "$OUTPUT_DIR"
   fi
   if contains_target "linux-x86_64"; then
-    build_linux_x86_64 "linux-x86_64" "$OUTPUT_DIR"
+    # On x86_64 Linux hosts, build natively (no Docker/QEMU needed).
+    # On Apple Silicon hosts, fall back to the cross-compile path.
+    if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]]; then
+      build_linux_native "linux-x86_64" "linux/amd64" "$OUTPUT_DIR"
+    else
+      build_linux_x86_64 "linux-x86_64" "$OUTPUT_DIR"
+    fi
   fi
 
   (
