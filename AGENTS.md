@@ -12,13 +12,14 @@ Full PRD: [docs/prd/asylum-live-v2-prd.md](docs/prd/asylum-live-v2-prd.md).
 
 ## Current focus — read this if you're picking up active work
 
-**Cockpit deliverability and prototype-residue cleanup.** Active plan:
+**Cockpit deliverability and prototype-residue cleanup is delivered (2026-04-29).** All 7 PRs merged to `main` (range `6e5054a..7458e4c`). See:
 
-- **Handoff:** [docs/handoff/2026-04-29-cockpit-deliverability-and-prototype-cleanup.md](docs/handoff/2026-04-29-cockpit-deliverability-and-prototype-cleanup.md)
-- **Plan (canonical, with full audit):** [docs/reviews/2026-04-29-cockpit-audit-and-deliverability-plan.md](docs/reviews/2026-04-29-cockpit-audit-and-deliverability-plan.md)
-- **Prior ultrareview (companion findings):** [docs/reviews/2026-04-29-local-ultrareview-findings.md](docs/reviews/2026-04-29-local-ultrareview-findings.md)
+- **Delivery handoff:** [docs/handoff/2026-04-29-cockpit-deliverability-and-prototype-cleanup.md](docs/handoff/2026-04-29-cockpit-deliverability-and-prototype-cleanup.md) — what shipped, what's deferred, manual smoke owed.
+- **Plan + audit (canonical):** [docs/reviews/2026-04-29-cockpit-audit-and-deliverability-plan.md](docs/reviews/2026-04-29-cockpit-audit-and-deliverability-plan.md) — Status section reflects all 7 PRs landed.
+- **CHANGELOG:** [CHANGELOG.md](CHANGELOG.md) — release notes for the delivery.
+- **Prior ultrareview (companion findings, all addressed):** [docs/reviews/2026-04-29-local-ultrareview-findings.md](docs/reviews/2026-04-29-local-ultrareview-findings.md)
 
-The plan is broken into 7 PRs with bite-sized TDD tasks. PRs land in order; PRs 5 and 6 can parallelize after PR 4. The plan tracks its own progress in a "Status / what's done so far" section — update it as you land work.
+**Active follow-up under discussion:** ntfy inbound auto-routing into node input streams. Transport works; addressing/correlation does not. Design notes in the delivery handoff; no PR open yet.
 
 ## The principle that drives current work
 

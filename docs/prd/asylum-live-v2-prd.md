@@ -474,7 +474,7 @@ V1 is complete only when all of the following work end to end:
 - [x] MCP server uses root capabilities (PR 6 — node.archive, node.fork, relationship.create, notify.send, attach_url.issue all wired),
 - [x] API or typed SDK contract exists,
 - [x] ntfy outbound notifications work,
-- [x] ntfy inbound remote command/reply path works (PR 3 — daemon subscribes, cockpit subscribes, channel.inbound hook fires),
+- [~] ntfy inbound transport works (PR 3 — daemon subscribes to ntfy.sh JSON stream, cockpit polls for direction=in, channel.inbound hook fires). Auto-routing of inbound messages into a target node's input stream is the remaining piece (needs a node_id column on channel_messages and a small outbound→reply correlation table); user can act on inbound today via hooks,
 - [x] dashboard notification center exists,
 - basic remote connection setup exists,
 - [x] capability flags are visible per harness/substrate,

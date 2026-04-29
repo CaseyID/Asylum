@@ -27,15 +27,24 @@ If you are an AI coding agent picking this up in a new session (with no memory o
 
 Update this list as PRs merge. Format: PR number — branch name — merge commit (or "in progress" / "not started").
 
-- PR 1 — `cockpit-strip-prototype-scaffolding` — **landed on branch (HEAD: 37794b2)**
-- PR 2 — `cockpit-real-settings` — **landed on branch (HEAD: cc94bcf)**
-- PR 3 — `daemon-ntfy-inbound` — **landed on branch (HEAD: 9dc1aab)**
-- PR 4 — `cockpit-wire-or-remove-dead-ui` — **landed on branch (HEAD: 8b03757)**
-- PR 5 — `cockpit-cmdk-real` — **landed on branch (HEAD: 6cb1a67)**
-- PR 6 — `daemon-cockpit-medium-cleanup` — **not started**
-- PR 7 — `release-prep-v1` — **not started**
+- PR 1 — `cockpit-strip-prototype-scaffolding` — **merged to main (3f32d6f)**
+- PR 2 — `cockpit-real-settings` — **merged to main (commit chain ending cc94bcf, merged via 7458e4c)**
+- PR 3 — `daemon-ntfy-inbound` — **merged to main (commit chain ending 8aad87d)**
+- PR 4 — `cockpit-wire-or-remove-dead-ui` — **merged to main (commit chain ending 72d6236)**
+- PR 5 — `cockpit-cmdk-real` — **merged to main (commit chain ending d077dab)**
+- PR 6 — `daemon-cockpit-medium-cleanup` — **merged to main (9be0d4b; 21 Mediums fixed, M9 partial)**
+- PR 7 — `release-prep-v1` — **merged to main (7458e4c; 17 Lows fixed, CHANGELOG, README)**
 
-The 9 ultrareview Highs (H1–H9) are already merged into `main` (commits `127814e..10585e6`). Everything else from the prior ultrareview is folded into PR 6 / PR 7.
+All seven PRs landed on `origin/main` 2026-04-29. The 9 ultrareview Highs (H1–H9) had merged earlier in commits `127814e..10585e6`. Two Lows (L11 installer integrity check, L12 MCP stdio async) and half of M9 (WS subprotocol auth) are deferred with rationale in `CHANGELOG.md`.
+
+**Manual smoke verification still required by user (not automatable):**
+- Fresh-machine `curl | bash` install on Ubuntu + macOS
+- H1: token revoke → 401 without restart
+- H5+PR3: ntfy inbound → toast within ~10s + `channel.inbound` hook fires
+- H8: publish-release dry-run with mismatched HEAD/tag
+- minisign trust path (needs real signing key in `install.sh`)
+
+**Known follow-up beyond this audit:** ntfy inbound message routing into node input streams. Currently the inbound transport works (DB row + hook event + cockpit toast), but inbound messages do not auto-route to a target node's input — that requires a `node_id` correlation column on `channel_messages` plus a small correlation table for outbound→reply addressing. Captured for a future PR; tracked as 2026-04-29 user discussion thread.
 
 ---
 
