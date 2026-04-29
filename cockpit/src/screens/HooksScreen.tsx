@@ -119,7 +119,6 @@ function HookCard({
         <span className="stat r">
           <Btn size="sm" kind="ghost" icon="play" iconOnly title="dry-run" onClick={onDryRun} />
           <Btn size="sm" kind="ghost" icon="edit-2" iconOnly title="edit" onClick={onEdit} />
-          <Btn size="sm" kind="ghost" icon="more-horizontal" iconOnly />
         </span>
       </div>
     </div>
@@ -417,7 +416,6 @@ export function HooksScreen(): JSX.Element {
           </div>
         </div>
         <div className="page-actions">
-          <Btn icon="upload">import</Btn>
           <Btn kind="primary" icon="plus" onClick={() => setDrawer({ id: "__new" })}>
             new hook
           </Btn>

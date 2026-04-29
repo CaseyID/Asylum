@@ -23,7 +23,7 @@ export interface FleetScreenProps {
   onOpen: (node: AsylumNode) => void;
 }
 
-const STATE_FILTERS: ("all" | UiState)[] = ["all", "running", "waiting", "idle", "errored"];
+const STATE_FILTERS: ("all" | UiState)[] = ["all", "running", "waiting", "idle", "errored", "stopped"];
 
 export function FleetScreen({ nodes, onLaunch, onOpen }: FleetScreenProps): JSX.Element {
   const [q, setQ] = useState("");
@@ -59,12 +59,6 @@ export function FleetScreen({ nodes, onLaunch, onOpen }: FleetScreenProps): JSX.
           </div>
         </div>
         <div className="page-actions">
-          <Btn icon="filter" size="sm">
-            filter
-          </Btn>
-          <Btn icon="download" size="sm">
-            export
-          </Btn>
           <Btn kind="primary" icon="plus" onClick={onLaunch}>
             launch node
           </Btn>

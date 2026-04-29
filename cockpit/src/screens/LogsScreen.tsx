@@ -1,6 +1,5 @@
 // ports prototype LogsScreen — backed by real NotificationRecord[] instead of mock LOGS
 import { useState, type JSX } from "react";
-import { Btn } from "../lib/ui";
 import { Icon } from "../lib/icons";
 import { shortNodeId } from "../lib/glyphs";
 import type { NotificationRecord } from "../types";
@@ -64,17 +63,6 @@ export function LogsScreen({ notifications }: LogsScreenProps): JSX.Element {
               unified event stream across nodes, substrates, and the asylum service
             </div>
           </div>
-          <div className="page-actions">
-            <Btn icon="filter" size="sm">
-              filter
-            </Btn>
-            <Btn icon="download" size="sm">
-              export
-            </Btn>
-            <Btn icon="play" size="sm">
-              tail live
-            </Btn>
-          </div>
         </div>
       </div>
       <div style={{ padding: "0 36px 12px", display: "flex", gap: 8, alignItems: "center" }}>
@@ -93,7 +81,7 @@ export function LogsScreen({ notifications }: LogsScreenProps): JSX.Element {
           />
         </div>
         <div style={{ display: "flex", gap: 4 }}>
-          {["all", "info", "warn", "err", "run", "dbg"].map((l) => (
+          {["all", "info", "warn", "err"].map((l) => (
             <button
               key={l}
               className={`btn btn-sm ${lvl === l ? "btn-secondary" : "btn-ghost"}`}

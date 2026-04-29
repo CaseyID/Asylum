@@ -30,7 +30,7 @@ Update this list as PRs merge. Format: PR number — branch name — merge commi
 - PR 1 — `cockpit-strip-prototype-scaffolding` — **landed on branch (HEAD: 37794b2)**
 - PR 2 — `cockpit-real-settings` — **landed on branch (HEAD: cc94bcf)**
 - PR 3 — `daemon-ntfy-inbound` — **landed on branch (HEAD: 9dc1aab)**
-- PR 4 — `cockpit-wire-or-remove-dead-ui` — **not started**
+- PR 4 — `cockpit-wire-or-remove-dead-ui` — **landed on branch (HEAD: 8b03757)**
 - PR 5 — `cockpit-cmdk-real` — **not started**
 - PR 6 — `daemon-cockpit-medium-cleanup` — **not started**
 - PR 7 — `release-prep-v1` — **not started**
@@ -1045,49 +1045,40 @@ is unchanged except: prefs persist; ntfy poll is constant 6s.
 
 ### Task 4.1: Fleet/Logs filter+export buttons
 
-- [ ] **Step 1:** Delete the `<Btn icon="filter">filter</Btn>` and `<Btn icon="download">export</Btn>` buttons in `FleetScreen.tsx:62-67` (state filters below provide filter; CSV export is post-v1).
-- [ ] **Step 2:** Delete `<Btn icon="filter">filter</Btn>` and `<Btn icon="download">export</Btn>` and `<Btn icon="play">tail live</Btn>` in `LogsScreen.tsx:67-76`.
-- [ ] **Step 3:** Drop level filter buttons "run" and "dbg" from `LogsScreen.tsx:96`. Update test if any.
-- [ ] **Step 4:** Add `"stopped"` to `STATE_FILTERS` in `FleetScreen.tsx:26`.
-- [ ] **Step 5:** Build + test, commit.
+- [x] **Step 1:** Delete the `<Btn icon="filter">filter</Btn>` and `<Btn icon="download">export</Btn>` buttons in `FleetScreen.tsx:62-67` (state filters below provide filter; CSV export is post-v1).
+- [x] **Step 2:** Delete `<Btn icon="filter">filter</Btn>` and `<Btn icon="download">export</Btn>` and `<Btn icon="play">tail live</Btn>` in `LogsScreen.tsx:67-76`.
+- [x] **Step 3:** Drop level filter buttons "run" and "dbg" from `LogsScreen.tsx:96`. Update test if any.
+- [x] **Step 4:** Add `"stopped"` to `STATE_FILTERS` in `FleetScreen.tsx:26`.
+- [x] **Step 5:** Build + test, commit.
 
 ### Task 4.2: Hooks/Channels small dead UI
 
-- [ ] **Step 1:** Delete `<Btn icon="upload">import</Btn>` in `HooksScreen.tsx:420`.
-- [ ] **Step 2:** Delete the trailing `<Btn icon="more-horizontal" iconOnly />` in `HooksScreen.tsx:122` (HookCard footer).
-- [ ] **Step 3:** Delete `<Btn icon="git-pull-request">view spec</Btn>` and `<Btn icon="thumbs-up">upvote</Btn>` in `ChannelsScreen.tsx:206-211`.
-- [ ] **Step 4:** Delete the `<Btn icon="more-horizontal" iconOnly />` in `NodeScreen.tsx:121`.
-- [ ] **Step 5:** Build + test, commit.
+- [x] **Step 1:** Delete `<Btn icon="upload">import</Btn>` in `HooksScreen.tsx:420`.
+- [x] **Step 2:** Delete the trailing `<Btn icon="more-horizontal" iconOnly />` in `HooksScreen.tsx:122` (HookCard footer).
+- [x] **Step 3:** Delete `<Btn icon="git-pull-request">view spec</Btn>` and `<Btn icon="thumbs-up">upvote</Btn>` in `ChannelsScreen.tsx:206-211`.
+- [x] **Step 4:** Delete the `<Btn icon="more-horizontal" iconOnly />` in `NodeScreen.tsx:121`.
+- [x] **Step 5:** Build + test, commit.
 
 ### Task 4.3: NodeScreen native attach actually does native attach
 
-- [ ] **Step 1:** Add a new `NodeScreenAction` value `"native-attach"`.
-- [ ] **Step 2:** In `NodeScreen.tsx:118-120`, change the button to `fire("native-attach", "native attach prepared")`.
-- [ ] **Step 3:** In `App.tsx:handleNodeAction`, add a case:
-  ```ts
-  } else if (action === "native-attach") {
-    const target = await requestNativeTarget(target.id);
-    const cmdLine = [target.command, ...(target.args ?? [])].join(" ");
-    setLocalNotice(`copy this to a terminal:\n${cmdLine}`);
-    if (typeof navigator !== "undefined" && navigator.clipboard) {
-      void navigator.clipboard.writeText(cmdLine);
-    }
-  ```
-- [ ] **Step 4:** Build + test, commit.
+- [x] **Step 1:** Add a new `NodeScreenAction` value `"native-attach"`.
+- [x] **Step 2:** In `NodeScreen.tsx:118-120`, change the button to `fire("native-attach", "native attach prepared")`.
+- [x] **Step 3:** In `App.tsx:handleNodeAction`, add a case for `"native-attach"` that calls `requestNativeTarget`, joins command + args, writes to clipboard, and shows a notice.
+- [x] **Step 4:** Build + test, commit.
 
 ### Task 4.4: Topbar bell button → notifications popover
 
-- [ ] **Step 1:** Either delete the bell button (line 41 in `Topbar.tsx`) OR wire it to a small popover that lists the latest 5 unread notifications and a link to `/logs`. Recommendation: delete for v1.
-- [ ] **Step 2:** If deleting, build + test, commit.
+- [x] **Step 1:** Deleted the bell button (`Topbar.tsx:41`) — no notifications backend for v1.
+- [x] **Step 2:** Build + test, commit (bundled into main commit).
 
 ### Task 4.5: Settings buttons that have no daemon backing get deleted
 
-- [ ] **Step 1:** Already largely covered by PR 2. Verify no leftover dead Settings buttons after PR 2 + PR 4.
+- [x] **Step 1:** Already covered by PR 2. No leftover dead Settings buttons after PR 2 + PR 4.
 
 ### PR 4 verification
 
-- [ ] Click every visible button in the cockpit: each either does its labeled action or doesn't exist.
-- [ ] Run `rg -l 'iconOnly' cockpit/src` — every result has an `onClick` handler nearby.
+- [x] Click every visible button in the cockpit: each either does its labeled action or doesn't exist.
+- [x] Run `rg -n 'iconOnly' cockpit/src` — every result has an `onClick` handler nearby (theme toggle, maximize-expand, copy token, back-arrow, rss subscribe, channel settings, dry-run, edit, remove-action).
 
 ---
 

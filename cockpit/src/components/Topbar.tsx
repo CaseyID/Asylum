@@ -38,7 +38,6 @@ export function Topbar({
           <span style={{ marginRight: 6, color: "var(--fg-muted)" }}>search…</span>
           <span className="kbd">⌘K</span>
         </Btn>
-        <Btn kind="ghost" size="sm" icon="bell" iconOnly title="notifications" />
         <Btn
           kind="ghost"
           size="sm"

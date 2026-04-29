@@ -28,6 +28,7 @@ interface NodeEventRecord {
 
 export type NodeScreenAction =
   | "attach"
+  | "native-attach"
   | "send"
   | "interrupt"
   | "fork"
@@ -114,10 +115,9 @@ export function NodeScreen({ node, nodes, relationships, onBack, onOpen, onActio
               <Btn size="sm" icon="external-link" onClick={() => fire("attach", "attach url issued")}>
                 attach in browser
               </Btn>
-              <Btn size="sm" icon="terminal" onClick={() => fire("attach", "native attach prepared")}>
+              <Btn size="sm" icon="terminal" onClick={() => fire("native-attach", "native attach prepared")}>
                 native attach
               </Btn>
-              <Btn size="sm" kind="ghost" icon="more-horizontal" iconOnly />
             </span>
           </div>
           <div className="meta">

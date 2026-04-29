@@ -292,13 +292,9 @@ function SessionHeader({
           <button className={view === "tui" ? "on" : ""} onClick={() => setView("tui")} title="raw tui replay">tui</button>
           <button className={view === "structured" ? "on" : ""} onClick={() => setView("structured")} title="structured / semantic">struct</button>
         </div>
-        <Btn kind="ghost" size="sm" icon="external-link" iconOnly title="attach in browser" />
-        <Btn kind="ghost" size="sm" icon="terminal" iconOnly title="native attach" />
-        <Btn kind="ghost" size="sm" icon="square" iconOnly title="interrupt (ctrl-c)" />
         {mode === "cockpit" && onExpand && (
           <Btn kind="ghost" size="sm" icon="maximize-2" iconOnly title="open in chat" onClick={onExpand} />
         )}
-        <Btn kind="ghost" size="sm" icon="more-horizontal" iconOnly />
       </span>
     </div>
   );
@@ -502,7 +498,6 @@ function SessionInput({
       <span className="r">
         {/* ⏎ send label is design typography */}
         <span className="kbd">{"⏎"} send</span>
-        <Btn kind="ghost" size="sm" icon="paperclip" iconOnly title="attach context" />
       </span>
     </div>
   );
