@@ -117,6 +117,7 @@ pub async fn serve(bind: SocketAddr, database: String, config: AsylumConfig) -> 
             ntfy_server: config.ntfy.server,
             ntfy_topic: config.ntfy.topic,
             ntfy_token: config.ntfy.token,
+            ntfy_poll_interval_seconds: Some(config.ntfy.poll_interval_seconds),
             harness: config.harness,
             loon: config.loon,
         },

@@ -3,6 +3,9 @@ use asylum_core::api::{ChannelDescriptor, ChannelMessageRecord};
 
 use crate::storage::{ChannelMessageRow, ChannelRow, Store};
 
+pub mod ntfy_inbound;
+pub use ntfy_inbound::NtfyInboundConfig;
+
 pub const NTFY_DEFAULT_ID: &str = "ntfy-default";
 pub const WEBHOOK_SUBSTRATE_ID: &str = "webhook-substrate";
 

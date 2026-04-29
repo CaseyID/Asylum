@@ -29,7 +29,7 @@ Update this list as PRs merge. Format: PR number — branch name — merge commi
 
 - PR 1 — `cockpit-strip-prototype-scaffolding` — **landed on branch (HEAD: 37794b2)**
 - PR 2 — `cockpit-real-settings` — **landed on branch (HEAD: cc94bcf)**
-- PR 3 — `daemon-ntfy-inbound` — **not started**
+- PR 3 — `daemon-ntfy-inbound` — **landed on branch (HEAD: 9dc1aab)**
 - PR 4 — `cockpit-wire-or-remove-dead-ui` — **not started**
 - PR 5 — `cockpit-cmdk-real` — **not started**
 - PR 6 — `daemon-cockpit-medium-cleanup` — **not started**
@@ -878,11 +878,11 @@ is unchanged except: prefs persist; ntfy poll is constant 6s.
 
 ### Task 3.1: Implement the JSON-stream subscriber
 
-- [ ] **Step 1:** Failing integration test. Stand up a `wiremock` server that streams two newline-delimited JSON message records (e.g.,`{"id":"abc","time":1714367400,"event":"message","topic":"asylum-test","message":"hello","title":"approve"}`). Configure the daemon's NtfyConfig to point at that mock server. Start `start_background_tasks`. Wait up to 5s for `store.list_channel_messages("ntfy-default", 10)` to contain a row with `direction="in"` and `body="hello"`.
+- [x] **Step 1:** Failing integration test. Stand up a `wiremock` server that streams two newline-delimited JSON message records (e.g.,`{"id":"abc","time":1714367400,"event":"message","topic":"asylum-test","message":"hello","title":"approve"}`). Configure the daemon's NtfyConfig to point at that mock server. Start `start_background_tasks`. Wait up to 5s for `store.list_channel_messages("ntfy-default", 10)` to contain a row with `direction="in"` and `body="hello"`.
 
-- [ ] **Step 2:** `cargo test -p asylum-daemon ntfy_inbound` — expect FAIL.
+- [x] **Step 2:** `cargo test -p asylum-daemon ntfy_inbound` — expect FAIL.
 
-- [ ] **Step 3:** Create `crates/asylum-daemon/src/channels/ntfy_inbound.rs`:
+- [x] **Step 3:** Create `crates/asylum-daemon/src/channels/ntfy_inbound.rs`:
   ```rust
   use anyhow::{anyhow, Result};
   use asylum_core::api::ChannelInboundRequest;
@@ -1001,21 +1001,21 @@ is unchanged except: prefs persist; ntfy poll is constant 6s.
   ```
   Notes: this uses `reqwest`'s streaming body. The `poll_interval_seconds` from NtfyConfig is honored as the reconnect-backoff floor, capped at 60s.
 
-- [ ] **Step 4:** Re-export from `crates/asylum-daemon/src/channels/mod.rs` and call `ntfy_inbound::spawn` from `CapabilityService::start_background_tasks` when `config.ntfy_server` and `config.ntfy_topic` are both set. The hook closure passes through to `self.post_hook_event`.
+- [x] **Step 4:** Re-export from `crates/asylum-daemon/src/channels/mod.rs` and call `ntfy_inbound::spawn` from `CapabilityService::start_background_tasks` when `config.ntfy_server` and `config.ntfy_topic` are both set. The hook closure passes through to `self.post_hook_event`.
 
-- [ ] **Step 5:** Run integration test, expect PASS. Commit:
+- [x] **Step 5:** Run integration test, expect PASS. Commit:
   ```
   daemon: subscribe to ntfy json stream and record inbound messages
   ```
 
 ### Task 3.2: Honor `poll_interval_seconds` as reconnect floor
 
-- [ ] **Step 1:** In `ntfy_inbound.rs`, change the initial backoff from `Duration::from_secs(2)` to `Duration::from_secs(cfg.poll_interval_seconds.max(2))`.
-- [ ] **Step 2:** Test that a deliberate connection failure (mock server returns 500) leads to a wait of at least `poll_interval_seconds` before retry. Commit.
+- [x] **Step 1:** In `ntfy_inbound.rs`, change the initial backoff from `Duration::from_secs(2)` to `Duration::from_secs(cfg.poll_interval_seconds.max(2))`.
+- [x] **Step 2:** Test that a deliberate connection failure (mock server returns 500) leads to a wait of at least `poll_interval_seconds` before retry. Commit.
 
 ### Task 3.3: Cockpit toast surfaces real inbound messages
 
-- [ ] **Step 1:** No cockpit code changes needed — the existing toast spawner from PR 1 already polls `fetchChannelMessages` and filters `direction === "in"`. After PR 3's daemon subscriber lands, real ntfy messages flow through.
+- [x] **Step 1:** No cockpit code changes needed — the existing toast spawner from PR 1 already polls `fetchChannelMessages` and filters `direction === "in"`. After PR 3's daemon subscriber lands, real ntfy messages flow through.
 - [ ] **Step 2:** End-to-end manual smoke (record in PR description):
   ```
   curl -d "approve" ntfy.sh/<your-test-topic>
@@ -1024,7 +1024,7 @@ is unchanged except: prefs persist; ntfy poll is constant 6s.
 
 ### Task 3.4: Update the seeded ntfy channel detail string
 
-- [ ] **Step 1:** In `crates/asylum-daemon/src/channels/mod.rs:64-67`, the seeded ntfy channel says `"ntfy.sh outbound + inbound; configured via daemon ntfy settings"` when configured. After PR 3 lands, this is now accurate. No change required, but verify the string is still right.
+- [x] **Step 1:** In `crates/asylum-daemon/src/channels/mod.rs:64-67`, the seeded ntfy channel says `"ntfy.sh outbound + inbound; configured via daemon ntfy settings"` when configured. After PR 3 lands, this is now accurate. No change required, but verify the string is still right.
 
 ### PR 3 verification
 
