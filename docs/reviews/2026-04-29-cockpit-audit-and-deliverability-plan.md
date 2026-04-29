@@ -37,6 +37,8 @@ Update this list as PRs merge. Format: PR number — branch name — merge commi
 
 All seven PRs landed on `origin/main` 2026-04-29. The 9 ultrareview Highs (H1–H9) had merged earlier in commits `127814e..10585e6`. Two Lows (L11 installer integrity check, L12 MCP stdio async) and half of M9 (WS subprotocol auth) are deferred with rationale in `CHANGELOG.md`.
 
+**Released as v0.1.2 (2026-04-29) — partial-platform.** linux-x86_64 published; macOS + linux-arm64 archives outstanding pending a Mac/arm64 build host. Tracking in [`RELEASES.md`](../../RELEASES.md).
+
 **Manual smoke verification still required by user (not automatable):**
 - Fresh-machine `curl | bash` install on Ubuntu + macOS
 - H1: token revoke → 401 without restart

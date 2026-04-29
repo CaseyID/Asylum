@@ -21,6 +21,15 @@ After the 9 High-severity findings from the 2026-04-29 local-ultrareview were me
 
 Commit range on `main`: `6e5054a..7458e4c` (40 commits).
 
+## Release status
+
+**Cut as v0.1.2 on 2026-04-29.** Published to https://github.com/CaseyID/Asylum/releases/tag/v0.1.2.
+
+- linux-x86_64 archive shipped + verified.
+- darwin-arm64, darwin-x86_64, linux-arm64 archives outstanding — need a Mac (and, for linux-arm64, either an arm64 Linux box or `qemu-user-static`+`binfmt-support` installed on the x86_64 build host). Re-run `publish-release.sh --version 0.1.2 --targets <missing> --allow-clobber` to fill them in.
+
+See the canonical record in [RELEASES.md](../../RELEASES.md).
+
 ## Manual verification still owed by Casey
 
 - Fresh-machine `curl | bash` install on Ubuntu + macOS

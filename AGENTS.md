@@ -68,6 +68,19 @@ cargo test --workspace
 npm --prefix cockpit run test
 ```
 
+## Release tracking — read this when finishing a delivery
+
+Asylum is **released manually**. There is no GitHub Actions release pipeline by design. "Merged to main" ≠ "shipped to users."
+
+After completing any delivery cycle (a multi-PR plan from `docs/reviews/` or `docs/handoff/`):
+
+1. Open [RELEASES.md](RELEASES.md). It has the workflow steps and the ledger.
+2. Decide whether the delivery warrants a release. Doc-only or trivial-internal changes don't; user-facing or shipping-relevant changes do.
+3. If yes: bump version, build, tag, publish, **and update the ledger row** as the final step. The ledger is what makes it real.
+4. If no: still answer "release status" in the delivery handoff with one line ("not released — folded into next cycle, no user-facing change").
+
+Every plan/handoff document **must** include a "Release status" section that ends with a link to the ledger. If you're authoring a plan and you don't see one, add one.
+
 ## Conventions to preserve
 
 - Asylum is single-user in v1. Do not introduce multi-tenancy, RBAC, or org-scoping.
