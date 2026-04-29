@@ -99,6 +99,43 @@ validate_archive() {
   fi
 }
 
+# M13: Before publishing, recompute sha256 for each archive and verify it matches
+# the entry in checksums.txt. Fails with a clear message if mismatched or missing.
+verify_checksums_against_artifacts() {
+  local artifact_dir=$1
+  local checksum_file="${artifact_dir}/checksums.txt"
+  local hash_cmd
+
+  # Determine available hash command (mirrors install.sh logic)
+  if command -v sha256sum >/dev/null 2>&1; then
+    hash_cmd="sha256sum"
+  elif command -v shasum >/dev/null 2>&1; then
+    hash_cmd="shasum -a 256"
+  else
+    echo "Cannot verify checksums: sha256sum or shasum is required." >&2
+    exit 1
+  fi
+
+  for archive in "${artifact_dir}"/asylum-*.tar.gz; do
+    local archive_name
+    archive_name="$(basename "$archive")"
+    local expected
+    expected="$(awk -v f="$archive_name" '$2 == f || $2 == ("*" f) { print $1; found=1 } END { if (!found) exit 1 }' "$checksum_file" 2>/dev/null)" || {
+      echo "Checksum mismatch: ${archive_name} not listed in checksums.txt — checksums.txt may be stale. Rebuild artifacts before publishing." >&2
+      exit 1
+    }
+    local actual
+    actual="$(eval "$hash_cmd \"$archive\"" | awk '{print $1}')"
+    if [[ "$expected" != "$actual" ]]; then
+      printf 'Checksum mismatch for %s\n  expected: %s\n  actual:   %s\n' \
+        "$archive_name" "$expected" "$actual" >&2
+      echo "Rebuild artifacts (checksums.txt is stale) before publishing." >&2
+      exit 1
+    fi
+    echo "Checksum verified: ${archive_name}"
+  done
+}
+
 # Verify that an annotated tag exists locally and points at HEAD.
 # Prints errors to stderr and returns non-zero on failure.
 # Args: <tag> <repo_dir>
@@ -212,6 +249,7 @@ main() {
   for archive in "${ARTIFACT_DIR}"/asylum-*.tar.gz; do
     validate_archive "$archive"
   done
+  verify_checksums_against_artifacts "$ARTIFACT_DIR"
 
   # Tag/HEAD reconciliation. Done before gh check so we fail fast even when gh
   # is unavailable.

@@ -147,10 +147,11 @@ build_linux_native() {
 
   require_docker
 
+  # M17: run as the host user so bind-mounted repo files are not modified as root.
   docker run --rm \
     --platform "$platform" \
-    -e HOST_UID="$(id -u)" \
-    -e HOST_GID="$(id -g)" \
+    --user "$(id -u):$(id -g)" \
+    -e HOME=/tmp/cargo-home \
     -e OUTPUT_BIN="/out/.asylum-${release_name}" \
     -e PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     -v "${REPO_ROOT}:/work" \
@@ -158,9 +159,9 @@ build_linux_native() {
     -w /work \
     "$DOCKER_IMAGE" \
     bash -c 'set -euo pipefail
+mkdir -p /tmp/cargo-home
 CARGO_TARGET_DIR=/tmp/asylum-target cargo build --release -p asylum
-cp /tmp/asylum-target/release/asylum "$OUTPUT_BIN"
-chown "${HOST_UID}:${HOST_GID}" "$OUTPUT_BIN"'
+cp /tmp/asylum-target/release/asylum "$OUTPUT_BIN"'
 
   package_binary "$scratch_binary" "asylum-${release_name}.tar.gz" "$output_dir"
   rm -f "$scratch_binary"
@@ -173,10 +174,11 @@ build_linux_x86_64() {
 
   require_docker
 
+  # M17: run as the host user so bind-mounted repo files are not modified as root.
   docker run --rm \
     --platform linux/arm64 \
-    -e HOST_UID="$(id -u)" \
-    -e HOST_GID="$(id -g)" \
+    --user "$(id -u):$(id -g)" \
+    -e HOME=/tmp/cargo-home \
     -e OUTPUT_BIN="/out/.asylum-${release_name}" \
     -e PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     -v "${REPO_ROOT}:/work" \
@@ -184,6 +186,7 @@ build_linux_x86_64() {
     -w /work \
     "$DOCKER_IMAGE" \
     bash -c 'set -euo pipefail
+mkdir -p /tmp/cargo-home
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends gcc-x86-64-linux-gnu libc6-dev-amd64-cross
@@ -193,8 +196,7 @@ export CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc
 export PKG_CONFIG_ALLOW_CROSS=1
 cargo build --release -p asylum --target x86_64-unknown-linux-gnu
-cp /tmp/asylum-target/x86_64-unknown-linux-gnu/release/asylum "$OUTPUT_BIN"
-chown "${HOST_UID}:${HOST_GID}" "$OUTPUT_BIN"'
+cp /tmp/asylum-target/x86_64-unknown-linux-gnu/release/asylum "$OUTPUT_BIN"'
 
   package_binary "$scratch_binary" "asylum-${release_name}.tar.gz" "$output_dir"
   rm -f "$scratch_binary"
