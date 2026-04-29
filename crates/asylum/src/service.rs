@@ -414,7 +414,7 @@ fn classify_pid_identity(
     argv: Option<&[String]>,
 ) -> PidIdentity {
     let metadata_match =
-        metadata.map_or(false, |content| pid_metadata_matches(binary, pid, content));
+        metadata.is_some_and(|content| pid_metadata_matches(binary, pid, content));
 
     if let Some(argv) = argv {
         if !command_argv_matches_asylum(binary, argv) {

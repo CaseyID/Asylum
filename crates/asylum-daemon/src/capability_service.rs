@@ -2208,7 +2208,7 @@ mod tests {
         // message.  Subsequent recvs must succeed — the channel is still open.
         let second = rx.recv().await;
         assert!(
-            matches!(second, Ok(_)),
+            second.is_ok(),
             "consumer should recover after Lagged and read the next retained message, got {second:?}"
         );
     }

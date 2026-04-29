@@ -909,8 +909,6 @@ fn optional_check(
 fn classify_service_state(detail: &str) -> CheckStatus {
     if detail.starts_with("running") {
         CheckStatus::Ok
-    } else if detail.starts_with("stopped") {
-        CheckStatus::Warn
     } else {
         CheckStatus::Warn
     }

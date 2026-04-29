@@ -173,7 +173,7 @@ fn evaluate_compare(payload: &JsonValue, key: &str, op: CompareOp, value: &str) 
     }
 }
 
-fn lookup_path<'a>(payload: &'a JsonValue, key: &str) -> Option<JsonValue> {
+fn lookup_path(payload: &JsonValue, key: &str) -> Option<JsonValue> {
     let mut current = payload.clone();
     for segment in key.split('.') {
         let next = match &current {
