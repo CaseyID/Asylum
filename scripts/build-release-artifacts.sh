@@ -109,6 +109,8 @@ package_binary() {
   local output_dir=$3
   local tmpdir
   tmpdir="$(mktemp -d)"
+  # Ensure tmpdir is removed on exit, error, or signal (L17).
+  trap 'rm -rf "$tmpdir"' EXIT
   cp "$binary" "${tmpdir}/asylum"
   chmod 0755 "${tmpdir}/asylum"
   tar -czf "${output_dir}/${asset_name}" -C "$tmpdir" asylum

@@ -239,6 +239,8 @@ Edges represent intentional responsibility:
 
 Every v1 product affordance maps to a documented root capability. Every root capability is available through the typed API and should be exposed through CLI and MCP unless the client physically cannot support it, in which case the client returns a link, token, or explanation.
 
+**MCP catalog parity (as of PR 6):** `node.create`, `node.list`, `node.inspect`, `node.send_input`, `node.interrupt`, `node.stop`, `node.archive`, `node.events`, `node.fork`, `node.attach_url`, `graph.get`, `relationship.create`, `notify.send`, `attach_url.issue` — all wired in `crates/asylum/src/mcp.rs`.
+
 ### Node capabilities
 
 - `node.create`
@@ -458,24 +460,24 @@ Users and harnesses can ignore, modify, or replace recipes.
 
 V1 is complete only when all of the following work end to end:
 
-- persistent Asylum service starts and remains useful with zero nodes,
-- graph-first Cockpit is available,
-- table view exists as secondary view,
+- [x] persistent Asylum service starts and remains useful with zero nodes,
+- [x] graph-first Cockpit is available,
+- [x] table view exists as secondary view,
 - inline persistent command-center chat launches a real Codex or Claude Code node,
-- Codex adapter works,
-- Claude Code adapter works,
-- local substrate works,
+- [x] Codex adapter works,
+- [x] Claude Code adapter works,
+- [x] local substrate works,
 - Loon substrate works,
-- browser attach works,
-- native attach target works where available,
-- CLI uses root capabilities,
-- MCP server uses root capabilities,
-- API or typed SDK contract exists,
-- ntfy outbound notifications work,
-- ntfy inbound remote command/reply path works,
-- dashboard notification center exists,
+- [x] browser attach works,
+- [x] native attach target works where available,
+- [x] CLI uses root capabilities,
+- [x] MCP server uses root capabilities (PR 6 — node.archive, node.fork, relationship.create, notify.send, attach_url.issue all wired),
+- [x] API or typed SDK contract exists,
+- [x] ntfy outbound notifications work,
+- [x] ntfy inbound remote command/reply path works (PR 3 — daemon subscribes, cockpit subscribes, channel.inbound hook fires),
+- [x] dashboard notification center exists,
 - basic remote connection setup exists,
-- capability flags are visible per harness/substrate,
+- [x] capability flags are visible per harness/substrate,
 - optional starter recipes are available.
 
 ## 17. V1 Wow Sequence

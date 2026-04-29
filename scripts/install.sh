@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-REPO_SLUG="CaseyID/Asylum"
+REPO_SLUG="${ASYLUM_REPO_SLUG:-CaseyID/Asylum}"
 GITHUB_API_URL="https://api.github.com/repos/${REPO_SLUG}/releases"
 GITHUB_RELEASE_URL="https://github.com/${REPO_SLUG}/releases"
 
@@ -100,15 +100,17 @@ asylum_error() {
 }
 
 asylum_path_contains() {
-  local candidate=$1
-  case ":${PATH}:" in
-    *":${candidate%/}:"*)
+  # Normalize the candidate and each PATH segment by stripping trailing slashes
+  # before comparison so /foo/bar/ and /foo/bar are treated as equal (L20).
+  local candidate="${1%/}"
+  local seg
+  local IFS=:
+  for seg in $PATH; do
+    if [[ "${seg%/}" == "$candidate" ]]; then
       return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+    fi
+  done
+  return 1
 }
 
 asylum_normalize_os() {
@@ -256,11 +258,15 @@ asylum_download_quiet() {
 }
 
 asylum_fetch_latest_release() {
-  local api_payload
-  api_payload="$(curl --fail --silent --location -H "Accept: application/vnd.github+json" "$GITHUB_API_URL/latest")"
+  # Resolve via the /releases/latest redirect rather than the authenticated API
+  # so rate-limit quota is not consumed and sed JSON parsing is not needed (L18).
+  local resolved_url
+  resolved_url="$(curl --fail --silent --head --location \
+    -w '%{url_effective}' -o /dev/null \
+    "${GITHUB_RELEASE_URL}/latest" 2>/dev/null)" || true
   local tag
-  tag="$(printf '%s\n' "$api_payload" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-  if [[ -z "$tag" ]]; then
+  tag="$(printf '%s\n' "$resolved_url" | sed 's|.*/tag/||')"
+  if [[ -z "$tag" ]] || [[ "$tag" == "$resolved_url" ]]; then
     asylum_error "Could not resolve latest release tag from GitHub"
     return 1
   fi

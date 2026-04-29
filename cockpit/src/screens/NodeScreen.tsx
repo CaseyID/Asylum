@@ -1,7 +1,7 @@
 // asylum cockpit — node detail screen.
 // ports NodeScreen / EventsView / ToolsView / CapsView / RelView from the prototype.
 
-import { Fragment, useEffect, useState, type JSX } from "react";
+import { Fragment, useEffect, useRef, useState, type JSX } from "react";
 import { Btn, Empty, KV, Pill, Tag } from "../lib/ui";
 import { Icon } from "../lib/icons";
 import { NodeSession } from "../components/NodeSession";
@@ -51,6 +51,7 @@ export function NodeScreen({ node, nodes, relationships, onBack, onOpen, onActio
   const [tab, setTab] = useState<Tab>("session");
   const [flash, setFlash] = useState<{ action: string; label: string; t: number } | null>(null);
   const [harnesses, setHarnesses] = useState<HarnessDescriptor[]>([]);
+  const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -96,10 +97,16 @@ export function NodeScreen({ node, nodes, relationships, onBack, onOpen, onActio
     onAction(action);
     const t = Date.now();
     setFlash({ action, label, t });
-    setTimeout(() => {
+    // Clear any previous timer before starting a new one to avoid leaking on unmount (L13).
+    if (flashTimerRef.current !== null) clearTimeout(flashTimerRef.current);
+    flashTimerRef.current = setTimeout(() => {
+      flashTimerRef.current = null;
       setFlash((f) => (f && f.action === action ? null : f));
     }, 2200);
   }
+
+  // Clear flash timer on unmount (L13).
+  useEffect(() => () => { if (flashTimerRef.current !== null) clearTimeout(flashTimerRef.current); }, []);
 
   return (
     <div className="node-page">

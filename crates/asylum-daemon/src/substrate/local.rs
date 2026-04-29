@@ -63,6 +63,17 @@ impl LocalSubstrate {
         let (output_tx, _) = broadcast::channel(1024);
         let output_tx_for_reader = output_tx.clone();
 
+        // Insert into runtimes before spawning the reader task so that any
+        // output emitted immediately on startup is not dropped (L3).
+        self.runtimes.write().await.insert(
+            node_id,
+            LocalRuntime {
+                writer: writer_arc,
+                output_tx,
+                killer: Arc::new(Mutex::new(killer)),
+            },
+        );
+
         tokio::task::spawn_blocking(move || {
             let mut local_child = child;
             let mut buffer = [0_u8; 1024];
@@ -80,14 +91,6 @@ impl LocalSubstrate {
             let _ = local_child.wait();
         });
 
-        self.runtimes.write().await.insert(
-            node_id,
-            LocalRuntime {
-                writer: writer_arc,
-                output_tx,
-                killer: Arc::new(Mutex::new(killer)),
-            },
-        );
         Ok(())
     }
 

@@ -104,7 +104,10 @@ pub fn evaluate_filter(filter: &str, payload: &JsonValue) -> bool {
     }
     match parse_filter(trimmed) {
         Ok(expr) => expr.evaluate(payload),
-        Err(_) => true,
+        Err(err) => {
+            tracing::warn!(filter = %trimmed, error = %err, "hook filter parse failed — event blocked (fail-closed)");
+            false
+        }
     }
 }
 
@@ -170,7 +173,7 @@ fn evaluate_compare(payload: &JsonValue, key: &str, op: CompareOp, value: &str) 
     }
 }
 
-fn lookup_path<'a>(payload: &'a JsonValue, key: &str) -> Option<JsonValue> {
+fn lookup_path(payload: &JsonValue, key: &str) -> Option<JsonValue> {
     let mut current = payload.clone();
     for segment in key.split('.') {
         let next = match &current {
@@ -360,8 +363,10 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_filter_falls_back_to_any() {
+    fn unparseable_filter_fails_closed() {
+        // L2: a filter that cannot be parsed must block the event (fail-closed),
+        // not silently pass it through.
         let payload = serde_json::json!({});
-        assert!(evaluate_filter("?(?)*", &payload));
+        assert!(!evaluate_filter("?(?)*", &payload));
     }
 }

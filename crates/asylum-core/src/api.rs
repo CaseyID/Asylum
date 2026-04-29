@@ -478,7 +478,16 @@ pub struct ForkNodeRequest {
 }
 
 impl NodeLiveness {
+    /// True for states that are permanently done and cannot be resumed.
+    /// Per PRD, `Stopped` is resumable via `node.resume` and is NOT terminal.
     pub fn is_terminal(&self) -> bool {
+        matches!(self, NodeLiveness::Failed | NodeLiveness::Archived)
+    }
+
+    /// True for states where the node is not actively running right now,
+    /// including resumable pauses (`Stopped`, `Exited`) as well as terminal
+    /// states (`Failed`, `Archived`).
+    pub fn is_done_for_now(&self) -> bool {
         matches!(
             self,
             NodeLiveness::Exited
@@ -489,6 +498,6 @@ impl NodeLiveness {
     }
 
     pub fn in_progress(&self) -> bool {
-        !self.is_terminal()
+        !self.is_done_for_now()
     }
 }

@@ -3,6 +3,18 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+/// Constant-time byte slice comparison — prevents timing-oracle on attach signatures.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 #[derive(Clone, Debug)]
 pub struct AttachTokenRecord {
     pub raw: String,
@@ -69,7 +81,7 @@ impl AttachTokenIssuer {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        if expected != signature {
+        if !ct_eq(expected.as_bytes(), signature.as_bytes()) {
             return Err(anyhow::anyhow!("signature mismatch"));
         }
         let payload_parts: Vec<_> = payload.split(':').collect();
