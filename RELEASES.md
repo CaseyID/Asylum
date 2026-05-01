@@ -50,7 +50,8 @@ The two supported build hosts are **macOS Apple Silicon** and **Linux x86_64**. 
 
 | Version | Tag | Date | main commit | Status | Platforms shipped | Notes |
 |---|---|---|---|---|---|---|
-| 0.1.3 | v0.1.3 | 2026-04-30 | 0b8a7a4 | **Published** | linux-x86_64, linux-arm64, darwin-arm64, darwin-x86_64 | CLI composability + uninstall delivery: HostState introspection layer, `asylum status --json`, `asylum uninstall`, `asylum service generate` (replaces `asylum install systemd\|launchd`), thin `install.sh` (857→593 lines). See [docs/reviews/2026-04-30-cli-composability-and-uninstall.md](docs/reviews/2026-04-30-cli-composability-and-uninstall.md). |
+| 0.1.4 | v0.1.4 | 2026-04-30 | 87b3c9b | **Published** | linux-x86_64, linux-arm64, darwin-arm64, darwin-x86_64 | Cosmetic + back-compat follow-up: ASYLUM block-letter banner unified across installer and binary first-run greetings; `install.sh` accepts `--skip-doctor`/`--yes` as no-op so `asylum update` from v0.1.2 and earlier can self-upgrade through. |
+| 0.1.3 | v0.1.3 | 2026-04-30 | 0b8a7a4 | Published | linux-x86_64, linux-arm64, darwin-arm64, darwin-x86_64 | CLI composability + uninstall delivery: HostState introspection layer, `asylum status --json`, `asylum uninstall`, `asylum service generate` (replaces `asylum install systemd\|launchd`), thin `install.sh` (857→593 lines). See [docs/reviews/2026-04-30-cli-composability-and-uninstall.md](docs/reviews/2026-04-30-cli-composability-and-uninstall.md). |
 | 0.1.2 | v0.1.2 | 2026-04-29 | 922e951 | Published | linux-x86_64, linux-arm64, darwin-arm64, darwin-x86_64 | Cuts the cockpit deliverability + prototype-residue cleanup (40+ commits, 7 PRs). All four platforms cross-built from Linux x86_64 via `ghcr.io/rust-cross/cargo-zigbuild`. |
 | 0.1.1 | v0.1.1 | 2026-04-28 | (pre-cleanup) | Published | linux-x86_64, linux-arm64, darwin-arm64, darwin-x86_64 | Initial cleanup of 9 ultrareview High findings. |
 
