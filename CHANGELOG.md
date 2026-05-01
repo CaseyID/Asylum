@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.3 — 2026-04-30
+
+### Added
+
+- **`HostState` introspection layer** (`crates/asylum/src/host.rs`) — single struct describing the machine from Asylum's perspective: binary location/version/PATH state, runtime dir contents, config dir contents, daemon state and backend, service-unit presence, port probe. Cheap to construct, side-effect-free, `Serialize`. Folds in the former `service.rs` (deleted). Carries `schema_version: 1`.
+- **`asylum status --json`** — emits the full `HostState` as machine-parseable JSON. Human rendering also gains binary-path, PATH-shadow, service-unit, and port-probe lines.
+- **`asylum uninstall`** — friendly removal command with plan / confirm / execute flow. Flags: `--yes`, `--keep state|config|logs` (repeatable), `--purge`, `--dry-run`, `--json`. `--purge` always requires typed-name confirmation (user types `asylum`), even with `--yes`. Default preserves `~/.config/asylum/` (signing keys live there). Binary removal is guarded against non-bin parent dirs so a dev workspace `target/release/asylum` is not deleted.
+- **`asylum service generate {systemd|launchd}`** — replaces the misnamed `asylum install {systemd|launchd}`. Same output (unit text on stdout). Old form deleted outright; no alias.
+- **First-run banners** — bare `asylum` invocation prints a "what is this, what's next" banner only when `~/.asylum` does not exist. `asylum setup` prints a welcome banner on first-time setup, including PATH guidance when the binary is not on the shell PATH.
+- **`#[command(after_help = …)]` example blocks** on the major user-facing subcommands (`setup`, `cockpit`, `start`, `stop`, `status`, `doctor`, `update`, `service`, `uninstall`, `attach`).
+- **`about` descriptions** on every top-level subcommand so `asylum --help` lists each with a one-line summary.
+
+### Changed
+
+- **`scripts/install.sh` shrank from 857 to 593 lines.** Now responsible only for OS/arch detection, download, signature verification, binary placement, then `exec asylum setup`. Dropped: prompt for setup, `asylum doctor` invocation, shell-rc PATH editor, "next steps" printer, `--yes`/`--skip-doctor` flags. Post-install UX now lives in `asylum setup`'s first-run banner.
+- **`asylum doctor` and `asylum setup`** refactored onto `HostState`; duplicated detection logic deleted.
+- **Bare `asylum`** with `~/.asylum` missing now exits cleanly after printing the banner instead of falling through to `Cockpit`.
+
+### Removed
+
+- **`asylum install systemd|launchd`** — replaced by `asylum service generate …`. No deprecation alias.
+- **`crates/asylum/src/service.rs`** — folded into `host.rs`.
+- **`scripts/install.sh` `--yes` and `--skip-doctor` flags** — no longer meaningful.
+
 ## 0.1.2 — 2026-04-29
 
 ### Fixed
