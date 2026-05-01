@@ -6,19 +6,26 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::os::unix::process::CommandExt as _;
 
 use anyhow::{anyhow, Context, Result};
+use serde::Serialize;
 
 use crate::runtime::RuntimePaths;
 
 const LABEL: &str = "dev.asylum.daemon";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// ------------------------------------------------------------------
+// Service backend / state (folded in from former `service.rs`)
+// ------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ServiceBackend {
     Launchd,
     SystemdUser,
     PidFallback,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
 pub enum ServiceState {
     Running,
     Stopped,
@@ -127,6 +134,23 @@ impl ServiceManager {
 
     pub fn systemd_unit_text(&self, bind: &str) -> String {
         render_systemd_unit(&self.render_config(bind))
+    }
+
+    pub fn read_running_pid(&self) -> Option<u32> {
+        let pid = self.read_pid()?;
+        if process_is_running(pid) && self.pid_identity(pid) == PidIdentity::Matches {
+            Some(pid)
+        } else {
+            None
+        }
+    }
+
+    pub fn launchd_plist_location(&self) -> PathBuf {
+        self.launchd_plist_path()
+    }
+
+    pub fn systemd_unit_location(&self) -> PathBuf {
+        self.systemd_unit_path()
     }
 
     fn start_launchd(&self, bind: &str) -> Result<()> {
@@ -487,7 +511,12 @@ fn binary_path_basename(binary: &str) -> Option<&std::ffi::OsStr> {
 }
 
 fn command_status(command: &str, args: &[&str]) -> ServiceState {
-    match ProcessCommand::new(command).args(args).status() {
+    match ProcessCommand::new(command)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
         Ok(status) if status.success() => ServiceState::Running,
         Ok(_) => ServiceState::Stopped,
         Err(error) => ServiceState::Unknown(error.to_string()),
@@ -566,6 +595,417 @@ pub fn service_state_from_health(healthy: bool, service_state: ServiceState) -> 
 
 pub fn require_binary() -> Result<PathBuf> {
     std::env::current_exe().map_err(|error| anyhow!("locate asylum executable: {error}"))
+}
+
+// ------------------------------------------------------------------
+// HostState — shared host introspection
+// ------------------------------------------------------------------
+
+pub const HOST_STATE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct HostState {
+    pub schema_version: u32,
+    pub binary: BinaryInfo,
+    pub runtime_dir: RuntimeDirInfo,
+    pub config_dir: ConfigDirInfo,
+    pub daemon: DaemonInfo,
+    pub service_unit: ServiceUnitInfo,
+    pub cockpit: CockpitInfo,
+    pub network: NetworkInfo,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BinaryInfo {
+    pub path: Option<PathBuf>,
+    pub version: &'static str,
+    pub on_path: bool,
+    pub shadowed_by: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RuntimeDirInfo {
+    pub path: PathBuf,
+    pub present: bool,
+    pub config_file: FileEntry,
+    pub database: FileEntry,
+    pub logs_dir: DirEntry,
+    pub run_dir: DirEntry,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConfigDirInfo {
+    pub path: PathBuf,
+    pub present: bool,
+    pub entry_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DaemonInfo {
+    pub state: ServiceState,
+    pub bind: Option<String>,
+    pub base_url: String,
+    pub pid: Option<u32>,
+    pub backend: ServiceBackend,
+    pub healthy: bool,
+    pub daemon_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ServiceUnitInfo {
+    pub backend: ServiceBackend,
+    pub path: Option<PathBuf>,
+    pub installed: bool,
+    pub enabled: Option<bool>,
+}
+
+/// Cockpit-owned caches we'd remove on uninstall. v0.1.x has no on-disk
+/// cockpit cache outside the runtime dir we already own; keep this as a
+/// placeholder so the JSON shape is stable.
+#[derive(Clone, Debug, Serialize)]
+pub struct CockpitInfo {
+    pub caches: Option<Vec<PathBuf>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NetworkInfo {
+    pub bind: Option<String>,
+    pub port: Option<u16>,
+    pub port_in_use: PortInUse,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PortInUse {
+    Free,
+    InUse {
+        pid: Option<u32>,
+        command: Option<String>,
+    },
+    Unknown {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FileEntry {
+    pub path: PathBuf,
+    pub present: bool,
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DirEntry {
+    pub path: PathBuf,
+    pub present: bool,
+    pub size_bytes: Option<u64>,
+}
+
+impl HostState {
+    /// Collect host state. Sync, blocking; performs filesystem lookups,
+    /// `which` walks, and a best-effort port probe. Acceptable for CLI startup.
+    pub fn collect(paths: &RuntimePaths) -> Self {
+        let binary = collect_binary_info();
+        let runtime_dir = collect_runtime_dir(paths);
+        let config_dir = collect_config_dir();
+        let bind = read_configured_bind(paths);
+        let port = bind.as_deref().and_then(parse_port);
+        let (daemon, service_unit) = collect_daemon_and_unit(paths, bind.clone());
+        let cockpit = CockpitInfo { caches: None };
+        let network = NetworkInfo {
+            bind: bind.clone(),
+            port,
+            port_in_use: probe_port(port, daemon.pid),
+        };
+
+        Self {
+            schema_version: HOST_STATE_SCHEMA_VERSION,
+            binary,
+            runtime_dir,
+            config_dir,
+            daemon,
+            service_unit,
+            cockpit,
+            network,
+        }
+    }
+}
+
+fn collect_binary_info() -> BinaryInfo {
+    let current = std::env::current_exe().ok();
+    let mut path_entries: Vec<PathBuf> = Vec::new();
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join("asylum");
+            if !candidate.is_file() {
+                continue;
+            }
+            let canonical = fs::canonicalize(&candidate).unwrap_or(candidate.clone());
+            if path_entries
+                .iter()
+                .any(|existing| fs::canonicalize(existing).unwrap_or(existing.clone()) == canonical)
+            {
+                continue;
+            }
+            path_entries.push(candidate);
+        }
+    }
+    let on_path = !path_entries.is_empty();
+    let shadowed_by = match (&current, path_entries.first()) {
+        (Some(current), Some(first)) if same_file(current, first) => {
+            path_entries.iter().skip(1).cloned().collect()
+        }
+        _ => path_entries.clone(),
+    };
+    BinaryInfo {
+        path: current,
+        version: env!("CARGO_PKG_VERSION"),
+        on_path,
+        shadowed_by,
+    }
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+fn collect_runtime_dir(paths: &RuntimePaths) -> RuntimeDirInfo {
+    let logs_dir = paths.logs_dir();
+    let run_dir = paths.run_dir();
+    RuntimeDirInfo {
+        present: paths.home.exists(),
+        path: paths.home.clone(),
+        config_file: file_entry(&paths.config),
+        database: file_entry(&paths.database),
+        logs_dir: dir_entry(&logs_dir),
+        run_dir: dir_entry(&run_dir),
+    }
+}
+
+fn collect_config_dir() -> ConfigDirInfo {
+    let path = config_dir_path();
+    let present = path.exists();
+    let entry_count = if present {
+        fs::read_dir(&path).map(|iter| iter.count()).unwrap_or(0)
+    } else {
+        0
+    };
+    ConfigDirInfo {
+        path,
+        present,
+        entry_count,
+    }
+}
+
+pub fn config_dir_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("asylum")
+}
+
+fn collect_daemon_and_unit(
+    paths: &RuntimePaths,
+    bind: Option<String>,
+) -> (DaemonInfo, ServiceUnitInfo) {
+    let manager = ServiceManager::new(paths.clone());
+    let backend = manager
+        .as_ref()
+        .map(|manager| manager.backend())
+        .unwrap_or_else(|_| select_backend());
+    let state = manager
+        .as_ref()
+        .map(|manager| manager.status())
+        .unwrap_or(ServiceState::Stopped);
+    let pid = manager
+        .as_ref()
+        .ok()
+        .and_then(|manager| manager.read_running_pid());
+    let healthy = matches!(state, ServiceState::Running);
+    let base_url = bind
+        .as_deref()
+        .and_then(|raw| raw.parse::<std::net::SocketAddr>().ok())
+        .map(|addr| {
+            let ip = if addr.ip().is_unspecified() {
+                if addr.is_ipv6() {
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                } else {
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                }
+            } else {
+                addr.ip()
+            };
+            format!("http://{}", std::net::SocketAddr::new(ip, addr.port()))
+        })
+        .unwrap_or_else(|| "http://127.0.0.1:7717".to_string());
+
+    let unit_path = manager.as_ref().ok().map(|manager| match backend {
+        ServiceBackend::Launchd => manager.launchd_plist_location(),
+        ServiceBackend::SystemdUser => manager.systemd_unit_location(),
+        ServiceBackend::PidFallback => manager.paths_pid_metadata(),
+    });
+    let installed = unit_path
+        .as_ref()
+        .map(|path| path.exists())
+        .unwrap_or(false);
+    let enabled = service_unit_enabled(backend);
+
+    let service_unit = ServiceUnitInfo {
+        backend,
+        path: unit_path.filter(|_| backend != ServiceBackend::PidFallback),
+        installed: installed && backend != ServiceBackend::PidFallback,
+        enabled,
+    };
+
+    let daemon = DaemonInfo {
+        state,
+        bind,
+        base_url,
+        pid,
+        backend,
+        healthy,
+        daemon_version: None,
+    };
+    (daemon, service_unit)
+}
+
+impl ServiceManager {
+    fn paths_pid_metadata(&self) -> PathBuf {
+        self.pid_metadata_path()
+    }
+}
+
+fn service_unit_enabled(backend: ServiceBackend) -> Option<bool> {
+    match backend {
+        ServiceBackend::SystemdUser => {
+            let output = ProcessCommand::new("systemctl")
+                .arg("--user")
+                .arg("is-enabled")
+                .arg("asylum.service")
+                .output()
+                .ok()?;
+            Some(output.status.success())
+        }
+        ServiceBackend::Launchd => {
+            let output = ProcessCommand::new("launchctl")
+                .arg("list")
+                .arg(LABEL)
+                .output()
+                .ok()?;
+            Some(output.status.success())
+        }
+        ServiceBackend::PidFallback => None,
+    }
+}
+
+fn read_configured_bind(paths: &RuntimePaths) -> Option<String> {
+    let content = fs::read_to_string(&paths.config).ok()?;
+    let parsed: toml::Value = toml::from_str(&content).ok()?;
+    parsed
+        .get("listen")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+}
+
+fn parse_port(bind: &str) -> Option<u16> {
+    bind.parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|addr| addr.port())
+}
+
+fn probe_port(port: Option<u16>, expected_pid: Option<u32>) -> PortInUse {
+    let Some(port) = port else {
+        return PortInUse::Unknown {
+            reason: "no configured bind".to_string(),
+        };
+    };
+    if !command_exists("lsof") {
+        return PortInUse::Unknown {
+            reason: "lsof not on PATH".to_string(),
+        };
+    }
+    let output = match ProcessCommand::new("lsof")
+        .arg("-nP")
+        .arg(format!("-iTCP:{port}"))
+        .arg("-sTCP:LISTEN")
+        .arg("-Fpcn")
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return PortInUse::Unknown {
+                reason: format!("lsof failed: {error}"),
+            }
+        }
+    };
+    if !output.status.success() && output.stdout.is_empty() {
+        return PortInUse::Free;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut pid: Option<u32> = None;
+    let mut command: Option<String> = None;
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix('p') {
+            pid = rest.trim().parse::<u32>().ok();
+        } else if let Some(rest) = line.strip_prefix('c') {
+            command = Some(rest.trim().to_string());
+        }
+    }
+    if pid.is_none() && command.is_none() {
+        return PortInUse::Free;
+    }
+    let _ = expected_pid;
+    PortInUse::InUse { pid, command }
+}
+
+fn file_entry(path: &Path) -> FileEntry {
+    let metadata = fs::metadata(path).ok();
+    FileEntry {
+        present: metadata.is_some(),
+        size_bytes: metadata.as_ref().map(|m| m.len()),
+        path: path.to_path_buf(),
+    }
+}
+
+fn dir_entry(path: &Path) -> DirEntry {
+    let present = path.is_dir();
+    let size_bytes = if present { dir_size(path).ok() } else { None };
+    DirEntry {
+        path: path.to_path_buf(),
+        present,
+        size_bytes,
+    }
+}
+
+fn dir_size(path: &Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = match fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                if let Ok(metadata) = entry.metadata() {
+                    total = total.saturating_add(metadata.len());
+                }
+            }
+        }
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -740,6 +1180,23 @@ mod tests {
             service_state_from_health(false, ServiceState::Stopped),
             ServiceState::Stopped
         );
+    }
+
+    #[test]
+    fn host_state_collects_for_empty_runtime() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let home = tempdir.path().join("nope");
+        let paths = RuntimePaths::from_values(
+            Some(home),
+            None,
+            None,
+            Some(tempdir.path().to_path_buf()),
+        );
+        let state = HostState::collect(&paths);
+        assert_eq!(state.schema_version, HOST_STATE_SCHEMA_VERSION);
+        assert!(!state.runtime_dir.present);
+        assert!(!state.runtime_dir.config_file.present);
+        assert!(!state.runtime_dir.database.present);
     }
 
     fn argv(values: &[&str]) -> Vec<String> {

@@ -1,9 +1,9 @@
 mod cli;
 mod client;
+mod host;
 mod mcp;
 mod native_attach;
 mod runtime;
-mod service;
 
 use anyhow::Result;
 

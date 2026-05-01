@@ -1,6 +1,6 @@
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
@@ -8,18 +8,18 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::client::AsylumClient;
+use crate::host::{
+    command_exists, config_dir_path, require_binary, service_state_from_health, HostState,
+    PortInUse, ServiceBackend, ServiceManager, ServiceState,
+};
 use crate::mcp;
 use crate::native_attach::format_native_attach_prompt;
 use crate::runtime::RuntimePaths;
-use crate::service::{
-    command_exists, require_binary, service_state_from_health, ServiceBackend, ServiceManager,
-    ServiceState,
-};
 use asylum_core::api::{CreateNodeRequest, HealthResponse};
 use asylum_core::config::AsylumConfig;
 use asylum_core::security::TokenRequest;
@@ -34,6 +34,13 @@ pub async fn run() -> Result<()> {
     let was_bare = cli.command.is_none();
     let paths = RuntimePaths::from_env(cli.config.clone())?;
     let client = runtime_client(&paths)?;
+
+    if was_bare && !paths.home.exists() {
+        // First run: print a friendly intro instead of barreling into the cockpit.
+        run_first_run_banner(&paths);
+        return Ok(());
+    }
+
     let command = cli.command.unwrap_or(Command::Cockpit);
 
     match command {
@@ -51,9 +58,9 @@ pub async fn run() -> Result<()> {
             let client = runtime_client(&paths)?;
             run_restart(&paths, &client).await?
         }
-        Command::Status => {
+        Command::Status { json } => {
             let client = runtime_client(&paths)?;
-            run_status(&paths, &client).await?
+            run_status(&paths, &client, json).await?
         }
         Command::Doctor { verbose } => {
             let client = runtime_client(&paths)?;
@@ -76,13 +83,19 @@ pub async fn run() -> Result<()> {
             ConfigCommand::Init => run_config_init(&paths)?,
             ConfigCommand::Show => run_config_show(&paths)?,
         },
-        Command::Install { command: install } => {
-            let manager = ServiceManager::new(paths.clone())?;
-            let payload = match install {
-                InstallCommand::Launchd => manager.launchd_plist_text(DEFAULT_BIND),
-                InstallCommand::Systemd => manager.systemd_unit_text(DEFAULT_BIND),
-            };
-            println!("{payload}");
+        Command::Service { command: service } => match service {
+            ServiceCommand::Generate { command: generate } => {
+                let manager = ServiceManager::new(paths.clone())?;
+                let payload = match generate {
+                    ServiceGenerateCommand::Launchd => manager.launchd_plist_text(DEFAULT_BIND),
+                    ServiceGenerateCommand::Systemd => manager.systemd_unit_text(DEFAULT_BIND),
+                };
+                println!("{payload}");
+            }
+        },
+        Command::Uninstall(args) => {
+            let client = runtime_client(&paths)?;
+            run_uninstall(&paths, &client, args).await?;
         }
         Command::Node { command: node } => match node {
             NodeCommand::Create(request) => {
@@ -167,12 +180,27 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Idempotent post-install dance; creates ~/.asylum, writes default config.
+    #[command(after_help = "Examples:\n  asylum setup\n  ASYLUM_HOME=/tmp/asylum-test asylum setup")]
     Setup,
+    /// Open the Cockpit in your browser; starts the daemon if needed.
+    #[command(after_help = "Examples:\n  asylum cockpit\n  asylum   # bare invocation falls through to cockpit when set up")]
     Cockpit,
+    /// Start the daemon (background; uses launchd / systemd-user / pid fallback).
+    #[command(after_help = "Examples:\n  asylum start\n  asylum start && asylum status")]
     Start,
+    /// Stop the daemon if running.
+    #[command(after_help = "Examples:\n  asylum stop\n  asylum stop && asylum status")]
     Stop,
     Restart,
-    Status,
+    /// Show host and daemon state.
+    #[command(after_help = "Examples:\n  asylum status\n  asylum status --json\n  asylum status --json | jq .daemon")]
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run host checks and report problems.
+    #[command(after_help = "Examples:\n  asylum doctor\n  asylum doctor --verbose")]
     Doctor {
         #[arg(long)]
         verbose: bool,
@@ -181,6 +209,8 @@ enum Command {
         #[arg(long)]
         tail: bool,
     },
+    /// Self-update via the public installer.
+    #[command(after_help = "Examples:\n  asylum update\n  asylum update --version v0.1.3")]
     Update {
         #[arg(long)]
         version: Option<String>,
@@ -193,10 +223,15 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    Install {
+    /// Service-unit operations (generate launchd / systemd-user unit text).
+    #[command(after_help = "Examples:\n  asylum service generate systemd > ~/.config/systemd/user/asylum.service\n  asylum service generate launchd > ~/Library/LaunchAgents/dev.asylum.daemon.plist")]
+    Service {
         #[command(subcommand)]
-        command: InstallCommand,
+        command: ServiceCommand,
     },
+    /// Remove Asylum from this machine. Stops daemon, removes service unit, binary, ~/.asylum.
+    #[command(after_help = "Examples:\n  asylum uninstall --dry-run\n  asylum uninstall --keep state\n  asylum uninstall --purge   # also removes ~/.config/asylum (signing keys)")]
+    Uninstall(UninstallArgs),
     Node {
         #[command(subcommand)]
         command: NodeCommand,
@@ -205,6 +240,8 @@ enum Command {
         #[command(subcommand)]
         command: GraphCommand,
     },
+    /// Attach a TTY directly to a node's harness.
+    #[command(after_help = "Examples:\n  asylum attach <NODE_ID>\n  asylum attach $(asylum node list | jq -r '.[0].node_id')")]
     Attach {
         node_id: Uuid,
     },
@@ -264,9 +301,50 @@ enum ConfigCommand {
 }
 
 #[derive(Subcommand)]
-enum InstallCommand {
+enum ServiceCommand {
+    /// Generate a service-unit file for the host's launch system.
+    #[command(after_help = "Examples:\n  asylum service generate systemd\n  asylum service generate launchd")]
+    Generate {
+        #[command(subcommand)]
+        command: ServiceGenerateCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceGenerateCommand {
     Launchd,
     Systemd,
+}
+
+#[derive(Args, Debug)]
+struct UninstallArgs {
+    /// Skip the interactive y/n confirm. Does NOT skip --purge typed-name confirmation.
+    #[arg(long)]
+    yes: bool,
+    /// Preserve the listed paths. Repeatable: `--keep state --keep logs`.
+    #[arg(long, value_enum)]
+    keep: Vec<KeepKind>,
+    /// Also remove ~/.config/asylum (signing keys). Requires typed-name confirm.
+    #[arg(long)]
+    purge: bool,
+    /// Print the plan and exit without removing anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Emit the plan (and post-state, if executed) as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lowercase")]
+enum KeepKind {
+    /// Preserve ~/.asylum (state, sqlite, logs, sockets).
+    State,
+    /// Preserve ~/.config/asylum (signing keys etc.). This is the default; the flag
+    /// is for explicitness in scripts.
+    Config,
+    /// Preserve ~/.asylum/logs/ even if state is removed.
+    Logs,
 }
 
 #[derive(Subcommand)]
@@ -409,6 +487,9 @@ fn setup_runtime(paths: &RuntimePaths) -> Result<SetupOutcome> {
 }
 
 fn run_setup(paths: &RuntimePaths) -> Result<()> {
+    let pre_state = HostState::collect(paths);
+    let was_first_run = !pre_state.runtime_dir.present;
+
     let outcome = setup_runtime(paths)?;
     println!("Asylum home: {}", paths.home.display());
     if outcome.created_config {
@@ -421,8 +502,52 @@ fn run_setup(paths: &RuntimePaths) -> Result<()> {
     print_harness_detection("Claude Code", "claude", outcome.claude_available);
     println!("Loon: optional; enable it in config when ready");
     println!("ntfy: optional; set server/topic in config when ready");
-    println!("Next: asylum");
+
+    if was_first_run {
+        print_first_run_banner(paths);
+    } else {
+        println!("Next: asylum");
+    }
     Ok(())
+}
+
+fn print_first_run_banner(paths: &RuntimePaths) {
+    let post_state = HostState::collect(paths);
+    println!();
+    println!("Welcome to Asylum.");
+    println!();
+    println!("Asylum runs as a small daemon on this machine, with a local web Cockpit");
+    println!("for observing and steering harness sessions (Codex, Claude Code).");
+    println!();
+    if !post_state.binary.on_path {
+        if let Some(bin) = &post_state.binary.path {
+            if let Some(install_dir) = bin.parent() {
+                println!("NOTE: `asylum` is not yet on your shell PATH.");
+                println!("      Add this line to your shell rc and restart the shell:");
+                println!("          export PATH=\"{}:$PATH\"", install_dir.display());
+                println!();
+            }
+        }
+    }
+    println!("What's next:");
+    println!("  asylum start    # start the daemon");
+    println!("  asylum cockpit  # open the Cockpit in your browser");
+    println!("  asylum status   # see what's running");
+    println!("  asylum doctor   # run host checks");
+    println!();
+}
+
+fn run_first_run_banner(paths: &RuntimePaths) {
+    println!("Asylum is installed but not yet set up on this machine.");
+    println!();
+    println!("Asylum home would live at: {}", paths.home.display());
+    println!();
+    println!("Run `asylum setup` to create it and finish first-time configuration.");
+    println!();
+    println!("Other useful commands:");
+    println!("  asylum status   # show host state (works without setup)");
+    println!("  asylum doctor   # run host checks");
+    println!("  asylum --help   # full command list");
 }
 
 fn print_harness_detection(label: &str, command: &str, available: bool) {
@@ -699,10 +824,21 @@ async fn run_restart(paths: &RuntimePaths, client: &AsylumClient) -> Result<()> 
     Ok(())
 }
 
-async fn run_status(paths: &RuntimePaths, client: &AsylumClient) -> Result<()> {
+async fn run_status(paths: &RuntimePaths, client: &AsylumClient, json: bool) -> Result<()> {
+    let mut state = HostState::collect(paths);
     let health = client.health().await.ok();
-    let manager = ServiceManager::new(paths.clone())?;
-    let service_state = service_state_from_health(health.is_some(), manager.status());
+    if let Some(health) = health.as_ref() {
+        state.daemon.healthy = true;
+        state.daemon.state = ServiceState::Running;
+        state.daemon.daemon_version = Some(health.daemon_version.clone());
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&state)?);
+        return Ok(());
+    }
+
+    let service_state = service_state_from_health(health.is_some(), state.daemon.state.clone());
     println!("Asylum: {service_state}");
     println!("Cockpit: {}", client.base_url());
     match health {
@@ -712,7 +848,45 @@ async fn run_status(paths: &RuntimePaths, client: &AsylumClient) -> Result<()> {
     println!("Config: {}", paths.config.display());
     println!("Database: {}", paths.database.display());
     println!("Logs: {}", paths.log.display());
+    println!("Binary: {}", display_optional_path(state.binary.path.as_deref()));
+    if !state.binary.shadowed_by.is_empty() {
+        println!("PATH shadows:");
+        for shadow in &state.binary.shadowed_by {
+            println!("  {}", shadow.display());
+        }
+    }
+    println!(
+        "Service unit: {} ({})",
+        if state.service_unit.installed {
+            "installed"
+        } else {
+            "not installed"
+        },
+        state.service_unit.backend,
+    );
+    if let Some(path) = &state.service_unit.path {
+        println!("  path: {}", path.display());
+    }
+    match &state.network.port_in_use {
+        PortInUse::Free => println!("Port: free"),
+        PortInUse::InUse { pid, command } => {
+            let pid_text = pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string());
+            let command_text = command.as_deref().unwrap_or("?");
+            println!("Port: in use (pid {pid_text}, command {command_text})");
+        }
+        PortInUse::Unknown { reason } => println!("Port: unknown ({reason})"),
+    }
+    println!(
+        "Config dir: {} ({} entries)",
+        state.config_dir.path.display(),
+        state.config_dir.entry_count
+    );
     Ok(())
+}
+
+fn display_optional_path(path: Option<&Path>) -> String {
+    path.map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unknown>".to_string())
 }
 
 async fn wait_for_health(client: &AsylumClient, timeout: Duration) -> Option<HealthResponse> {
@@ -791,17 +965,25 @@ async fn doctor_checks(
     client: &AsylumClient,
     verbose: bool,
 ) -> Vec<DoctorCheck> {
+    let host = HostState::collect(paths);
     let mut checks = Vec::new();
-    checks.push(match require_binary() {
-        Ok(binary) => DoctorCheck::new(
+    checks.push(match host.binary.path.as_ref() {
+        Some(binary) => DoctorCheck::new(
             CheckStatus::Ok,
             "binary",
-            format!("{} {}", binary.display(), env!("CARGO_PKG_VERSION")),
+            format!("{} {}", binary.display(), host.binary.version),
         ),
-        Err(error) => DoctorCheck::new(CheckStatus::Fail, "binary", error.to_string()),
+        None => match require_binary() {
+            Ok(binary) => DoctorCheck::new(
+                CheckStatus::Ok,
+                "binary",
+                format!("{} {}", binary.display(), host.binary.version),
+            ),
+            Err(error) => DoctorCheck::new(CheckStatus::Fail, "binary", error.to_string()),
+        },
     });
     checks.push(classify_required(
-        command_exists("asylum"),
+        host.binary.on_path,
         "PATH",
         "`asylum` command is available",
         "`asylum` command was not found on PATH",
@@ -847,16 +1029,10 @@ async fn doctor_checks(
         "configured",
         "optional and not configured",
     ));
-    let service_detail = match ServiceManager::new(paths.clone()) {
-        Ok(manager) => {
-            let state = manager.status();
-            if verbose {
-                format!("{state} via {}", manager.backend())
-            } else {
-                state.to_string()
-            }
-        }
-        Err(error) => format!("unknown: {error}"),
+    let service_detail = if verbose {
+        format!("{} via {}", host.daemon.state, host.daemon.backend)
+    } else {
+        host.daemon.state.to_string()
     };
     checks.push(DoctorCheck::new(
         classify_service_state(&service_detail),
@@ -876,6 +1052,25 @@ async fn doctor_checks(
                 paths.pid.display()
             ),
         ));
+        checks.push(DoctorCheck::new(
+            CheckStatus::Ok,
+            "config dir",
+            format!(
+                "{} ({} entries)",
+                host.config_dir.path.display(),
+                host.config_dir.entry_count
+            ),
+        ));
+        let port_detail = match &host.network.port_in_use {
+            PortInUse::Free => "free".to_string(),
+            PortInUse::InUse { pid, command } => {
+                let pid_text = pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string());
+                let command_text = command.as_deref().unwrap_or("?");
+                format!("in use (pid {pid_text}, command {command_text})")
+            }
+            PortInUse::Unknown { reason } => format!("unknown ({reason})"),
+        };
+        checks.push(DoctorCheck::new(CheckStatus::Ok, "port", port_detail));
     }
     checks
 }
@@ -953,11 +1148,11 @@ fn database_check(paths: &RuntimePaths) -> DoctorCheck {
 fn cockpit_assets_check() -> DoctorCheck {
     #[cfg(not(debug_assertions))]
     {
-        return DoctorCheck::new(
+        DoctorCheck::new(
             CheckStatus::Ok,
             "cockpit assets",
             "embedded in release binary",
-        );
+        )
     }
 
     #[cfg(debug_assertions)]
@@ -1036,6 +1231,509 @@ fn run_logs(paths: &RuntimePaths, tail: bool) -> Result<()> {
         return Err(anyhow!("tail exited with {status}"));
     }
     Ok(())
+}
+
+// ------------------------------------------------------------------
+// Uninstall
+// ------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum PlanStep {
+    StopDaemon { running: bool },
+    RemoveServiceUnit { backend: String, path: Option<PathBuf>, installed: bool },
+    RemoveBinary { path: Option<PathBuf>, present: bool },
+    RemoveRuntimeDir { path: PathBuf, present: bool, preserve_logs: bool },
+    KeepRuntimeDir { path: PathBuf, reason: String },
+    RemoveConfigDir { path: PathBuf, present: bool },
+    KeepConfigDir { path: PathBuf, reason: String },
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case", tag = "outcome")]
+enum StepResult {
+    Removed { path: PathBuf },
+    Preserved { path: PathBuf, reason: String },
+    NotPresent { path: PathBuf },
+    Stopped,
+    NotRunning,
+    Failed { path: Option<PathBuf>, error: String },
+    Noop,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct UninstallReport {
+    plan: Vec<PlanStep>,
+    executed: bool,
+    results: Vec<(String, StepResult)>,
+    remaining: Option<HostState>,
+}
+
+async fn run_uninstall(
+    paths: &RuntimePaths,
+    client: &AsylumClient,
+    args: UninstallArgs,
+) -> Result<()> {
+    // The daemon is running iff health responds; HostState.daemon.state is best-effort.
+    let mut state = HostState::collect(paths);
+    if client.is_healthy().await {
+        state.daemon.healthy = true;
+        state.daemon.state = ServiceState::Running;
+    }
+
+    let keep_state = args.keep.contains(&KeepKind::State);
+    let keep_logs = args.keep.contains(&KeepKind::Logs);
+    // `--keep config` is the default; `--purge` is the explicit opt-in to remove.
+    let remove_config = args.purge && !args.keep.contains(&KeepKind::Config);
+
+    let plan = build_uninstall_plan(&state, keep_state, keep_logs, remove_config);
+
+    if args.json && args.dry_run {
+        let report = UninstallReport {
+            plan,
+            executed: false,
+            results: Vec::new(),
+            remaining: None,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    if !args.json {
+        print_uninstall_plan(&plan);
+    }
+
+    if args.dry_run {
+        if !args.json {
+            println!();
+            println!("Dry run; no changes made.");
+        }
+        return Ok(());
+    }
+
+    if !args.yes && !args.json && !prompt_yes_no("Proceed with uninstall? [y/N] ")? {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    if args.purge {
+        // Typed-name confirm is non-skippable, even with --yes.
+        let typed = prompt_line(&format!(
+            "Type `asylum` to confirm purge of {}: ",
+            config_dir_path().display()
+        ))?;
+        if typed.trim() != "asylum" {
+            println!("Confirmation did not match; not purging config dir.");
+            return Ok(());
+        }
+    }
+
+    let results = execute_uninstall_plan(paths, &plan)?;
+    let remaining = HostState::collect(paths);
+
+    if args.json {
+        let report = UninstallReport {
+            plan,
+            executed: true,
+            results,
+            remaining: Some(remaining),
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!();
+        println!("Done.");
+        print_remaining_report(&remaining);
+    }
+    Ok(())
+}
+
+fn build_uninstall_plan(
+    state: &HostState,
+    keep_state: bool,
+    keep_logs: bool,
+    remove_config: bool,
+) -> Vec<PlanStep> {
+    let mut plan = Vec::new();
+    plan.push(PlanStep::StopDaemon {
+        running: matches!(state.daemon.state, ServiceState::Running),
+    });
+    plan.push(PlanStep::RemoveServiceUnit {
+        backend: state.service_unit.backend.to_string(),
+        path: state.service_unit.path.clone(),
+        installed: state.service_unit.installed,
+    });
+    plan.push(PlanStep::RemoveBinary {
+        path: state.binary.path.clone(),
+        present: state.binary.path.as_deref().map(Path::exists).unwrap_or(false),
+    });
+    if keep_state {
+        plan.push(PlanStep::KeepRuntimeDir {
+            path: state.runtime_dir.path.clone(),
+            reason: "--keep state".to_string(),
+        });
+    } else {
+        plan.push(PlanStep::RemoveRuntimeDir {
+            path: state.runtime_dir.path.clone(),
+            present: state.runtime_dir.present,
+            preserve_logs: keep_logs,
+        });
+    }
+    if remove_config {
+        plan.push(PlanStep::RemoveConfigDir {
+            path: state.config_dir.path.clone(),
+            present: state.config_dir.present,
+        });
+    } else {
+        plan.push(PlanStep::KeepConfigDir {
+            path: state.config_dir.path.clone(),
+            reason: if state.config_dir.present {
+                "preserved by default; pass --purge to remove (signing keys live here)".to_string()
+            } else {
+                "not present".to_string()
+            },
+        });
+    }
+    plan
+}
+
+fn print_uninstall_plan(plan: &[PlanStep]) {
+    println!("Uninstall plan:");
+    for step in plan {
+        match step {
+            PlanStep::StopDaemon { running } => {
+                if *running {
+                    println!("  - stop daemon (currently running)");
+                } else {
+                    println!("  - stop daemon (not running, no-op)");
+                }
+            }
+            PlanStep::RemoveServiceUnit { backend, path, installed } => match (installed, path) {
+                (true, Some(path)) => {
+                    println!("  - remove service unit ({backend}): {}", path.display())
+                }
+                (false, Some(path)) => println!(
+                    "  - service unit ({backend}) not installed at {}",
+                    path.display()
+                ),
+                (_, None) => println!("  - service unit ({backend}): n/a"),
+            },
+            PlanStep::RemoveBinary { path, present } => match (present, path) {
+                (true, Some(path)) => println!("  - remove binary: {}", path.display()),
+                (false, Some(path)) => {
+                    println!("  - binary not present at {}", path.display())
+                }
+                (_, None) => println!("  - binary path unknown"),
+            },
+            PlanStep::RemoveRuntimeDir {
+                path,
+                present,
+                preserve_logs,
+            } => {
+                if !*present {
+                    println!("  - runtime dir not present: {}", path.display());
+                } else if *preserve_logs {
+                    println!(
+                        "  - remove runtime dir, preserve logs/: {}",
+                        path.display()
+                    );
+                } else {
+                    println!("  - remove runtime dir: {}", path.display());
+                }
+            }
+            PlanStep::KeepRuntimeDir { path, reason } => {
+                println!("  - keep runtime dir ({reason}): {}", path.display());
+            }
+            PlanStep::RemoveConfigDir { path, present } => {
+                if *present {
+                    println!("  - PURGE config dir: {}", path.display());
+                } else {
+                    println!("  - config dir not present: {}", path.display());
+                }
+            }
+            PlanStep::KeepConfigDir { path, reason } => {
+                println!("  - keep config dir ({reason}): {}", path.display());
+            }
+        }
+    }
+}
+
+fn execute_uninstall_plan(
+    paths: &RuntimePaths,
+    plan: &[PlanStep],
+) -> Result<Vec<(String, StepResult)>> {
+    let mut results = Vec::new();
+
+    for step in plan {
+        match step {
+            PlanStep::StopDaemon { running } => {
+                if !*running {
+                    results.push(("stop_daemon".to_string(), StepResult::NotRunning));
+                    continue;
+                }
+                let manager = match ServiceManager::new(paths.clone()) {
+                    Ok(manager) => manager,
+                    Err(error) => {
+                        results.push((
+                            "stop_daemon".to_string(),
+                            StepResult::Failed {
+                                path: None,
+                                error: error.to_string(),
+                            },
+                        ));
+                        continue;
+                    }
+                };
+                match manager.stop() {
+                    Ok(()) => results.push(("stop_daemon".to_string(), StepResult::Stopped)),
+                    Err(error) => results.push((
+                        "stop_daemon".to_string(),
+                        StepResult::Failed {
+                            path: None,
+                            error: error.to_string(),
+                        },
+                    )),
+                }
+            }
+            PlanStep::RemoveServiceUnit {
+                backend,
+                path,
+                installed,
+            } => {
+                let key = format!("remove_service_unit:{backend}");
+                let Some(path) = path.clone() else {
+                    results.push((key, StepResult::Noop));
+                    continue;
+                };
+                if !*installed && !path.exists() {
+                    results.push((key, StepResult::NotPresent { path }));
+                    continue;
+                }
+                // Best-effort: also unload/disable via the platform tool.
+                // ServiceManager::stop() already handled launchctl unload / systemctl stop.
+                match fs::remove_file(&path) {
+                    Ok(()) => results.push((key, StepResult::Removed { path })),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        results.push((key, StepResult::NotPresent { path }))
+                    }
+                    Err(error) => results.push((
+                        key,
+                        StepResult::Failed {
+                            path: Some(path),
+                            error: error.to_string(),
+                        },
+                    )),
+                }
+            }
+            PlanStep::RemoveBinary { path, present } => {
+                let Some(path) = path.clone() else {
+                    results.push(("remove_binary".to_string(), StepResult::Noop));
+                    continue;
+                };
+                if !*present && !path.exists() {
+                    results.push(("remove_binary".to_string(), StepResult::NotPresent { path }));
+                    continue;
+                }
+                // Refuse to remove an asylum binary inside a non-bin location, as a
+                // courtesy guard (e.g. a developer workspace `target/release/asylum`).
+                let in_bin_path = path
+                    .parent()
+                    .map(|p| {
+                        p.ends_with("bin")
+                            || p.ends_with("usr/bin")
+                            || p.ends_with("local/bin")
+                    })
+                    .unwrap_or(false);
+                if !in_bin_path {
+                    results.push((
+                        "remove_binary".to_string(),
+                        StepResult::Preserved {
+                            path: path.clone(),
+                            reason: "binary not under a recognized bin dir; remove manually if intended".to_string(),
+                        },
+                    ));
+                    continue;
+                }
+                match fs::remove_file(&path) {
+                    Ok(()) => results.push(("remove_binary".to_string(), StepResult::Removed { path })),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        results.push(("remove_binary".to_string(), StepResult::NotPresent { path }))
+                    }
+                    Err(error) => results.push((
+                        "remove_binary".to_string(),
+                        StepResult::Failed {
+                            path: Some(path),
+                            error: error.to_string(),
+                        },
+                    )),
+                }
+            }
+            PlanStep::RemoveRuntimeDir {
+                path,
+                present,
+                preserve_logs,
+            } => {
+                if !*present {
+                    results.push((
+                        "remove_runtime_dir".to_string(),
+                        StepResult::NotPresent { path: path.clone() },
+                    ));
+                    continue;
+                }
+                if *preserve_logs {
+                    match remove_runtime_dir_preserving_logs(path, &paths.logs_dir()) {
+                        Ok(()) => results.push((
+                            "remove_runtime_dir".to_string(),
+                            StepResult::Preserved {
+                                path: path.clone(),
+                                reason: "logs preserved".to_string(),
+                            },
+                        )),
+                        Err(error) => results.push((
+                            "remove_runtime_dir".to_string(),
+                            StepResult::Failed {
+                                path: Some(path.clone()),
+                                error: error.to_string(),
+                            },
+                        )),
+                    }
+                } else {
+                    match fs::remove_dir_all(path) {
+                        Ok(()) => results.push((
+                            "remove_runtime_dir".to_string(),
+                            StepResult::Removed { path: path.clone() },
+                        )),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            results.push((
+                                "remove_runtime_dir".to_string(),
+                                StepResult::NotPresent { path: path.clone() },
+                            ))
+                        }
+                        Err(error) => results.push((
+                            "remove_runtime_dir".to_string(),
+                            StepResult::Failed {
+                                path: Some(path.clone()),
+                                error: error.to_string(),
+                            },
+                        )),
+                    }
+                }
+            }
+            PlanStep::KeepRuntimeDir { path, reason } => {
+                results.push((
+                    "keep_runtime_dir".to_string(),
+                    StepResult::Preserved {
+                        path: path.clone(),
+                        reason: reason.clone(),
+                    },
+                ));
+            }
+            PlanStep::RemoveConfigDir { path, present } => {
+                if !*present {
+                    results.push((
+                        "remove_config_dir".to_string(),
+                        StepResult::NotPresent { path: path.clone() },
+                    ));
+                    continue;
+                }
+                match fs::remove_dir_all(path) {
+                    Ok(()) => results.push((
+                        "remove_config_dir".to_string(),
+                        StepResult::Removed { path: path.clone() },
+                    )),
+                    Err(error) => results.push((
+                        "remove_config_dir".to_string(),
+                        StepResult::Failed {
+                            path: Some(path.clone()),
+                            error: error.to_string(),
+                        },
+                    )),
+                }
+            }
+            PlanStep::KeepConfigDir { path, reason } => {
+                results.push((
+                    "keep_config_dir".to_string(),
+                    StepResult::Preserved {
+                        path: path.clone(),
+                        reason: reason.clone(),
+                    },
+                ));
+            }
+        }
+    }
+    Ok(results)
+}
+
+fn remove_runtime_dir_preserving_logs(home: &Path, logs_dir: &Path) -> Result<()> {
+    let entries = match fs::read_dir(home) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let logs_canonical = fs::canonicalize(logs_dir).ok();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let same_as_logs = match (&logs_canonical, fs::canonicalize(&path).ok()) {
+            (Some(a), Some(b)) => a == &b,
+            _ => path == *logs_dir,
+        };
+        if same_as_logs {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("remove {}", path.display()))?;
+        } else {
+            fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn print_remaining_report(state: &HostState) {
+    println!("Remaining:");
+    println!(
+        "  runtime dir present: {}",
+        state.runtime_dir.present
+    );
+    println!("  config dir present: {}", state.config_dir.present);
+    if let Some(path) = state.binary.path.as_ref() {
+        if path.exists() {
+            println!("  binary still present: {}", path.display());
+        }
+    }
+    if !state.binary.shadowed_by.is_empty() {
+        println!("  PATH still references other asylum binaries:");
+        for path in &state.binary.shadowed_by {
+            println!("    {}", path.display());
+        }
+    }
+    if state.service_unit.installed {
+        if let Some(path) = &state.service_unit.path {
+            println!(
+                "  service unit still installed: {}",
+                path.display()
+            );
+        }
+    }
+}
+
+fn prompt_yes_no(prompt: &str) -> Result<bool> {
+    let answer = prompt_line(prompt)?;
+    Ok(matches!(
+        answer.trim().to_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn prompt_line(prompt: &str) -> Result<String> {
+    let mut stdout = io::stdout();
+    stdout.write_all(prompt.as_bytes())?;
+    stdout.flush()?;
+    let stdin = io::stdin();
+    let mut line = String::new();
+    stdin.lock().read_line(&mut line)?;
+    Ok(line)
 }
 
 async fn run_update(

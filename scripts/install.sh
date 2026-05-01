@@ -34,9 +34,7 @@ Options:
   --version <tag>       Install a specific release tag
   --install-dir <path>  Directory to install asylum binary (default: ~/.local/bin)
   --asylum-home <path>  Asylum home path (default: ~/.asylum)
-  --yes                 Run setup and doctor automatically
-  --skip-setup          Do not run or prompt for setup
-  --skip-doctor         Do not run asylum doctor
+  --skip-setup          Do not run `asylum setup` after install
   --no-color            Disable color output
 
 Examples:
@@ -99,20 +97,6 @@ asylum_error() {
   printf '%s\n' "${COLOR_ERR}!! ${msg}${COLOR_RESET}" >&2
 }
 
-asylum_path_contains() {
-  # Normalize the candidate and each PATH segment by stripping trailing slashes
-  # before comparison so /foo/bar/ and /foo/bar are treated as equal (L20).
-  local candidate="${1%/}"
-  local seg
-  local IFS=:
-  for seg in $PATH; do
-    if [[ "${seg%/}" == "$candidate" ]]; then
-      return 0
-    fi
-  done
-  return 1
-}
-
 asylum_normalize_os() {
   local raw_os=${1:-$(uname -s)}
   raw_os="$(printf '%s' "$raw_os" | tr '[:upper:]' '[:lower:]')"
@@ -161,9 +145,7 @@ asylum_parse_args() {
   VERSION=""
   INSTALL_DIR="${HOME}/.local/bin"
   ASYLUM_HOME="${HOME}/.asylum"
-  ASSUME_YES=0
   SKIP_SETUP=0
-  SKIP_DOCTOR=0
   NO_COLOR=0
   SHOW_HELP=0
 
@@ -203,16 +185,8 @@ asylum_parse_args() {
         ASYLUM_HOME=$2
         shift 2
         ;;
-      --yes)
-        ASSUME_YES=1
-        shift
-        ;;
       --skip-setup)
         SKIP_SETUP=1
-        shift
-        ;;
-      --skip-doctor)
-        SKIP_DOCTOR=1
         shift
         ;;
       --no-color)
@@ -539,238 +513,6 @@ asylum_install_binary() {
   }
 }
 
-asylum_prompt_yes_no() {
-  local question=$1
-  local response
-  printf '%s [Y/n] ' "$question"
-  read -r response
-  response="$(printf '%s' "$response" | tr '[:upper:]' '[:lower:]')"
-  case "$response" in
-    n|no)
-      return 1
-      ;;
-    *)
-      return 0
-      ;;
-  esac
-}
-
-asylum_run_setup_if_needed() {
-  local binary_path=$1
-  local interactive=$2
-
-  if (( SKIP_SETUP )); then
-    return 0
-  fi
-
-  if (( ASSUME_YES )); then
-    asylum_step "Running asylum setup"
-    ASYLUM_HOME="$ASYLUM_HOME" "$binary_path" setup
-    return $?
-  fi
-
-  if (( interactive )); then
-    if asylum_prompt_yes_no "Run asylum setup now?"; then
-      asylum_step "Running asylum setup"
-      ASYLUM_HOME="$ASYLUM_HOME" "$binary_path" setup
-      return $?
-    fi
-    printf "Setup skipped. Run %sasylum setup%s later if needed.\n" "$COLOR_OK" "$COLOR_RESET"
-  else
-    printf "Interactive mode is unavailable. Run %sasylum setup%s when ready.\n" "$COLOR_OK" "$COLOR_RESET"
-  fi
-}
-
-asylum_run_doctor_if_needed() {
-  local binary_path=$1
-
-  if (( SKIP_DOCTOR )); then
-    return 0
-  fi
-
-  asylum_step "Running asylum doctor"
-  ASYLUM_HOME="$ASYLUM_HOME" "$binary_path" doctor
-}
-
-asylum_detect_shell_rc() {
-  local shell_name
-  shell_name="${SHELL:-/bin/sh}"
-  shell_name="${shell_name##*/}"
-  case "$shell_name" in
-    zsh)
-      echo "${HOME}/.zshrc"
-      return 0
-      ;;
-    bash)
-      if [[ -f "${HOME}/.bashrc" ]]; then
-        echo "${HOME}/.bashrc"
-      elif [[ -f "${HOME}/.bash_profile" ]]; then
-        echo "${HOME}/.bash_profile"
-      elif [[ -f "${HOME}/.profile" ]]; then
-        echo "${HOME}/.profile"
-      else
-        echo "${HOME}/.bashrc"
-      fi
-      return 0
-      ;;
-    *)
-      if [[ -f "${HOME}/.profile" ]]; then
-        echo "${HOME}/.profile"
-      else
-        echo "${HOME}/.bash_profile"
-      fi
-      return 0
-      ;;
-  esac
-}
-
-# M16: single-quote-escape a string for safe embedding inside sh single quotes.
-# Replaces each ' with '"'"' so the result can be wrapped in '...' safely.
-_sq_escape() {
-  printf '%s' "$1" | sed "s/'/'\\''/g"
-}
-
-asylum_render_managed_path_block() {
-  local install_dir=$1
-  local marker="# Added by Asylum installer"
-  # M16: use single-quoted form so special chars in install_dir are safe.
-  local escaped_dir
-  escaped_dir="$(_sq_escape "$install_dir")"
-
-  printf '%s\n' "$marker"
-  printf "if [[ \":\$PATH:\" != *\":'%s':\"* ]]; then\n" "$escaped_dir"
-  printf "  export PATH='%s':\"\$PATH\"\n" "$escaped_dir"
-  printf 'fi\n'
-}
-
-asylum_apply_path_to_shell_rc() {
-  local install_dir=$1
-  local rc_file
-  local marker="# Added by Asylum installer"
-  local has_managed_block=0
-  rc_file="$(asylum_detect_shell_rc)"
-
-  if [[ -f "$rc_file" ]] && grep -Fxq "$marker" "$rc_file" 2>/dev/null; then
-    has_managed_block=1
-  fi
-
-  if (( ! has_managed_block )) && asylum_path_contains "$install_dir"; then
-    return 0
-  fi
-
-  if [[ ! -f "$rc_file" ]]; then
-    touch "$rc_file"
-  fi
-
-  # M16: all writes to rc_file use atomic temp+mv to avoid partial writes.
-  if (( has_managed_block )); then
-    local tmp_rc
-    local clean_rc
-    local final_rc
-    tmp_rc="$(mktemp)"
-    clean_rc="$(mktemp)"
-    final_rc="$(mktemp "${rc_file}.tmp.XXXXXX")"
-
-    awk -v marker="$marker" '
-      $0 == marker { in_block=1; next }
-      in_block {
-        if ($0 == "fi") {
-          in_block=0
-        }
-        next
-      }
-      { print }
-    ' "$rc_file" > "$tmp_rc"
-
-    awk '
-      { lines[NR]=$0 }
-      END {
-        end=NR
-        while (end > 0 && lines[end] == "") {
-          end--
-        }
-        for (i = 1; i <= end; i++) {
-          print lines[i]
-        }
-      }
-    ' "$tmp_rc" > "$clean_rc"
-
-    cat "$clean_rc" > "$final_rc"
-    if [[ -s "$final_rc" ]]; then
-      printf '\n' >> "$final_rc"
-    fi
-    asylum_render_managed_path_block "$install_dir" >> "$final_rc"
-    mv -f "$final_rc" "$rc_file"
-    rm -f "$tmp_rc" "$clean_rc"
-    return 0
-  fi
-
-  local tmp_rc
-  local final_rc
-  tmp_rc="$(mktemp)"
-  final_rc="$(mktemp "${rc_file}.tmp.XXXXXX")"
-  awk '
-    { lines[NR]=$0 }
-    END {
-      end=NR
-      while (end > 0 && lines[end] == "") {
-        end--
-      }
-      for (i = 1; i <= end; i++) {
-        print lines[i]
-      }
-    }
-  ' "$rc_file" > "$tmp_rc"
-
-  cat "$tmp_rc" > "$final_rc"
-  if [[ -s "$final_rc" ]]; then
-    printf '\n' >> "$final_rc"
-  fi
-  asylum_render_managed_path_block "$install_dir" >> "$final_rc"
-  mv -f "$final_rc" "$rc_file"
-  rm -f "$tmp_rc"
-}
-
-asylum_shell_rc_has_managed_path_block() {
-  local rc_file
-  local marker="# Added by Asylum installer"
-  rc_file="$(asylum_detect_shell_rc)"
-  [[ -f "$rc_file" ]] && grep -Fxq "$marker" "$rc_file" 2>/dev/null
-}
-
-asylum_print_path_instructions() {
-  local install_dir=$1
-  local rc_file
-  rc_file="$(asylum_detect_shell_rc)"
-  printf 'Asylum installed but not yet on PATH for this shell.\n'
-  printf 'Add this line to %s and restart your shell:\n' "$rc_file"
-  printf '  export PATH="%s:$PATH"\n' "$install_dir"
-}
-
-asylum_next_steps() {
-  printf '\n'
-  asylum_colorize "$COLOR_LABEL" "Next steps:"
-  printf '\n'
-  printf '  asylum setup\n'
-  printf '  asylum doctor\n'
-  printf '  asylum\n'
-  printf '\n'
-  if asylum_shell_rc_has_managed_path_block; then
-    if ! asylum_apply_path_to_shell_rc "${INSTALL_DIR}"; then
-      asylum_print_path_instructions "${INSTALL_DIR}"
-    fi
-    return 0
-  fi
-  if ! asylum_path_contains "${INSTALL_DIR}"; then
-    if [[ -t 0 && "${ASSUME_YES}" -eq 1 ]]; then
-      if ! asylum_apply_path_to_shell_rc "${INSTALL_DIR}"; then
-        asylum_print_path_instructions "${INSTALL_DIR}"
-      fi
-    else
-      asylum_print_path_instructions "${INSTALL_DIR}"
-    fi
-  fi
-}
 
 asylum_main() {
   local parse_result=0
@@ -834,21 +576,15 @@ asylum_main() {
   asylum_step "Installing asylum to ${INSTALL_DIR}"
   asylum_install_binary "$extracted_binary" "$INSTALL_DIR"
 
-  asylum_step "Creating Asylum home at ${ASYLUM_HOME}"
-  mkdir -p "${ASYLUM_HOME}" "${ASYLUM_HOME}/logs" "${ASYLUM_HOME}/run"
-
   if (( SKIP_SETUP )); then
     printf "Setup skipped by flag: %s--skip-setup%s\n" "$COLOR_WARN" "$COLOR_RESET"
+    printf "Run %sasylum setup%s when ready.\n" "$COLOR_OK" "$COLOR_RESET"
+    return 0
   fi
 
-  local interactive=0
-  if [[ -t 0 ]]; then
-    interactive=1
-  fi
-
-  asylum_run_setup_if_needed "${INSTALL_DIR}/asylum" "$interactive"
-  asylum_run_doctor_if_needed "${INSTALL_DIR}/asylum"
-  asylum_next_steps
+  asylum_step "Handing off to asylum setup"
+  export ASYLUM_HOME
+  exec "${INSTALL_DIR}/asylum" setup
 }
 
 INSTALLER_SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
