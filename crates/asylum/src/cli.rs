@@ -192,6 +192,7 @@ enum Command {
     /// Stop the daemon if running.
     #[command(after_help = "Examples:\n  asylum stop\n  asylum stop && asylum status")]
     Stop,
+    /// Stop and start the daemon.
     Restart,
     /// Show host and daemon state.
     #[command(after_help = "Examples:\n  asylum status\n  asylum status --json\n  asylum status --json | jq .daemon")]
@@ -205,6 +206,7 @@ enum Command {
         #[arg(long)]
         verbose: bool,
     },
+    /// Show daemon logs (use --tail to follow).
     Logs {
         #[arg(long)]
         tail: bool,
@@ -215,10 +217,12 @@ enum Command {
         #[arg(long)]
         version: Option<String>,
     },
+    /// Run the daemon in the foreground (used by service units; you usually want `start`).
     Serve {
         #[command(flatten)]
         serve: ServeConfig,
     },
+    /// Manage the on-disk config (init / show).
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -232,10 +236,12 @@ enum Command {
     /// Remove Asylum from this machine. Stops daemon, removes service unit, binary, ~/.asylum.
     #[command(after_help = "Examples:\n  asylum uninstall --dry-run\n  asylum uninstall --keep state\n  asylum uninstall --purge   # also removes ~/.config/asylum (signing keys)")]
     Uninstall(UninstallArgs),
+    /// Manage harness nodes (create / list / stop).
     Node {
         #[command(subcommand)]
         command: NodeCommand,
     },
+    /// Inspect the live node graph.
     Graph {
         #[command(subcommand)]
         command: GraphCommand,
@@ -245,14 +251,17 @@ enum Command {
     Attach {
         node_id: Uuid,
     },
+    /// Issue and manage owner tokens.
     Token {
         #[command(subcommand)]
         command: TokenCommand,
     },
+    /// Send a notification through the configured ntfy channel.
     Notify {
         #[command(subcommand)]
         command: NotifyCommand,
     },
+    /// Run the MCP server over stdio (for editor integrations).
     Mcp,
 }
 
