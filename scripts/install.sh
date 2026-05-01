@@ -189,6 +189,12 @@ asylum_parse_args() {
         SKIP_SETUP=1
         shift
         ;;
+      --skip-doctor|--yes)
+        # Accepted-but-no-op for back-compat with `asylum update` from
+        # v0.1.2 and earlier. The installer no longer runs doctor or
+        # prompts, so these flags have nothing to do.
+        shift
+        ;;
       --no-color)
         NO_COLOR=1
         shift
