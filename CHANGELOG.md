@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.4 — 2026-04-30
+
+### Added
+
+- **Unified ASYLUM block-letter banner** on first-run greeting moments: bare `asylum` invocation when `~/.asylum` does not exist, and the welcome screen after first-time `asylum setup`. Same ANSI Shadow art as the installer, centralized as the `ASYLUM_BANNER` const + `print_asylum_banner()` helper.
+
+### Fixed
+
+- **Installer banner ASCII art** — replaced the long-broken figlet output (a leftover from a prior project name) with proper block letters that actually spell ASYLUM.
+- **`asylum update` from v0.1.2 and earlier** — `scripts/install.sh` now silently accepts `--skip-doctor` and `--yes` as no-op flags so older `asylum update` invocations can self-upgrade through to the new installer instead of erroring on unknown options.
+
 ## 0.1.3 — 2026-04-30
 
 ### Added
