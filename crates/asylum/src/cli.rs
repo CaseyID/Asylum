@@ -520,9 +520,24 @@ fn run_setup(paths: &RuntimePaths) -> Result<()> {
     Ok(())
 }
 
+const ASYLUM_BANNER: &str = concat!(
+    " █████╗ ███████╗██╗   ██╗██╗     ██╗   ██╗███╗   ███╗\n",
+    "██╔══██╗██╔════╝╚██╗ ██╔╝██║     ██║   ██║████╗ ████║\n",
+    "███████║███████╗ ╚████╔╝ ██║     ██║   ██║██╔████╔██║\n",
+    "██╔══██║╚════██║  ╚██╔╝  ██║     ██║   ██║██║╚██╔╝██║\n",
+    "██║  ██║███████║   ██║   ███████╗╚██████╔╝██║ ╚═╝ ██║\n",
+    "╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝ ╚═════╝ ╚═╝     ╚═╝",
+);
+
+fn print_asylum_banner() {
+    println!();
+    println!("{ASYLUM_BANNER}");
+    println!();
+}
+
 fn print_first_run_banner(paths: &RuntimePaths) {
     let post_state = HostState::collect(paths);
-    println!();
+    print_asylum_banner();
     println!("Welcome to Asylum.");
     println!();
     println!("Asylum runs as a small daemon on this machine, with a local web Cockpit");
@@ -547,6 +562,7 @@ fn print_first_run_banner(paths: &RuntimePaths) {
 }
 
 fn run_first_run_banner(paths: &RuntimePaths) {
+    print_asylum_banner();
     println!("Asylum is installed but not yet set up on this machine.");
     println!();
     println!("Asylum home would live at: {}", paths.home.display());
