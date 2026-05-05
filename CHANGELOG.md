@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `asylum update` now refreshes an already-installed launchd/systemd service definition even when the daemon is stopped, so stale commands like the removed `asylum serve` cannot survive a binary update.
+- Post-update doctor output now runs through the freshly installed `asylum` binary instead of the still-running self-replaced process, avoiding misleading `(deleted)` binary paths and old version strings immediately after update.
+
 ## 0.1.5 — 2026-05-05
 
 ### Changed

@@ -132,6 +132,22 @@ impl ServiceManager {
         render_systemd_unit(&self.render_config(bind))
     }
 
+    pub fn service_unit_installed(&self) -> bool {
+        match self.backend {
+            ServiceBackend::Launchd => self.launchd_plist_path().exists(),
+            ServiceBackend::SystemdUser => self.systemd_unit_path().exists(),
+            ServiceBackend::PidFallback => false,
+        }
+    }
+
+    pub fn refresh_installed_unit(&self, bind: &str) -> Result<bool> {
+        let refreshed = self.refresh_installed_unit_file(bind)?.is_some();
+        if refreshed {
+            self.reload_service_definitions();
+        }
+        Ok(refreshed)
+    }
+
     pub fn read_running_pid(&self) -> Option<u32> {
         let pid = self.read_pid()?;
         if process_is_running(pid) && self.pid_identity(pid) == PidIdentity::Matches {
@@ -191,6 +207,39 @@ impl ServiceManager {
             Ok(())
         } else {
             self.start_pid_fallback(bind)
+        }
+    }
+
+    fn refresh_installed_unit_file(&self, bind: &str) -> Result<Option<PathBuf>> {
+        match self.backend {
+            ServiceBackend::Launchd => {
+                let plist = self.launchd_plist_path();
+                if !plist.exists() {
+                    return Ok(None);
+                }
+                fs::write(&plist, self.launchd_plist_text(bind))
+                    .with_context(|| format!("refresh launchd plist {}", plist.display()))?;
+                Ok(Some(plist))
+            }
+            ServiceBackend::SystemdUser => {
+                let unit = self.systemd_unit_path();
+                if !unit.exists() {
+                    return Ok(None);
+                }
+                fs::write(&unit, self.systemd_unit_text(bind))
+                    .with_context(|| format!("refresh systemd unit {}", unit.display()))?;
+                Ok(Some(unit))
+            }
+            ServiceBackend::PidFallback => Ok(None),
+        }
+    }
+
+    fn reload_service_definitions(&self) {
+        if self.backend == ServiceBackend::SystemdUser {
+            let _ = ProcessCommand::new("systemctl")
+                .arg("--user")
+                .arg("daemon-reload")
+                .status();
         }
     }
 
@@ -996,6 +1045,9 @@ fn dir_size(path: &Path) -> std::io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn render_config() -> ServiceRenderConfig {
         ServiceRenderConfig {
@@ -1045,6 +1097,51 @@ mod tests {
         assert_eq!(rendered, "\"/tmp/asylum\\nbin/\\x07asylum\"");
         assert!(!rendered.contains('\n'));
         assert!(!rendered.contains('\u{0007}'));
+    }
+
+    #[test]
+    fn refresh_installed_systemd_unit_file_rewrites_stale_serve_command() -> anyhow::Result<()> {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let tempdir = tempfile::tempdir()?;
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", tempdir.path());
+
+        let result = (|| -> anyhow::Result<(Option<PathBuf>, PathBuf, String)> {
+            let paths = RuntimePaths::from_values(
+                Some(tempdir.path().join(".asylum")),
+                None,
+                None,
+                Some(tempdir.path().join(".config").join("asylum")),
+            );
+            paths.ensure_dirs()?;
+            let manager = ServiceManager::with_backend(
+                paths,
+                PathBuf::from("/home/test/.local/bin/asylum"),
+                ServiceBackend::SystemdUser,
+            );
+            let unit_path = manager.systemd_unit_location();
+            fs::create_dir_all(unit_path.parent().expect("unit parent"))?;
+            fs::write(
+                &unit_path,
+                "ExecStart=\"/home/test/.local/bin/asylum\" serve --config \"/tmp/old.toml\"\n",
+            )?;
+
+            let refreshed = manager.refresh_installed_unit_file("127.0.0.1:7717")?;
+            let unit = fs::read_to_string(&unit_path)?;
+            Ok((refreshed, unit_path, unit))
+        })();
+
+        if let Some(previous_home) = previous_home {
+            std::env::set_var("HOME", previous_home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        let (refreshed, unit_path, unit) = result?;
+        assert_eq!(refreshed, Some(unit_path.clone()));
+        assert!(unit.contains("ExecStart=\"/home/test/.local/bin/asylum\" daemon run --config"));
+        assert!(!unit.contains(" serve "));
+        Ok(())
     }
 
     #[test]

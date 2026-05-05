@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use crate::client::AsylumClient;
 use crate::host::{
-    command_exists, config_dir_path, require_binary, service_state_from_health, HostState,
-    PortInUse, ServiceBackend, ServiceManager, ServiceState,
+    command_exists, config_dir_path, require_binary, select_backend, service_state_from_health,
+    HostState, PortInUse, ServiceBackend, ServiceManager, ServiceState,
 };
 use crate::mcp;
 use crate::native_attach::format_native_attach_prompt;
@@ -1733,6 +1733,7 @@ async fn run_update(
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| anyhow!("could not determine asylum installation directory"))?;
+    let installed_binary = install_dir.join("asylum");
     let mut cleanup_installer = None;
     let installer = match update_installer_source(&current_exe) {
         UpdateInstallerSource::Local(installer_path) => installer_path,
@@ -1743,9 +1744,14 @@ async fn run_update(
         }
     };
 
-    let manager = ServiceManager::new(paths.clone())?;
-    let restart_bind = if update_needs_running_service(client.is_healthy().await, manager.status())
-    {
+    let manager =
+        ServiceManager::with_backend(paths.clone(), installed_binary.clone(), select_backend());
+    let followup = update_followup_plan(
+        client.is_healthy().await,
+        manager.status(),
+        manager.service_unit_installed(),
+    );
+    let restart_bind = if followup.restart_service {
         Some(effective_service_bind(paths)?)
     } else {
         None
@@ -1790,9 +1796,14 @@ async fn run_update(
         if let Err(error) = restart_service_after_update(&manager, client, bind).await {
             restart_error = Some(error);
         }
+    } else if followup.refresh_installed_service_unit {
+        let bind = effective_service_bind(paths)?;
+        if manager.refresh_installed_unit(&bind.to_string())? {
+            println!("Asylum service unit refreshed");
+        }
     }
 
-    let doctor_result = run_doctor(paths, client, false).await;
+    let doctor_result = run_post_update_doctor(&installed_binary, paths);
     match (restart_error, doctor_result) {
         (None, result) => result,
         (Some(restart_err), Ok(())) => Err(restart_err),
@@ -1827,6 +1838,45 @@ fn update_needs_running_service(healthy: bool, service_state: ServiceState) -> b
         service_state_from_health(healthy, service_state),
         ServiceState::Running
     )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct UpdateFollowupPlan {
+    restart_service: bool,
+    refresh_installed_service_unit: bool,
+}
+
+fn update_followup_plan(
+    healthy: bool,
+    service_state: ServiceState,
+    service_unit_installed: bool,
+) -> UpdateFollowupPlan {
+    let restart_service = update_needs_running_service(healthy, service_state);
+    UpdateFollowupPlan {
+        restart_service,
+        refresh_installed_service_unit: !restart_service && service_unit_installed,
+    }
+}
+
+fn post_update_doctor_args(paths: &RuntimePaths) -> Vec<String> {
+    vec![
+        "--config".to_string(),
+        paths.config.display().to_string(),
+        "doctor".to_string(),
+    ]
+}
+
+fn run_post_update_doctor(binary: &Path, paths: &RuntimePaths) -> Result<()> {
+    let status = ProcessCommand::new(binary)
+        .args(post_update_doctor_args(paths))
+        .env("ASYLUM_HOME", &paths.home)
+        .status()
+        .with_context(|| format!("run post-update doctor {}", binary.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("post-update doctor exited with {status}"))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2195,6 +2245,35 @@ mod tests {
             false,
             ServiceState::Unknown("launchd".to_string())
         ));
+    }
+
+    #[test]
+    fn update_refreshes_stopped_installed_service_units() {
+        let plan = update_followup_plan(false, ServiceState::Stopped, true);
+        assert!(!plan.restart_service);
+        assert!(plan.refresh_installed_service_unit);
+    }
+
+    #[test]
+    fn update_does_not_create_service_units_for_stopped_non_service_installs() {
+        let plan = update_followup_plan(false, ServiceState::Stopped, false);
+        assert!(!plan.restart_service);
+        assert!(!plan.refresh_installed_service_unit);
+    }
+
+    #[test]
+    fn post_update_doctor_uses_fresh_binary_cli_shape() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_values(Some(tempdir.path().to_path_buf()), None, None, None);
+        let args = post_update_doctor_args(&paths);
+        assert_eq!(
+            args,
+            vec![
+                "--config".to_string(),
+                paths.config.display().to_string(),
+                "doctor".to_string(),
+            ]
+        );
     }
 
     #[test]
