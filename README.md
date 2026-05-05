@@ -8,7 +8,9 @@ The core product object is the **Node**: a live or resumable harness session run
 
 ## Start Here
 
+- Current product spec: [docs/specs/asylum-current-product-spec.md](docs/specs/asylum-current-product-spec.md)
 - Product PRD: [docs/prd/asylum-live-v2-prd.md](docs/prd/asylum-live-v2-prd.md)
+- Spec coverage audit brief: [docs/reviews/2026-05-05-asylum-spec-coverage-audit-brief.md](docs/reviews/2026-05-05-asylum-spec-coverage-audit-brief.md)
 - Implementation-planning handoff: [docs/handoff/transition-to-implementation-planning.md](docs/handoff/transition-to-implementation-planning.md)
 - Source and context trail: [docs/context/source-trail.md](docs/context/source-trail.md)
 

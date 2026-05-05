@@ -8,7 +8,9 @@ A single-user, always-on control plane for real agent harness sessions (Codex, C
 
 The core product object is the **Node**: a live or resumable harness session. Roles (command-center, supervisor, worker, evaluator, assistant) are hints, not mandatory workflow states. The cockpit is the primary first-party UI; CLI, MCP, and API share the same root capabilities.
 
-Full PRD: [docs/prd/asylum-live-v2-prd.md](docs/prd/asylum-live-v2-prd.md).
+Canonical current product spec: [docs/specs/asylum-current-product-spec.md](docs/specs/asylum-current-product-spec.md).
+
+Original PRD / product-intent source: [docs/prd/asylum-live-v2-prd.md](docs/prd/asylum-live-v2-prd.md).
 
 ## Current focus — read this if you're picking up active work
 
@@ -20,6 +22,8 @@ Full PRD: [docs/prd/asylum-live-v2-prd.md](docs/prd/asylum-live-v2-prd.md).
 - **Prior ultrareview (companion findings, all addressed):** [docs/reviews/2026-04-29-local-ultrareview-findings.md](docs/reviews/2026-04-29-local-ultrareview-findings.md)
 
 **Active follow-up under discussion:** ntfy inbound auto-routing into node input streams. Transport works; addressing/correlation does not. Design notes in the delivery handoff; no PR open yet.
+
+**Current spec coverage audit brief:** [docs/reviews/2026-05-05-asylum-spec-coverage-audit-brief.md](docs/reviews/2026-05-05-asylum-spec-coverage-audit-brief.md) — use this for the next full repo-vs-spec gap audit.
 
 ## The principle that drives current work
 
