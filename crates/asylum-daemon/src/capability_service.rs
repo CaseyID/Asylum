@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use asylum_core::api::{
+use asylum_types::api::{
     AttachResponse, CapabilityListResponse, ClientConfigResponse, CreateNodeRequest,
     GraphGetResponse, HarnessDescriptor, HarnessDescriptorResponse, HarnessListResponse,
     HealthResponse, LaunchPacketResponse, NativeAttachResponse, NodeCreateResponse,
@@ -10,24 +10,24 @@ use asylum_core::api::{
     SubstrateDescriptor, SubstrateDescriptorResponse, SubstrateHealth, SubstrateListResponse,
     TokenIssueResponse,
 };
-use asylum_core::capabilities::CapabilityDescriptor;
-use asylum_core::capabilities::CapabilityName;
-use asylum_core::event::NodeEventKind;
-use asylum_core::node::{
+use asylum_types::capabilities::CapabilityDescriptor;
+use asylum_types::capabilities::CapabilityName;
+use asylum_types::event::NodeEventKind;
+use asylum_types::node::{
     CapabilitySnapshot, GraphRecord, HarnessKind, NodeLiveness, SubstrateKind,
 };
-use asylum_core::relationship::RelationshipKind;
-use asylum_core::security::TokenRequest;
+use asylum_types::relationship::RelationshipKind;
+use asylum_types::security::TokenRequest;
 use serde_json::{json, Value as JsonValue};
 use uuid::Uuid;
 
 use crate::attach::AttachTokenIssuer;
 use crate::auth::{issue_owner_token, AuthMode};
+use crate::channels::ntfy_inbound::NtfyInboundConfig;
 use crate::channels::{
     descriptor_from_row, message_record_from_row, ntfy_inbound, render_template, require_channel,
     seed_builtin_channels, SeedConfig, NTFY_DEFAULT_ID,
 };
-use crate::channels::ntfy_inbound::NtfyInboundConfig;
 use crate::harness::HarnessRegistry;
 use crate::hooks::{
     evaluate_filter, event_catalog, firing_record_from_row, rule_from_row, HookEngine, HookEvent,
@@ -39,20 +39,21 @@ use crate::remote_commands::{ParsedRemoteCommand, RemoteCommandKind};
 use crate::storage::Store;
 use crate::substrate::loon::{capability_flags_from_health, LoonHealth, LoonSubstrate};
 use crate::substrate::{LocalSubstrate, SubstrateContext};
-use asylum_core::api::{
+use asylum_types::api::{
     ChannelCreateRequest, ChannelDescriptor, ChannelInboundRequest, ChannelListResponse,
     ChannelMessagesResponse, ChannelTestRequest, ChannelTestResponse, ChannelUpdateRequest,
     ForkNodeRequest, HookAction, HookCreateRequest, HookEventCatalogResponse, HookFiringsResponse,
     HookListResponse, HookRule, HookTestResponse, HookUpdateRequest, RecipeDescriptor,
     RecipeListResponse, RecipeSpawnRequest, RecipeSpawnResponse,
 };
-use asylum_core::config::{HarnessConfig, LoonConfig};
-use asylum_core::node::NodeRecord;
+use asylum_types::config::{HarnessConfig, LoonConfig};
+use asylum_types::node::NodeRecord;
 
 #[derive(Clone)]
 pub struct AppConfig {
     pub base_url: String,
     pub bind_addr: String,
+    pub socket_path: Option<String>,
     pub transcripts_dir: String,
     pub workspace_recent_limit: usize,
     pub ntfy_server: Option<String>,
@@ -789,21 +790,23 @@ impl CapabilityService {
             status: "ok".to_string(),
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             bind_addr: self.config.bind_addr.clone(),
+            base_url: self.config.base_url.clone(),
+            socket_path: self.config.socket_path.clone(),
             database_path: self.store.path().to_string(),
             database_size_bytes,
             transcripts_dir: self.config.transcripts_dir.clone(),
         }
     }
 
-    pub async fn list_tokens(&self) -> Result<asylum_core::api::TokenListResponse> {
+    pub async fn list_tokens(&self) -> Result<asylum_types::api::TokenListResponse> {
         let tokens = self.store.list_all_tokens()?;
-        Ok(asylum_core::api::TokenListResponse { tokens })
+        Ok(asylum_types::api::TokenListResponse { tokens })
     }
 
     pub async fn rotate_token(
         &self,
         token_id: Uuid,
-    ) -> Result<asylum_core::api::TokenRotateResponse> {
+    ) -> Result<asylum_types::api::TokenRotateResponse> {
         use crate::auth::issue_owner_token;
         let meta = self
             .store
@@ -825,13 +828,13 @@ impl CapabilityService {
             &serde_json::to_string(&issued.scope)?,
             issued.expires_at_epoch_secs,
         )?;
-        let new_token = asylum_core::api::TokenIssueResponse {
+        let new_token = asylum_types::api::TokenIssueResponse {
             id: issued.token_id.to_string(),
             raw_token: issued.raw_token,
             scope: issued.scope,
             expires_at_epoch_secs: issued.expires_at_epoch_secs,
         };
-        Ok(asylum_core::api::TokenRotateResponse {
+        Ok(asylum_types::api::TokenRotateResponse {
             old_id: token_id.to_string(),
             new_token,
         })
@@ -1081,7 +1084,7 @@ impl CapabilityService {
     pub async fn create_relationship(
         &self,
         request: RelationshipCreateRequest,
-    ) -> Result<asylum_core::relationship::RelationshipRecord> {
+    ) -> Result<asylum_types::relationship::RelationshipRecord> {
         let source = Uuid::parse_str(&request.source_node_id)?;
         let target = Uuid::parse_str(&request.target_node_id)?;
         let kind = parse_relationship_kind(&request.kind)?;
@@ -1212,7 +1215,11 @@ impl CapabilityService {
     pub async fn attach_native_target(&self, node_id: Uuid) -> Result<NativeAttachResponse> {
         self.store.get_node(node_id)?.context("node not found")?;
         let mut environment = std::collections::BTreeMap::new();
-        environment.insert("ASYLUM_BASE_URL".to_string(), self.config.base_url.clone());
+        if let Some(socket_path) = &self.config.socket_path {
+            environment.insert("ASYLUM_SOCKET_PATH".to_string(), socket_path.clone());
+        } else {
+            environment.insert("ASYLUM_BASE_URL".to_string(), self.config.base_url.clone());
+        }
         Ok(NativeAttachResponse {
             label: "Open in Terminal".to_string(),
             command: "asylum".to_string(),
@@ -1557,7 +1564,7 @@ impl CapabilityService {
         topic: Option<String>,
         token: Option<String>,
     ) -> Result<bool> {
-        let configured = asylum_core::config::NtfyConfig {
+        let configured = asylum_types::config::NtfyConfig {
             server: server.or_else(|| self.config.ntfy_server.clone()),
             topic: topic.or_else(|| self.config.ntfy_topic.clone()),
             token: token.or_else(|| self.config.ntfy_token.clone()),
@@ -1864,7 +1871,7 @@ impl CapabilityService {
         let mut node_ids = Vec::new();
         if is_fanout {
             let supervisor = self
-                .create_node(asylum_core::api::CreateNodeRequest {
+                .create_node(asylum_types::api::CreateNodeRequest {
                     harness: request.harness.clone(),
                     substrate: request.substrate.clone(),
                     role_hint: "supervisor".to_string(),
@@ -1878,7 +1885,7 @@ impl CapabilityService {
             node_ids.push(supervisor.node_id.clone());
             for _ in 0..2 {
                 let worker = self
-                    .create_node(asylum_core::api::CreateNodeRequest {
+                    .create_node(asylum_types::api::CreateNodeRequest {
                         harness: request.harness.clone(),
                         substrate: request.substrate.clone(),
                         role_hint: "worker".to_string(),
@@ -1900,7 +1907,7 @@ impl CapabilityService {
         } else {
             let role = request.role_hint.unwrap_or_else(|| "worker".to_string());
             let single = self
-                .create_node(asylum_core::api::CreateNodeRequest {
+                .create_node(asylum_types::api::CreateNodeRequest {
                     harness: request.harness.clone(),
                     substrate: request.substrate.clone(),
                     role_hint: role,
@@ -1924,7 +1931,7 @@ impl CapabilityService {
         let workspace = request.workspace.or(source.workspace.clone());
         let description = request.description.unwrap_or(source.description.clone());
         let response = self
-            .create_node(asylum_core::api::CreateNodeRequest {
+            .create_node(asylum_types::api::CreateNodeRequest {
                 harness: source.harness.to_string(),
                 substrate: source.substrate.to_string(),
                 role_hint,
@@ -2013,7 +2020,7 @@ fn resolve_remote_decision(
 mod tests {
     use super::*;
     use crate::auth::hash_token;
-    use asylum_core::config::AsylumConfig;
+    use asylum_types::config::AsylumConfig;
     use std::collections::HashMap;
 
     fn test_app_config() -> AppConfig {
@@ -2021,6 +2028,7 @@ mod tests {
         AppConfig {
             base_url: core.base_url,
             bind_addr: "127.0.0.1:7717".to_string(),
+            socket_path: None,
             transcripts_dir: "/tmp/asylum-test/transcripts".to_string(),
             workspace_recent_limit: core.workspace.recent_limit,
             ntfy_server: core.ntfy.server,
@@ -2242,7 +2250,7 @@ mod tests {
             test_app_config(),
         );
 
-        use asylum_core::security::TokenRequest;
+        use asylum_types::security::TokenRequest;
         service
             .issue_token(TokenRequest {
                 name: "token-a".to_string(),
@@ -2264,7 +2272,10 @@ mod tests {
         // must never include raw_token or hash
         let token_value = serde_json::to_value(&list.tokens[0]).unwrap();
         let obj = token_value.as_object().unwrap();
-        assert!(!obj.contains_key("raw_token"), "raw_token must not be in token list");
+        assert!(
+            !obj.contains_key("raw_token"),
+            "raw_token must not be in token list"
+        );
         assert!(!obj.contains_key("hash"), "hash must not be in token list");
         assert!(!obj.contains_key("raw"), "raw must not be in token list");
         Ok(())
@@ -2283,7 +2294,7 @@ mod tests {
             test_app_config(),
         );
 
-        use asylum_core::security::TokenRequest;
+        use asylum_types::security::TokenRequest;
         let issued = service
             .issue_token(TokenRequest {
                 name: "operator".to_string(),

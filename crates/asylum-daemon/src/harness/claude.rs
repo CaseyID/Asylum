@@ -1,5 +1,5 @@
-use asylum_core::node::CapabilitySnapshot;
-use asylum_core::node::HarnessKind;
+use asylum_types::node::CapabilitySnapshot;
+use asylum_types::node::HarnessKind;
 
 use crate::harness::launch_context::LaunchContext;
 
@@ -43,7 +43,7 @@ impl super::HarnessAdapter for ClaudeHarness {
         }
     }
 
-    fn launch_context(&self, request: &asylum_core::api::CreateNodeRequest) -> String {
+    fn launch_context(&self, request: &asylum_types::api::CreateNodeRequest) -> String {
         let context = LaunchContext {
             node_id: uuid::Uuid::new_v4(),
             workspace: request.workspace.clone().map(std::path::PathBuf::from),

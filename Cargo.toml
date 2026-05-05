@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/asylum-core", "crates/asylum-daemon", "crates/asylum"]
+members = [
+    "crates/asylum-types",
+    "crates/asylum-daemon",
+    "crates/asylum-cli",
+    "crates/asylum",
+]
 resolver = "2"
 
 [workspace.package]

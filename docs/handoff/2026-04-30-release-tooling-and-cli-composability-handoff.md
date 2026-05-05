@@ -2,6 +2,8 @@
 
 This handoff captures session state for a fresh agent picking up after context compaction. Three threads are in play: (1) release tooling work that just shipped, (2) the user's machine state for an upcoming end-to-end install test, and (3) an open architectural proposal around CLI composability and a new `asylum uninstall` command.
 
+Architecture note: crate layout and daemon-entry details are superseded by [the finalized architecture refactor spec](../reviews/2026-05-04-asylum-architecture-refactor-spec.md): one installed `asylum` binary, `asylum daemon run` for foreground daemon mode, no `asylum serve`, `asylum`/`asylum-cli`/`asylum-daemon`/`asylum-types` crates, and Unix-socket CLI/MCP local control at `~/.asylum/run/asylum.sock`.
+
 ## Release status
 
 - **v0.1.2** (tag `922e951`) — Published with full platform parity: `darwin-arm64`, `darwin-x86_64`, `linux-arm64`, `linux-x86_64` archives + signed `checksums.txt.minisig`. End-to-end signature verification confirmed against the embedded pubkey.
@@ -55,7 +57,7 @@ User's most recent direction: persist this state and start a fresh session, so s
 
 User explicitly wants composable CLI commands where install/uninstall/update/doctor share machinery via the binary itself, not duplicate logic in shell. They also want a friendly `asylum uninstall` that confirms before acting. North-star architecture proposed:
 
-**Layer 1 — shared inspection library (new, in `crates/asylum-core/`):**
+**Layer 1 — shared inspection library (in `crates/asylum-cli/`):**
 - A `HostState` struct: binary location + version, daemon state (running/stopped/missing), `~/.asylum` contents, ports in use, systemd unit presence, cockpit assets, etc.
 - Returned both as a Rust struct (in-process callers) and via `--json` (shell callers).
 
@@ -70,7 +72,7 @@ User explicitly wants composable CLI commands where install/uninstall/update/doc
 
 **Layer 3 — `scripts/install.sh` becomes a thin bootstrap:**
 1. Detect OS/arch, download + verify + place the binary.
-2. Hand off: `exec "$INSTALL_DIR/asylum" install --post-bootstrap`.
+2. Hand off: `exec "$INSTALL_DIR/asylum" setup`.
 
 After bootstrap, **every** lifecycle operation lives in the binary. Shell exists only because of the chicken-and-egg.
 
@@ -90,7 +92,7 @@ For ergonomic iteration on the CLI without cutting releases:
 | Fresh binary on PATH | Want `asylum` to behave like the installed version | `cargo install --path crates/asylum --force` (overwrites `~/.cargo/bin/asylum`; check `which asylum` for shadowing vs `~/.local/bin/asylum`) |
 | **Live-build symlink (most ergonomic)** | Iterating on CLI | `ln -sf "$PWD/target/release/asylum" ~/.local/bin/asylum`; then `cargo build --release -p asylum` and the next `asylum` invocation is the new code |
 
-Daemon dev: `cargo run -p asylum-daemon -- start`. Cockpit dev: `npm --prefix cockpit run dev` (Vite hot reload, proxies `/api/*` to daemon).
+Daemon dev: `cargo run -p asylum -- daemon run`. Cockpit dev: `npm --prefix cockpit run dev` (Vite hot reload, proxies `/api/*` to daemon).
 
 Runtime files asylum needs: just `~/.asylum/` (created by `asylum setup`, idempotent). Whether the binary got there via install.sh or `cargo build`, you run `asylum setup` once.
 

@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::client::AsylumClient;
@@ -20,28 +20,70 @@ use crate::host::{
 use crate::mcp;
 use crate::native_attach::format_native_attach_prompt;
 use crate::runtime::RuntimePaths;
-use asylum_core::api::{CreateNodeRequest, HealthResponse};
-use asylum_core::config::AsylumConfig;
-use asylum_core::security::TokenRequest;
+use asylum_types::api::{CreateNodeRequest, HealthResponse};
+use asylum_types::config::{AsylumConfig, AsylumFileConfig};
+use asylum_types::security::TokenRequest;
 
 const DEFAULT_BIND: &str = "127.0.0.1:7717";
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:7717";
 const PUBLIC_INSTALLER_URL: &str =
     "https://raw.githubusercontent.com/CaseyID/Asylum/main/scripts/install.sh";
 
-pub async fn run() -> Result<()> {
+pub enum TopLevelAction {
+    Cli(CliAction),
+    DaemonRun {
+        config: Option<PathBuf>,
+        options: DaemonRunCliOptions,
+    },
+}
+
+pub struct CliAction {
+    paths: RuntimePaths,
+    client: AsylumClient,
+    was_bare: bool,
+    command: Command,
+}
+
+pub fn parse() -> Result<TopLevelAction> {
     let cli = Cli::parse();
     let was_bare = cli.command.is_none();
-    let paths = RuntimePaths::from_env(cli.config.clone())?;
+    let global_config = cli.config.clone();
+    let command = cli.command.unwrap_or(Command::Cockpit);
+
+    if let Command::Daemon {
+        command: DaemonCommand::Run(options),
+    } = command
+    {
+        return Ok(TopLevelAction::DaemonRun {
+            config: global_config,
+            options,
+        });
+    }
+
+    let paths = RuntimePaths::from_env(global_config)?;
     let client = runtime_client(&paths)?;
+
+    Ok(TopLevelAction::Cli(CliAction {
+        paths,
+        client,
+        was_bare,
+        command,
+    }))
+}
+
+pub async fn run(action: CliAction) -> Result<()> {
+    let CliAction {
+        paths,
+        client,
+        was_bare,
+        command,
+    } = action;
 
     if was_bare && !paths.home.exists() {
         // First run: print a friendly intro instead of barreling into the cockpit.
         run_first_run_banner(&paths);
         return Ok(());
     }
-
-    let command = cli.command.unwrap_or(Command::Cockpit);
 
     match command {
         Command::Setup => run_setup(&paths)?,
@@ -71,14 +113,7 @@ pub async fn run() -> Result<()> {
             let client = runtime_client(&paths)?;
             run_update(&paths, &client, version).await?
         }
-        Command::Serve { serve } => {
-            let ServeState {
-                bind,
-                database,
-                config,
-            } = load_serve_config(serve, &paths)?;
-            asylum_daemon::app::serve(bind, database, config).await?;
-        }
+        Command::Daemon { .. } => unreachable!("daemon run is handled by the composition crate"),
         Command::Config { command: config } => match config {
             ConfigCommand::Init => run_config_init(&paths)?,
             ConfigCommand::Show => run_config_show(&paths)?,
@@ -181,10 +216,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Idempotent post-install dance; creates ~/.asylum, writes default config.
-    #[command(after_help = "Examples:\n  asylum setup\n  ASYLUM_HOME=/tmp/asylum-test asylum setup")]
+    #[command(
+        after_help = "Examples:\n  asylum setup\n  ASYLUM_HOME=/tmp/asylum-test asylum setup"
+    )]
     Setup,
     /// Open the Cockpit in your browser; starts the daemon if needed.
-    #[command(after_help = "Examples:\n  asylum cockpit\n  asylum   # bare invocation falls through to cockpit when set up")]
+    #[command(
+        after_help = "Examples:\n  asylum cockpit\n  asylum   # bare invocation falls through to cockpit when set up"
+    )]
     Cockpit,
     /// Start the daemon (background; uses launchd / systemd-user / pid fallback).
     #[command(after_help = "Examples:\n  asylum start\n  asylum start && asylum status")]
@@ -195,7 +234,9 @@ enum Command {
     /// Stop and start the daemon.
     Restart,
     /// Show host and daemon state.
-    #[command(after_help = "Examples:\n  asylum status\n  asylum status --json\n  asylum status --json | jq .daemon")]
+    #[command(
+        after_help = "Examples:\n  asylum status\n  asylum status --json\n  asylum status --json | jq .daemon"
+    )]
     Status {
         #[arg(long)]
         json: bool,
@@ -217,10 +258,10 @@ enum Command {
         #[arg(long)]
         version: Option<String>,
     },
-    /// Run the daemon in the foreground (used by service units; you usually want `start`).
-    Serve {
-        #[command(flatten)]
-        serve: ServeConfig,
+    /// Daemon process commands.
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
     },
     /// Manage the on-disk config (init / show).
     Config {
@@ -228,13 +269,17 @@ enum Command {
         command: ConfigCommand,
     },
     /// Service-unit operations (generate launchd / systemd-user unit text).
-    #[command(after_help = "Examples:\n  asylum service generate systemd > ~/.config/systemd/user/asylum.service\n  asylum service generate launchd > ~/Library/LaunchAgents/dev.asylum.daemon.plist")]
+    #[command(
+        after_help = "Examples:\n  asylum service generate systemd > ~/.config/systemd/user/asylum.service\n  asylum service generate launchd > ~/Library/LaunchAgents/dev.asylum.daemon.plist"
+    )]
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
     },
     /// Remove Asylum from this machine. Stops daemon, removes service unit, binary, ~/.asylum.
-    #[command(after_help = "Examples:\n  asylum uninstall --dry-run\n  asylum uninstall --keep state\n  asylum uninstall --purge   # also removes ~/.config/asylum (signing keys)")]
+    #[command(
+        after_help = "Examples:\n  asylum uninstall --dry-run\n  asylum uninstall --keep state\n  asylum uninstall --purge   # also removes ~/.config/asylum (signing keys)"
+    )]
     Uninstall(UninstallArgs),
     /// Manage harness nodes (create / list / stop).
     Node {
@@ -247,10 +292,10 @@ enum Command {
         command: GraphCommand,
     },
     /// Attach a TTY directly to a node's harness.
-    #[command(after_help = "Examples:\n  asylum attach <NODE_ID>\n  asylum attach $(asylum node list | jq -r '.[0].node_id')")]
-    Attach {
-        node_id: Uuid,
-    },
+    #[command(
+        after_help = "Examples:\n  asylum attach <NODE_ID>\n  asylum attach $(asylum node list | jq -r '.[0].node_id')"
+    )]
+    Attach { node_id: Uuid },
     /// Issue and manage owner tokens.
     Token {
         #[command(subcommand)]
@@ -265,42 +310,44 @@ enum Command {
     Mcp,
 }
 
-#[derive(Args)]
-struct ServeConfig {
-    #[arg(long)]
-    bind: Option<SocketAddr>,
-    #[arg(long)]
-    database: Option<String>,
-    #[arg(long)]
-    base_url: Option<String>,
-    #[arg(long, value_name = "VALUE")]
-    owner_token: Option<String>,
-    #[arg(long)]
-    owner_tokens_enabled: bool,
-    #[arg(long)]
-    ntfy_server: Option<String>,
-    #[arg(long)]
-    ntfy_topic: Option<String>,
-    #[arg(long)]
-    ntfy_token: Option<String>,
-    #[arg(long)]
-    loon_enabled: bool,
-    #[arg(long)]
-    loon_endpoint: Option<String>,
-    #[arg(long)]
-    loon_cli_path: Option<PathBuf>,
-    #[arg(long)]
-    harness_codex_command: Option<String>,
-    #[arg(long)]
-    harness_claude_command: Option<String>,
-    #[arg(long)]
-    workspace_recent_limit: Option<usize>,
+#[derive(Subcommand)]
+enum DaemonCommand {
+    /// Run the daemon in the foreground (used by service units and development).
+    Run(DaemonRunCliOptions),
 }
 
-struct ServeState {
-    bind: SocketAddr,
-    database: String,
-    config: AsylumConfig,
+#[derive(Args, Clone, Debug)]
+pub struct DaemonRunCliOptions {
+    #[arg(long)]
+    pub bind: Option<SocketAddr>,
+    #[arg(long)]
+    pub database: Option<String>,
+    #[arg(long)]
+    pub socket_path: Option<PathBuf>,
+    #[arg(long)]
+    pub base_url: Option<String>,
+    #[arg(long, value_name = "VALUE")]
+    pub owner_token: Option<String>,
+    #[arg(long)]
+    pub owner_tokens_enabled: bool,
+    #[arg(long)]
+    pub ntfy_server: Option<String>,
+    #[arg(long)]
+    pub ntfy_topic: Option<String>,
+    #[arg(long)]
+    pub ntfy_token: Option<String>,
+    #[arg(long)]
+    pub loon_enabled: bool,
+    #[arg(long)]
+    pub loon_endpoint: Option<String>,
+    #[arg(long)]
+    pub loon_cli_path: Option<PathBuf>,
+    #[arg(long)]
+    pub harness_codex_command: Option<String>,
+    #[arg(long)]
+    pub harness_claude_command: Option<String>,
+    #[arg(long)]
+    pub workspace_recent_limit: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -312,7 +359,9 @@ enum ConfigCommand {
 #[derive(Subcommand)]
 enum ServiceCommand {
     /// Generate a service-unit file for the host's launch system.
-    #[command(after_help = "Examples:\n  asylum service generate systemd\n  asylum service generate launchd")]
+    #[command(
+        after_help = "Examples:\n  asylum service generate systemd\n  asylum service generate launchd"
+    )]
     Generate {
         #[command(subcommand)]
         command: ServiceGenerateCommand,
@@ -422,43 +471,22 @@ impl NodeCreateArgs {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ConfigFile {
-    #[serde(flatten)]
-    core: AsylumConfig,
-    database: String,
-}
+fn default_file_config_for_paths(paths: &RuntimePaths) -> AsylumFileConfig {
+    let mut config = AsylumConfig::default();
+    config.listen = Some(DEFAULT_BIND.to_string());
+    config.base_url = DEFAULT_BASE_URL.to_string();
+    config.ntfy = asylum_types::config::NtfyConfig {
+        server: None,
+        topic: None,
+        token: None,
+        poll_interval_seconds: 30,
+    };
+    config.harness.codex_command = detected_command("codex");
+    config.harness.claude_command = detected_command("claude");
 
-impl ConfigFile {
-    fn default_for_paths(paths: &RuntimePaths) -> Self {
-        let mut config = AsylumConfig::default();
-        config.listen = Some(DEFAULT_BIND.to_string());
-        config.base_url = DEFAULT_BASE_URL.to_string();
-        config.ntfy = asylum_core::config::NtfyConfig {
-            server: None,
-            topic: None,
-            token: None,
-            poll_interval_seconds: 30,
-        };
-        config.harness.codex_command = detected_command("codex");
-        config.harness.claude_command = detected_command("claude");
-
-        Self {
-            core: config,
-            database: paths.database.display().to_string(),
-        }
-    }
-}
-
-impl Default for ConfigFile {
-    fn default() -> Self {
-        let paths = RuntimePaths::from_values(
-            env::var_os("ASYLUM_HOME").map(PathBuf::from),
-            env::var_os("ASYLUM_CONFIG").map(PathBuf::from),
-            env::var_os("ASYLUM_DATABASE").map(PathBuf::from),
-            env::var_os("HOME").map(PathBuf::from),
-        );
-        Self::default_for_paths(&paths)
+    AsylumFileConfig {
+        core: config,
+        database: paths.database.display().to_string(),
     }
 }
 
@@ -480,7 +508,7 @@ fn setup_runtime(paths: &RuntimePaths) -> Result<SetupOutcome> {
     let created_config = if paths.config.exists() {
         false
     } else {
-        let config = ConfigFile::default_for_paths(paths);
+        let config = default_file_config_for_paths(paths);
         let content = toml::to_string_pretty(&config).context("serialize config")?;
         fs::write(&paths.config, content).context("write config file")?;
         true
@@ -583,125 +611,15 @@ fn print_harness_detection(label: &str, command: &str, available: bool) {
     }
 }
 
-fn parse_bool_flag(value: &str) -> bool {
-    matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on")
-}
-
-fn load_config_file(paths: &RuntimePaths) -> Result<ConfigFile> {
+fn load_config_file(paths: &RuntimePaths) -> Result<AsylumFileConfig> {
     if !paths.config.exists() {
-        return Ok(ConfigFile::default_for_paths(paths));
+        return Ok(default_file_config_for_paths(paths));
     }
 
     let content = fs::read_to_string(&paths.config)
         .with_context(|| format!("read config file {}", paths.config.display()))?;
-    toml::from_str::<ConfigFile>(&content)
+    toml::from_str::<AsylumFileConfig>(&content)
         .with_context(|| format!("parse config file {}", paths.config.display()))
-}
-
-fn apply_env_overrides(config: &mut AsylumConfig) {
-    if let Ok(value) = env::var("ASYLUM_BASE_URL") {
-        config.base_url = value;
-    }
-    if let Ok(value) = env::var("ASYLUM_OWNER_TOKEN") {
-        config.auth.owner_token = Some(value);
-    }
-    if let Ok(value) = env::var("ASYLUM_OWNER_TOKENS_ENABLED") {
-        config.auth.owner_tokens_enabled = parse_bool_flag(&value);
-    }
-    if let Ok(value) = env::var("ASYLUM_NTFY_SERVER") {
-        config.ntfy.server = Some(value);
-    }
-    if let Ok(value) = env::var("ASYLUM_NTFY_TOPIC") {
-        config.ntfy.topic = Some(value);
-    }
-    if let Ok(value) = env::var("ASYLUM_NTFY_TOKEN") {
-        config.ntfy.token = Some(value);
-    }
-    if let Ok(value) = env::var("ASYLUM_LOON_ENABLED") {
-        config.loon.enabled = parse_bool_flag(&value);
-    }
-    if let Ok(value) = env::var("ASYLUM_LOON_ENDPOINT") {
-        config.loon.endpoint = value;
-    }
-    if let Ok(value) = env::var("ASYLUM_HARNESS_CODEX_COMMAND") {
-        config.harness.codex_command = value;
-    }
-    if let Ok(value) = env::var("ASYLUM_HARNESS_CLAUDE_COMMAND") {
-        config.harness.claude_command = value;
-    }
-    if let Ok(value) = env::var("ASYLUM_WORKSPACE_RECENT_LIMIT") {
-        if let Ok(recent_limit) = value.parse::<usize>() {
-            config.workspace.recent_limit = recent_limit;
-        }
-    }
-}
-
-fn apply_cli_overrides(config: &mut AsylumConfig, args: &ServeConfig) {
-    if let Some(base_url) = args.base_url.as_deref() {
-        config.base_url = base_url.to_string();
-    }
-    if args.owner_tokens_enabled {
-        config.auth.owner_tokens_enabled = true;
-    }
-    if let Some(owner_token) = args.owner_token.as_deref() {
-        config.auth.owner_token = Some(owner_token.to_string());
-        config.auth.owner_tokens_enabled = true;
-    }
-    if let Some(ntfy_server) = args.ntfy_server.as_deref() {
-        config.ntfy.server = Some(ntfy_server.to_string());
-    }
-    if let Some(ntfy_topic) = args.ntfy_topic.as_deref() {
-        config.ntfy.topic = Some(ntfy_topic.to_string());
-    }
-    if let Some(ntfy_token) = args.ntfy_token.as_deref() {
-        config.ntfy.token = Some(ntfy_token.to_string());
-    }
-    if args.loon_enabled {
-        config.loon.enabled = true;
-    }
-    if let Some(loon_endpoint) = args.loon_endpoint.as_deref() {
-        config.loon.endpoint = loon_endpoint.to_string();
-    }
-    if let Some(cli_path) = &args.loon_cli_path {
-        config.loon.cli_path = Some(cli_path.clone());
-    }
-    if let Some(command) = args.harness_codex_command.as_deref() {
-        config.harness.codex_command = command.to_string();
-    }
-    if let Some(command) = args.harness_claude_command.as_deref() {
-        config.harness.claude_command = command.to_string();
-    }
-    if let Some(recent_limit) = args.workspace_recent_limit {
-        config.workspace.recent_limit = recent_limit;
-    }
-}
-
-fn load_serve_config(args: ServeConfig, paths: &RuntimePaths) -> Result<ServeState> {
-    let file_config = load_config_file(paths)?;
-    let mut config = file_config.core;
-    let base_url_from_file = config.base_url.clone();
-    let base_url_overridden = args.base_url.is_some()
-        || env::var_os("ASYLUM_BASE_URL").is_some()
-        || is_explicit_config_base_url(&base_url_from_file);
-
-    apply_bind_env_override(&mut config);
-    apply_env_overrides(&mut config);
-    apply_cli_overrides(&mut config, &args);
-
-    let bind = effective_bind(args.bind, &config);
-    if !base_url_overridden {
-        config.base_url = local_base_url_for_bind(bind);
-    }
-    let database = args
-        .database
-        .or_else(|| env::var("ASYLUM_DATABASE").ok())
-        .unwrap_or(file_config.database);
-
-    Ok(ServeState {
-        bind,
-        database,
-        config,
-    })
 }
 
 fn apply_bind_env_override(config: &mut AsylumConfig) {
@@ -725,19 +643,19 @@ fn effective_service_bind(paths: &RuntimePaths) -> Result<SocketAddr> {
 }
 
 fn runtime_client(paths: &RuntimePaths) -> Result<AsylumClient> {
-    let bind = effective_service_bind(paths)?;
-    Ok(AsylumClient::new(
-        effective_runtime_base_url(env::var("ASYLUM_BASE_URL").ok(), bind),
-        env::var("ASYLUM_TOKEN").ok(),
-    ))
+    if env::var_os("ASYLUM_BASE_URL").is_some() || env::var_os("ASYLUM_TOKEN").is_some() {
+        let bind = effective_service_bind(paths)?;
+        return Ok(AsylumClient::new(
+            effective_runtime_base_url(env::var("ASYLUM_BASE_URL").ok(), bind),
+            env::var("ASYLUM_TOKEN").ok(),
+        ));
+    }
+
+    AsylumClient::new_socket(paths.socket_path())
 }
 
 fn effective_runtime_base_url(base_url_override: Option<String>, bind: SocketAddr) -> String {
     base_url_override.unwrap_or_else(|| local_base_url_for_bind(bind))
-}
-
-fn is_explicit_config_base_url(value: &str) -> bool {
-    !value.is_empty() && value != DEFAULT_BASE_URL
 }
 
 fn local_base_url_for_bind(bind: SocketAddr) -> String {
@@ -755,7 +673,7 @@ fn local_base_url_for_bind(bind: SocketAddr) -> String {
 
 fn run_config_init(paths: &RuntimePaths) -> Result<()> {
     paths.ensure_dirs()?;
-    let config = ConfigFile::default_for_paths(paths);
+    let config = default_file_config_for_paths(paths);
     let content = toml::to_string_pretty(&config).context("serialize config")?;
     fs::write(&paths.config, content).context("write config file")?;
     println!("wrote config to {}", paths.config.display());
@@ -779,7 +697,11 @@ async fn run_cockpit(paths: &RuntimePaths, client: &AsylumClient, first_run: boo
             "Asylum start requested but health is not ready; run `asylum status` or `asylum logs`."
         ));
     }
-    let url = client.base_url().to_string();
+    let url = client
+        .health()
+        .await
+        .map(|health| health.base_url)
+        .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
     open_browser(&url);
     println!("Cockpit: {url}");
     Ok(())
@@ -802,9 +724,11 @@ async fn run_start(paths: &RuntimePaths, client: &AsylumClient) -> Result<StartO
     if !paths.config.exists() {
         let _ = setup_runtime(paths)?;
     }
-    if client.is_healthy().await {
-        println!("Asylum is already running at {}", client.base_url());
-        return Ok(StartOutcome::AlreadyHealthy);
+    if let Ok(health) = client.health().await {
+        if health.status == "ok" {
+            println!("Asylum is already running at {}", health.base_url);
+            return Ok(StartOutcome::AlreadyHealthy);
+        }
     }
     let manager = ServiceManager::new(paths.clone())?;
     let bind = effective_service_bind(paths)?;
@@ -813,9 +737,7 @@ async fn run_start(paths: &RuntimePaths, client: &AsylumClient) -> Result<StartO
         Some(health) => {
             println!(
                 "Asylum started at {} ({}, version {})",
-                client.base_url(),
-                health.status,
-                health.daemon_version
+                health.base_url, health.status, health.daemon_version
             );
             Ok(StartOutcome::StartedHealthy)
         }
@@ -838,11 +760,8 @@ async fn run_restart(paths: &RuntimePaths, client: &AsylumClient) -> Result<()> 
     let manager = ServiceManager::new(paths.clone())?;
     let bind = effective_service_bind(paths)?;
     manager.restart(&bind.to_string())?;
-    if wait_for_health(client, Duration::from_secs(6))
-        .await
-        .is_some()
-    {
-        println!("Asylum restarted at {}", client.base_url());
+    if let Some(health) = wait_for_health(client, Duration::from_secs(6)).await {
+        println!("Asylum restarted at {}", health.base_url);
     } else {
         println!("Asylum restart requested; health is not ready yet");
     }
@@ -856,6 +775,8 @@ async fn run_status(paths: &RuntimePaths, client: &AsylumClient, json: bool) -> 
         state.daemon.healthy = true;
         state.daemon.state = ServiceState::Running;
         state.daemon.daemon_version = Some(health.daemon_version.clone());
+        state.daemon.base_url = health.base_url.clone();
+        state.daemon.bind = Some(health.bind_addr.clone());
     }
 
     if json {
@@ -865,15 +786,24 @@ async fn run_status(paths: &RuntimePaths, client: &AsylumClient, json: bool) -> 
 
     let service_state = service_state_from_health(health.is_some(), state.daemon.state.clone());
     println!("Asylum: {service_state}");
-    println!("Cockpit: {}", client.base_url());
+    println!("Cockpit: {}", state.daemon.base_url);
+    if let Some(socket_path) = client.socket_path() {
+        println!("Socket: {}", socket_path.display());
+    }
     match health {
-        Some(health) => println!("Health: {} (version {})", health.status, health.daemon_version),
+        Some(health) => println!(
+            "Health: {} (version {})",
+            health.status, health.daemon_version
+        ),
         None => println!("Health: unavailable"),
     }
     println!("Config: {}", paths.config.display());
     println!("Database: {}", paths.database.display());
     println!("Logs: {}", paths.log.display());
-    println!("Binary: {}", display_optional_path(state.binary.path.as_deref()));
+    println!(
+        "Binary: {}",
+        display_optional_path(state.binary.path.as_deref())
+    );
     if !state.binary.shadowed_by.is_empty() {
         println!("PATH shadows:");
         for shadow in &state.binary.shadowed_by {
@@ -895,7 +825,9 @@ async fn run_status(paths: &RuntimePaths, client: &AsylumClient, json: bool) -> 
     match &state.network.port_in_use {
         PortInUse::Free => println!("Port: free"),
         PortInUse::InUse { pid, command } => {
-            let pid_text = pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string());
+            let pid_text = pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "?".to_string());
             let command_text = command.as_deref().unwrap_or("?");
             println!("Port: in use (pid {pid_text}, command {command_text})");
         }
@@ -1029,7 +961,7 @@ async fn doctor_checks(
         ),
     });
     checks.push(cockpit_assets_check());
-    let config = load_config_file(paths).unwrap_or_else(|_| ConfigFile::default_for_paths(paths));
+    let config = load_config_file(paths).unwrap_or_else(|_| default_file_config_for_paths(paths));
     checks.push(classify_required(
         command_exists(&config.core.harness.codex_command),
         "codex",
@@ -1089,7 +1021,9 @@ async fn doctor_checks(
         let port_detail = match &host.network.port_in_use {
             PortInUse::Free => "free".to_string(),
             PortInUse::InUse { pid, command } => {
-                let pid_text = pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string());
+                let pid_text = pid
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "?".to_string());
                 let command_text = command.as_deref().unwrap_or("?");
                 format!("in use (pid {pid_text}, command {command_text})")
             }
@@ -1265,24 +1199,56 @@ fn run_logs(paths: &RuntimePaths, tail: bool) -> Result<()> {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 enum PlanStep {
-    StopDaemon { running: bool },
-    RemoveServiceUnit { backend: String, path: Option<PathBuf>, installed: bool },
-    RemoveBinary { path: Option<PathBuf>, present: bool },
-    RemoveRuntimeDir { path: PathBuf, present: bool, preserve_logs: bool },
-    KeepRuntimeDir { path: PathBuf, reason: String },
-    RemoveConfigDir { path: PathBuf, present: bool },
-    KeepConfigDir { path: PathBuf, reason: String },
+    StopDaemon {
+        running: bool,
+    },
+    RemoveServiceUnit {
+        backend: String,
+        path: Option<PathBuf>,
+        installed: bool,
+    },
+    RemoveBinary {
+        path: Option<PathBuf>,
+        present: bool,
+    },
+    RemoveRuntimeDir {
+        path: PathBuf,
+        present: bool,
+        preserve_logs: bool,
+    },
+    KeepRuntimeDir {
+        path: PathBuf,
+        reason: String,
+    },
+    RemoveConfigDir {
+        path: PathBuf,
+        present: bool,
+    },
+    KeepConfigDir {
+        path: PathBuf,
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case", tag = "outcome")]
 enum StepResult {
-    Removed { path: PathBuf },
-    Preserved { path: PathBuf, reason: String },
-    NotPresent { path: PathBuf },
+    Removed {
+        path: PathBuf,
+    },
+    Preserved {
+        path: PathBuf,
+        reason: String,
+    },
+    NotPresent {
+        path: PathBuf,
+    },
     Stopped,
     NotRunning,
-    Failed { path: Option<PathBuf>, error: String },
+    Failed {
+        path: Option<PathBuf>,
+        error: String,
+    },
     Noop,
 }
 
@@ -1389,7 +1355,12 @@ fn build_uninstall_plan(
     });
     plan.push(PlanStep::RemoveBinary {
         path: state.binary.path.clone(),
-        present: state.binary.path.as_deref().map(Path::exists).unwrap_or(false),
+        present: state
+            .binary
+            .path
+            .as_deref()
+            .map(Path::exists)
+            .unwrap_or(false),
     });
     if keep_state {
         plan.push(PlanStep::KeepRuntimeDir {
@@ -1432,7 +1403,11 @@ fn print_uninstall_plan(plan: &[PlanStep]) {
                     println!("  - stop daemon (not running, no-op)");
                 }
             }
-            PlanStep::RemoveServiceUnit { backend, path, installed } => match (installed, path) {
+            PlanStep::RemoveServiceUnit {
+                backend,
+                path,
+                installed,
+            } => match (installed, path) {
                 (true, Some(path)) => {
                     println!("  - remove service unit ({backend}): {}", path.display())
                 }
@@ -1457,10 +1432,7 @@ fn print_uninstall_plan(plan: &[PlanStep]) {
                 if !*present {
                     println!("  - runtime dir not present: {}", path.display());
                 } else if *preserve_logs {
-                    println!(
-                        "  - remove runtime dir, preserve logs/: {}",
-                        path.display()
-                    );
+                    println!("  - remove runtime dir, preserve logs/: {}", path.display());
                 } else {
                     println!("  - remove runtime dir: {}", path.display());
                 }
@@ -1563,9 +1535,7 @@ fn execute_uninstall_plan(
                 let in_bin_path = path
                     .parent()
                     .map(|p| {
-                        p.ends_with("bin")
-                            || p.ends_with("usr/bin")
-                            || p.ends_with("local/bin")
+                        p.ends_with("bin") || p.ends_with("usr/bin") || p.ends_with("local/bin")
                     })
                     .unwrap_or(false);
                 if !in_bin_path {
@@ -1573,13 +1543,17 @@ fn execute_uninstall_plan(
                         "remove_binary".to_string(),
                         StepResult::Preserved {
                             path: path.clone(),
-                            reason: "binary not under a recognized bin dir; remove manually if intended".to_string(),
+                            reason:
+                                "binary not under a recognized bin dir; remove manually if intended"
+                                    .to_string(),
                         },
                     ));
                     continue;
                 }
                 match fs::remove_file(&path) {
-                    Ok(()) => results.push(("remove_binary".to_string(), StepResult::Removed { path })),
+                    Ok(()) => {
+                        results.push(("remove_binary".to_string(), StepResult::Removed { path }))
+                    }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         results.push(("remove_binary".to_string(), StepResult::NotPresent { path }))
                     }
@@ -1627,12 +1601,10 @@ fn execute_uninstall_plan(
                             "remove_runtime_dir".to_string(),
                             StepResult::Removed { path: path.clone() },
                         )),
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                            results.push((
-                                "remove_runtime_dir".to_string(),
-                                StepResult::NotPresent { path: path.clone() },
-                            ))
-                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => results.push((
+                            "remove_runtime_dir".to_string(),
+                            StepResult::NotPresent { path: path.clone() },
+                        )),
                         Err(error) => results.push((
                             "remove_runtime_dir".to_string(),
                             StepResult::Failed {
@@ -1706,8 +1678,7 @@ fn remove_runtime_dir_preserving_logs(home: &Path, logs_dir: &Path) -> Result<()
         }
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            fs::remove_dir_all(&path)
-                .with_context(|| format!("remove {}", path.display()))?;
+            fs::remove_dir_all(&path).with_context(|| format!("remove {}", path.display()))?;
         } else {
             fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
         }
@@ -1717,10 +1688,7 @@ fn remove_runtime_dir_preserving_logs(home: &Path, logs_dir: &Path) -> Result<()
 
 fn print_remaining_report(state: &HostState) {
     println!("Remaining:");
-    println!(
-        "  runtime dir present: {}",
-        state.runtime_dir.present
-    );
+    println!("  runtime dir present: {}", state.runtime_dir.present);
     println!("  config dir present: {}", state.config_dir.present);
     if let Some(path) = state.binary.path.as_ref() {
         if path.exists() {
@@ -1735,20 +1703,14 @@ fn print_remaining_report(state: &HostState) {
     }
     if state.service_unit.installed {
         if let Some(path) = &state.service_unit.path {
-            println!(
-                "  service unit still installed: {}",
-                path.display()
-            );
+            println!("  service unit still installed: {}", path.display());
         }
     }
 }
 
 fn prompt_yes_no(prompt: &str) -> Result<bool> {
     let answer = prompt_line(prompt)?;
-    Ok(matches!(
-        answer.trim().to_lowercase().as_str(),
-        "y" | "yes"
-    ))
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 fn prompt_line(prompt: &str) -> Result<String> {
@@ -1836,7 +1798,9 @@ async fn run_update(
         (Some(restart_err), Ok(())) => Err(restart_err),
         (Some(restart_err), Err(doctor_err)) => {
             // Surface both: restart failure context prepended to doctor error (L8).
-            Err(anyhow!("{restart_err:#}; doctor also reported: {doctor_err:#}"))
+            Err(anyhow!(
+                "{restart_err:#}; doctor also reported: {doctor_err:#}"
+            ))
         }
     }
 }
@@ -1977,9 +1941,14 @@ mod tests {
             cli.command,
             Some(Command::Doctor { verbose: true })
         ));
-        let cli = Cli::try_parse_from(["asylum", "serve", "--database", "/tmp/a.db"])?;
-        assert!(matches!(cli.command, Some(Command::Serve { .. })));
-        let cli = Cli::try_parse_from(["asylum", "serve", "--config", "/tmp/config.toml"])?;
+        let cli = Cli::try_parse_from(["asylum", "daemon", "run", "--database", "/tmp/a.db"])?;
+        assert!(matches!(
+            cli.command,
+            Some(Command::Daemon {
+                command: DaemonCommand::Run(_)
+            })
+        ));
+        let cli = Cli::try_parse_from(["asylum", "daemon", "run", "--config", "/tmp/config.toml"])?;
         assert_eq!(cli.config, Some(PathBuf::from("/tmp/config.toml")));
         let cli = Cli::try_parse_from(["asylum", "--config", "/tmp/config.toml", "status"])?;
         assert_eq!(cli.config, Some(PathBuf::from("/tmp/config.toml")));
@@ -2020,7 +1989,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let tempdir = tempfile::tempdir()?;
         let paths = RuntimePaths::from_values(Some(tempdir.path().to_path_buf()), None, None, None);
-        let mut file = ConfigFile::default_for_paths(&paths);
+        let mut file = default_file_config_for_paths(&paths);
         file.core.listen = Some("127.0.0.1:9011".to_string());
         paths.ensure_dirs()?;
         fs::write(
@@ -2045,7 +2014,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let tempdir = tempfile::tempdir()?;
         let paths = RuntimePaths::from_values(Some(tempdir.path().to_path_buf()), None, None, None);
-        let mut file = ConfigFile::default_for_paths(&paths);
+        let mut file = default_file_config_for_paths(&paths);
         file.core.listen = Some("127.0.0.1:9011".to_string());
         paths.ensure_dirs()?;
         fs::write(
@@ -2057,9 +2026,7 @@ mod tests {
         env::set_var("ASYLUM_BIND", "127.0.0.1:9012");
 
         let service_bind = effective_service_bind(&paths)?;
-        let serve_bind = load_serve_config(empty_serve_config(), &paths)?.bind;
         assert_eq!(service_bind.to_string(), "127.0.0.1:9012");
-        assert_eq!(serve_bind, service_bind);
 
         if let Some(value) = prev_bind {
             env::set_var("ASYLUM_BIND", value);
@@ -2070,7 +2037,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_client_uses_config_bind_when_base_url_is_unset() -> Result<()> {
+    fn runtime_client_uses_socket_when_base_url_is_unset() -> Result<()> {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let tempdir = tempfile::tempdir()?;
         let paths = RuntimePaths::from_values(Some(tempdir.path().to_path_buf()), None, None, None);
@@ -2082,7 +2049,7 @@ mod tests {
         env::remove_var("ASYLUM_BASE_URL");
 
         let client = runtime_client(&paths)?;
-        assert_eq!(client.base_url(), "http://127.0.0.1:9021");
+        assert_eq!(client.socket_path(), Some(paths.socket_path().as_path()));
 
         restore_env("ASYLUM_BIND", prev_bind);
         restore_env("ASYLUM_BASE_URL", prev_base_url);
@@ -2090,7 +2057,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_client_uses_env_bind_when_base_url_is_unset() -> Result<()> {
+    fn runtime_client_ignores_env_bind_when_socket_transport_is_used() -> Result<()> {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let tempdir = tempfile::tempdir()?;
         let paths = RuntimePaths::from_values(Some(tempdir.path().to_path_buf()), None, None, None);
@@ -2102,7 +2069,7 @@ mod tests {
         env::remove_var("ASYLUM_BASE_URL");
 
         let client = runtime_client(&paths)?;
-        assert_eq!(client.base_url(), "http://127.0.0.1:9022");
+        assert_eq!(client.socket_path(), Some(paths.socket_path().as_path()));
 
         restore_env("ASYLUM_BIND", prev_bind);
         restore_env("ASYLUM_BASE_URL", prev_base_url);
@@ -2144,115 +2111,7 @@ mod tests {
         env::remove_var("ASYLUM_BASE_URL");
 
         let client = runtime_client(&paths)?;
-        // The data-plane client must NOT point at the hard-coded default (7717).
-        assert_ne!(
-            client.base_url(),
-            "http://127.0.0.1:7717",
-            "data-plane client must not use hard-coded default when config overrides listen"
-        );
-        assert_eq!(
-            client.base_url(),
-            "http://127.0.0.1:9999",
-            "data-plane client must use config listen address"
-        );
-
-        restore_env("ASYLUM_BIND", prev_bind);
-        restore_env("ASYLUM_BASE_URL", prev_base_url);
-        Ok(())
-    }
-
-    #[test]
-    fn serve_config_base_url_tracks_effective_bind_without_override() -> Result<()> {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let tempdir = tempfile::tempdir()?;
-        let paths = RuntimePaths::from_values(Some(tempdir.path().to_path_buf()), None, None, None);
-        write_config_with_listen(&paths, "127.0.0.1:9031")?;
-
-        let prev_bind = env::var_os("ASYLUM_BIND");
-        let prev_base_url = env::var_os("ASYLUM_BASE_URL");
-        env::set_var("ASYLUM_BIND", "127.0.0.1:9032");
-        env::remove_var("ASYLUM_BASE_URL");
-
-        let state = load_serve_config(empty_serve_config(), &paths)?;
-        assert_eq!(state.bind.to_string(), "127.0.0.1:9032");
-        assert_eq!(state.config.base_url, "http://127.0.0.1:9032");
-
-        restore_env("ASYLUM_BIND", prev_bind);
-        restore_env("ASYLUM_BASE_URL", prev_base_url);
-        Ok(())
-    }
-
-    #[test]
-    fn serve_config_base_url_honors_env_override() -> Result<()> {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let tempdir = tempfile::tempdir()?;
-        let paths = RuntimePaths::from_values(Some(tempdir.path().to_path_buf()), None, None, None);
-        write_config_with_listen(&paths, "127.0.0.1:9031")?;
-
-        let prev_bind = env::var_os("ASYLUM_BIND");
-        let prev_base_url = env::var_os("ASYLUM_BASE_URL");
-        env::set_var("ASYLUM_BIND", "127.0.0.1:9032");
-        env::set_var("ASYLUM_BASE_URL", "http://public.example");
-
-        let state = load_serve_config(empty_serve_config(), &paths)?;
-        assert_eq!(state.bind.to_string(), "127.0.0.1:9032");
-        assert_eq!(state.config.base_url, "http://public.example");
-
-        restore_env("ASYLUM_BIND", prev_bind);
-        restore_env("ASYLUM_BASE_URL", prev_base_url);
-        Ok(())
-    }
-
-    #[test]
-    fn serve_config_preserves_explicit_file_base_url() -> Result<()> {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let tempdir = tempfile::tempdir()?;
-        let paths = RuntimePaths::from_values(Some(tempdir.path().to_path_buf()), None, None, None);
-        let mut file = ConfigFile::default_for_paths(&paths);
-        file.core.listen = Some("127.0.0.1:9041".to_string());
-        file.core.base_url = "https://public.example".to_string();
-        paths.ensure_dirs()?;
-        fs::write(
-            &paths.config,
-            toml::to_string_pretty(&file).context("serialize config file")?,
-        )?;
-
-        let prev_bind = env::var_os("ASYLUM_BIND");
-        let prev_base_url = env::var_os("ASYLUM_BASE_URL");
-        env::remove_var("ASYLUM_BIND");
-        env::remove_var("ASYLUM_BASE_URL");
-
-        let state = load_serve_config(empty_serve_config(), &paths)?;
-        assert_eq!(state.bind.to_string(), "127.0.0.1:9041");
-        assert_eq!(state.config.base_url, "https://public.example");
-
-        restore_env("ASYLUM_BIND", prev_bind);
-        restore_env("ASYLUM_BASE_URL", prev_base_url);
-        Ok(())
-    }
-
-    #[test]
-    fn serve_config_aligns_default_file_base_url_to_changed_listen() -> Result<()> {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let tempdir = tempfile::tempdir()?;
-        let paths = RuntimePaths::from_values(Some(tempdir.path().to_path_buf()), None, None, None);
-        let mut file = ConfigFile::default_for_paths(&paths);
-        file.core.listen = Some("127.0.0.1:9042".to_string());
-        file.core.base_url = DEFAULT_BASE_URL.to_string();
-        paths.ensure_dirs()?;
-        fs::write(
-            &paths.config,
-            toml::to_string_pretty(&file).context("serialize config file")?,
-        )?;
-
-        let prev_bind = env::var_os("ASYLUM_BIND");
-        let prev_base_url = env::var_os("ASYLUM_BASE_URL");
-        env::remove_var("ASYLUM_BIND");
-        env::remove_var("ASYLUM_BASE_URL");
-
-        let state = load_serve_config(empty_serve_config(), &paths)?;
-        assert_eq!(state.bind.to_string(), "127.0.0.1:9042");
-        assert_eq!(state.config.base_url, "http://127.0.0.1:9042");
+        assert_eq!(client.socket_path(), Some(paths.socket_path().as_path()));
 
         restore_env("ASYLUM_BIND", prev_bind);
         restore_env("ASYLUM_BASE_URL", prev_base_url);
@@ -2357,128 +2216,8 @@ mod tests {
         assert_eq!(classify_service_state("stopped"), CheckStatus::Warn);
     }
 
-    #[test]
-    fn serve_config_merges_cli_overrides_with_file() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let paths = RuntimePaths::from_values(Some(tempdir.path().to_path_buf()), None, None, None);
-        let mut file = ConfigFile::default_for_paths(&paths);
-        file.core.base_url = "http://from-file".to_string();
-        file.core.workspace.recent_limit = 5;
-        file.database = ".asylum/asylum.sqlite3".to_string();
-        file.core.ntfy.server = Some("https://from-file".to_string());
-        paths.ensure_dirs()?;
-        fs::write(
-            &paths.config,
-            toml::to_string_pretty(&file).context("serialize config file")?,
-        )?;
-
-        let args = ServeConfig {
-            bind: Some("127.0.0.1:9000".parse()?),
-            database: None,
-            base_url: Some("http://from-cli".to_string()),
-            owner_token: None,
-            owner_tokens_enabled: false,
-            ntfy_server: Some("https://from-cli".to_string()),
-            ntfy_topic: None,
-            ntfy_token: None,
-            loon_enabled: true,
-            loon_endpoint: Some("http://loon".to_string()),
-            loon_cli_path: None,
-            harness_codex_command: None,
-            harness_claude_command: Some("claude-cli".to_string()),
-            workspace_recent_limit: Some(11),
-        };
-
-        let ServeState {
-            bind,
-            database,
-            config,
-        } = load_serve_config(args, &paths)?;
-
-        assert_eq!(bind.to_string(), "127.0.0.1:9000");
-        assert_eq!(database, ".asylum/asylum.sqlite3");
-        assert_eq!(config.base_url, "http://from-cli");
-        assert_eq!(config.ntfy.server, Some("https://from-cli".to_string()));
-        assert!(config.ntfy.topic.is_none());
-        assert_eq!(config.workspace.recent_limit, 11);
-        assert_eq!(config.harness.claude_command, "claude-cli");
-        assert_eq!(config.loon.endpoint, "http://loon");
-        assert!(config.loon.enabled);
-
-        Ok(())
-    }
-
-    #[test]
-    fn serve_config_reads_owner_token_env() -> Result<()> {
-        let tempdir = tempfile::tempdir()?;
-        let paths = RuntimePaths::from_values(Some(tempdir.path().to_path_buf()), None, None, None);
-        let file = ConfigFile::default_for_paths(&paths);
-        paths.ensure_dirs()?;
-        fs::write(
-            &paths.config,
-            toml::to_string_pretty(&file).context("serialize config file")?,
-        )?;
-
-        let prev_token = env::var_os("ASYLUM_OWNER_TOKEN");
-        let prev_enabled = env::var_os("ASYLUM_OWNER_TOKENS_ENABLED");
-        env::set_var("ASYLUM_OWNER_TOKEN", "env-owner");
-        env::set_var("ASYLUM_OWNER_TOKENS_ENABLED", "true");
-
-        let args = ServeConfig {
-            bind: None,
-            database: None,
-            base_url: None,
-            owner_token: None,
-            owner_tokens_enabled: false,
-            ntfy_server: None,
-            ntfy_topic: None,
-            ntfy_token: None,
-            loon_enabled: false,
-            loon_endpoint: None,
-            loon_cli_path: None,
-            harness_codex_command: None,
-            harness_claude_command: None,
-            workspace_recent_limit: None,
-        };
-
-        let ServeState { config, .. } = load_serve_config(args, &paths)?;
-        assert_eq!(config.auth.owner_token.as_deref(), Some("env-owner"));
-        assert!(config.auth.owner_tokens_enabled);
-
-        if let Some(value) = prev_token {
-            env::set_var("ASYLUM_OWNER_TOKEN", value);
-        } else {
-            env::remove_var("ASYLUM_OWNER_TOKEN");
-        }
-        if let Some(value) = prev_enabled {
-            env::set_var("ASYLUM_OWNER_TOKENS_ENABLED", value);
-        } else {
-            env::remove_var("ASYLUM_OWNER_TOKENS_ENABLED");
-        }
-        Ok(())
-    }
-
-    fn empty_serve_config() -> ServeConfig {
-        ServeConfig {
-            bind: None,
-            database: None,
-            base_url: None,
-            owner_token: None,
-            owner_tokens_enabled: false,
-            ntfy_server: None,
-            ntfy_topic: None,
-            ntfy_token: None,
-            loon_enabled: false,
-            loon_endpoint: None,
-            loon_cli_path: None,
-            harness_codex_command: None,
-            harness_claude_command: None,
-            workspace_recent_limit: None,
-        }
-    }
-
     fn write_config_with_listen(paths: &RuntimePaths, listen: &str) -> Result<()> {
-        let mut file = ConfigFile::default_for_paths(paths);
+        let mut file = default_file_config_for_paths(paths);
         file.core.listen = Some(listen.to_string());
         paths.ensure_dirs()?;
         fs::write(

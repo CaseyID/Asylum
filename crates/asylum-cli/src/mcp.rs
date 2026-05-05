@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::client::AsylumClient;
-use asylum_core::api::CreateNodeRequest;
+use asylum_types::api::CreateNodeRequest;
 
 #[derive(Deserialize)]
 struct RpcRequest {
@@ -522,7 +522,11 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
                 "label": args.label,
             });
             match client
-                .send_request_json::<Value, _>(reqwest::Method::POST, "/api/relationships", Some(&body))
+                .send_request_json::<Value, _>(
+                    reqwest::Method::POST,
+                    "/api/relationships",
+                    Some(&body),
+                )
                 .await
             {
                 Ok(v) => content_result(v),
@@ -722,7 +726,10 @@ mod tests {
     #[tokio::test]
     async fn notification_returns_none() {
         use std::sync::Arc;
-        let client = Arc::new(AsylumClient::new("http://127.0.0.1:1", Option::<String>::None));
+        let client = Arc::new(AsylumClient::new(
+            "http://127.0.0.1:1",
+            Option::<String>::None,
+        ));
         // notifications/initialized has no id — must return None
         let req = RpcRequest {
             _jsonrpc: Some("2.0".to_string()),
@@ -737,7 +744,10 @@ mod tests {
     #[tokio::test]
     async fn unknown_notification_returns_none() {
         use std::sync::Arc;
-        let client = Arc::new(AsylumClient::new("http://127.0.0.1:1", Option::<String>::None));
+        let client = Arc::new(AsylumClient::new(
+            "http://127.0.0.1:1",
+            Option::<String>::None,
+        ));
         let req = RpcRequest {
             _jsonrpc: Some("2.0".to_string()),
             id: None,
@@ -745,6 +755,9 @@ mod tests {
             params: None,
         };
         let result = handle_request(&client, req).await;
-        assert!(result.is_none(), "unknown notification must not produce a response");
+        assert!(
+            result.is_none(),
+            "unknown notification must not produce a response"
+        );
     }
 }

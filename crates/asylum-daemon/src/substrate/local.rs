@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use asylum_core::node::{CapabilitySnapshot, HarnessKind};
+use asylum_types::node::{CapabilitySnapshot, HarnessKind};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};

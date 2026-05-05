@@ -34,9 +34,10 @@ Test fixtures and unit-test mocks are fine. The principle applies to behavior de
 
 ## Repository layout
 
-- `crates/asylum-core/` — shared types and contracts (API, capabilities, config, security primitives)
-- `crates/asylum-daemon/` — HTTP service, storage (SQLite), substrates (`local`, `loon`), harnesses (`claude_code`, `codex`), hooks engine, channels, capability service
-- `crates/asylum/` — CLI binary + MCP server, native attach helpers
+- `crates/asylum/` — tiny composition crate that builds the installed `asylum` binary
+- `crates/asylum-cli/` — CLI, MCP bridge, Unix-socket daemon client, service lifecycle, native attach helpers
+- `crates/asylum-daemon/` — daemon runtime, HTTP/WebSocket Cockpit service, storage (SQLite), substrates (`local`, `loon`), harnesses (`claude_code`, `codex`), hooks engine, channels, capability service
+- `crates/asylum-types/` — shared types and contracts (API, capabilities, config, security primitives)
 - `cockpit/` — TypeScript/React single-page app served by the daemon (`/api/...` routes; `/` serves the SPA)
 - `scripts/` — release, install, build-artifact scripts
 - `docs/` — PRD, handoffs, reviews, source trail, plan archive
@@ -58,7 +59,7 @@ npm --prefix cockpit run build
 cargo build --release
 
 # dev daemon
-cargo run -p asylum-daemon -- start
+cargo run -p asylum -- daemon run
 
 # dev cockpit (alongside the daemon)
 npm --prefix cockpit run dev
@@ -94,6 +95,7 @@ Every plan/handoff document must include a "Release status" section that links t
 - Asylum is Loon-independent. Loon is one of two supported substrates; do not couple core logic to it.
 - Asylum is graph-first. Nodes are the core object; runs/workflows may come later.
 - Capability surface (CLI, API, MCP, cockpit) shares the same root capabilities — do not let one drift from the others.
+- CLI/MCP local control uses `~/.asylum/run/asylum.sock`; Cockpit remains HTTP/WebSocket.
 
 ## Other entry points
 

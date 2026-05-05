@@ -239,7 +239,7 @@ Edges represent intentional responsibility:
 
 Every v1 product affordance maps to a documented root capability. Every root capability is available through the typed API and should be exposed through CLI and MCP unless the client physically cannot support it, in which case the client returns a link, token, or explanation.
 
-**MCP catalog parity (as of PR 6):** `node.create`, `node.list`, `node.inspect`, `node.send_input`, `node.interrupt`, `node.stop`, `node.archive`, `node.events`, `node.fork`, `node.attach_url`, `graph.get`, `relationship.create`, `notify.send`, `attach_url.issue` — all wired in `crates/asylum/src/mcp.rs`.
+**MCP catalog parity (as of PR 6):** `node.create`, `node.list`, `node.inspect`, `node.send_input`, `node.interrupt`, `node.stop`, `node.archive`, `node.events`, `node.fork`, `node.attach_url`, `graph.get`, `relationship.create`, `notify.send`, `attach_url.issue` — all wired in `crates/asylum-cli/src/mcp.rs`.
 
 ### Node capabilities
 
@@ -411,6 +411,8 @@ Dashboard notifications also exist. Richer channels such as Signal, Telegram, Di
 
 Asylum exposes one typed capability API. CLI, MCP, dashboard, command-center chat, and third-party chatbot integrations all use that same API.
 
+There is one installed binary, `asylum`. Local CLI/MCP control talks to the daemon through `~/.asylum/run/asylum.sock`; Cockpit remains on daemon HTTP/WebSocket routes.
+
 Third-party clients can do whatever their host environment permits:
 
 - inspect nodes,
@@ -431,6 +433,7 @@ Security requirements:
 
 - bind to localhost by default,
 - explicit network exposure configuration,
+- Unix-socket local control for CLI/MCP,
 - owner token or pairing credential for API, MCP, CLI, and remote channels,
 - dashboard authentication,
 - attach URLs protected by auth/session tokens,

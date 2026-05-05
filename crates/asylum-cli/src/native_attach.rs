@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use asylum_core::api::NativeAttachResponse;
+use asylum_types::api::NativeAttachResponse;
 
 /// Single-quote-escape a shell token so it is safe to use in a shell command line (L9).
 /// Any single-quote in the value is replaced with `'\''` (end quote, literal ', reopen quote).
@@ -11,7 +11,8 @@ fn shell_quote(s: &str) -> String {
 
 /// Returns true if the string needs quoting (contains any shell-special character).
 fn needs_quoting(s: &str) -> bool {
-    s.chars().any(|c| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '_' | '.' | '/' | ':' | '@'))
+    s.chars()
+        .any(|c| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '_' | '.' | '/' | ':' | '@'))
 }
 
 pub fn render_native_attach_command(target: &NativeAttachResponse) -> String {
@@ -74,8 +75,8 @@ mod tests {
     fn render_native_command_includes_args_and_environment() {
         let mut env = BTreeMap::new();
         env.insert(
-            "ASYLUM_BASE_URL".to_string(),
-            "http://127.0.0.1:7717".to_string(),
+            "ASYLUM_SOCKET_PATH".to_string(),
+            "/tmp/asylum/run/asylum.sock".to_string(),
         );
 
         let target = NativeAttachResponse {
@@ -88,7 +89,7 @@ mod tests {
         let command = render_native_attach_command(&target);
         assert_eq!(
             command,
-            "ASYLUM_BASE_URL=http://127.0.0.1:7717 asylum attach abc"
+            "ASYLUM_SOCKET_PATH=/tmp/asylum/run/asylum.sock asylum attach abc"
         );
     }
 }

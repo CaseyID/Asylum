@@ -1,5 +1,5 @@
 [package]
-name = "asylum-core"
+name = "asylum-types"
 edition.workspace = true
 license.workspace = true
 version.workspace = true

@@ -68,7 +68,7 @@ pub mod ntfy {
 }
 
 pub async fn send_with_optional_config(
-    config: Option<&asylum_core::config::NtfyConfig>,
+    config: Option<&asylum_types::config::NtfyConfig>,
     title: &str,
     body: &str,
 ) -> Result<bool> {

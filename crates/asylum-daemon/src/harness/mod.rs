@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use crate::harness::claude::ClaudeHarness;
 use crate::harness::codex::CodexHarness;
-use asylum_core::config::HarnessConfig;
-use asylum_core::node::{CapabilitySnapshot, HarnessKind};
+use asylum_types::config::HarnessConfig;
+use asylum_types::node::{CapabilitySnapshot, HarnessKind};
 
 mod claude;
 mod codex;
@@ -20,7 +20,7 @@ pub trait HarnessAdapter: Send + Sync {
     fn command(&self) -> &str;
     fn launch_args(&self) -> &[String];
     fn capabilities(&self) -> CapabilitySnapshot;
-    fn launch_context(&self, request: &asylum_core::api::CreateNodeRequest) -> String;
+    fn launch_context(&self, request: &asylum_types::api::CreateNodeRequest) -> String;
 }
 
 #[derive(Clone)]
@@ -74,7 +74,7 @@ fn launch_args_for(config: &HarnessConfig, kind: &HarnessKind) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asylum_core::node::HarnessKind;
+    use asylum_types::node::HarnessKind;
 
     #[test]
     fn default_harness_commands_are_real_clis() {

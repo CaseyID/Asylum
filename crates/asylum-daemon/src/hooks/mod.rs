@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use asylum_core::api::{HookAction, HookEventCatalogEntry, HookFiringRecord, HookRule};
+use asylum_types::api::{HookAction, HookEventCatalogEntry, HookFiringRecord, HookRule};
 use serde_json::Value as JsonValue;
 use tokio::sync::broadcast;
 use uuid::Uuid;

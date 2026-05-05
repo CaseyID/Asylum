@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
-use asylum_core::event::{NodeEvent, NodeEventKind};
-use asylum_core::node::{
+use asylum_types::event::{NodeEvent, NodeEventKind};
+use asylum_types::node::{
     CapabilitySnapshot, GraphRecord, HarnessKind, NodeLiveness, NodeRecord, SubstrateKind,
 };
-use asylum_core::relationship::RelationshipKind;
-use asylum_core::relationship::RelationshipRecord;
+use asylum_types::relationship::RelationshipKind;
+use asylum_types::relationship::RelationshipRecord;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value as JsonValue;
 use std::path::Path;
@@ -582,7 +582,7 @@ impl Store {
 
     /// Returns ALL tokens (active, expired, revoked) for management UI display.
     /// Never returns the raw token value or hash — only metadata.
-    pub fn list_all_tokens(&self) -> Result<Vec<asylum_core::api::TokenSummary>> {
+    pub fn list_all_tokens(&self) -> Result<Vec<asylum_types::api::TokenSummary>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, name, created_at, expires_at, revoked FROM tokens ORDER BY created_at DESC",
@@ -590,7 +590,7 @@ impl Store {
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            out.push(asylum_core::api::TokenSummary {
+            out.push(asylum_types::api::TokenSummary {
                 id: row.get::<_, String>(0)?,
                 label: row.get::<_, String>(1)?,
                 created_at_epoch_secs: row.get::<_, i64>(2)?,
@@ -603,9 +603,8 @@ impl Store {
 
     pub fn get_token_metadata(&self, id: Uuid) -> Result<Option<(String, i64, i64)>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT name, created_at, expires_at FROM tokens WHERE id = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT name, created_at, expires_at FROM tokens WHERE id = ?1")?;
         let row = stmt
             .query_row(params![id.to_string()], |row| {
                 Ok((

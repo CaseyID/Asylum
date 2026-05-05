@@ -70,11 +70,7 @@ pub async fn run(service: Arc<CapabilityService>, cfg: NtfyInboundConfig) {
 }
 
 async fn run_subscription(service: &Arc<CapabilityService>, cfg: &NtfyInboundConfig) -> Result<()> {
-    let url = format!(
-        "{}/{}/json",
-        cfg.server.trim_end_matches('/'),
-        cfg.topic
-    );
+    let url = format!("{}/{}/json", cfg.server.trim_end_matches('/'), cfg.topic);
 
     let client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(0))
@@ -87,10 +83,7 @@ async fn run_subscription(service: &Arc<CapabilityService>, cfg: &NtfyInboundCon
 
     let response = req.send().await?;
     if !response.status().is_success() {
-        return Err(anyhow!(
-            "ntfy stream returned status {}",
-            response.status()
-        ));
+        return Err(anyhow!("ntfy stream returned status {}", response.status()));
     }
 
     // Reset backoff on successful connection is signalled by returning Ok(())
@@ -180,7 +173,8 @@ mod tests {
     #[test]
     fn parse_ntfy_minimal_message() {
         // ntfy sometimes omits title/tags for simple messages
-        let line = r#"{"id":"m1","time":1714367400,"event":"message","topic":"t","message":"ping"}"#;
+        let line =
+            r#"{"id":"m1","time":1714367400,"event":"message","topic":"t","message":"ping"}"#;
         let msg: NtfyMessage = serde_json::from_str(line).expect("should parse minimal message");
         assert_eq!(msg.event, "message");
         assert_eq!(msg.message, "ping");

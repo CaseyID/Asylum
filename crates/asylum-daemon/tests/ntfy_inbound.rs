@@ -6,15 +6,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use asylum_daemon::capability_service::{AppConfig, CapabilityService};
 use asylum_daemon::auth::AuthMode;
+use asylum_daemon::capability_service::{AppConfig, CapabilityService};
 use asylum_daemon::storage::Store;
-use asylum_core::config::AsylumConfig;
-use axum::Router;
+use asylum_types::config::AsylumConfig;
+use axum::body::Body;
 use axum::extract::Path;
 use axum::response::Response;
-use axum::body::Body;
 use axum::routing::get;
+use axum::Router;
 use tokio::net::TcpListener;
 
 fn make_config(ntfy_server: String, ntfy_topic: String) -> AppConfig {
@@ -22,6 +22,7 @@ fn make_config(ntfy_server: String, ntfy_topic: String) -> AppConfig {
     AppConfig {
         base_url: core.base_url,
         bind_addr: "127.0.0.1:0".to_string(),
+        socket_path: None,
         transcripts_dir: "/tmp/asylum-test-ntfy/transcripts".to_string(),
         workspace_recent_limit: 20,
         ntfy_server: Some(ntfy_server),
@@ -35,9 +36,8 @@ fn make_config(ntfy_server: String, ntfy_topic: String) -> AppConfig {
 
 /// Handler that returns two NDJSON lines: an open event then a message event.
 async fn ntfy_stream_handler(Path(topic): Path<String>) -> Response<Body> {
-    let line1 = format!(
-        "{{\"id\":\"a\",\"time\":1000,\"event\":\"open\",\"topic\":\"{topic}\"}}\n"
-    );
+    let line1 =
+        format!("{{\"id\":\"a\",\"time\":1000,\"event\":\"open\",\"topic\":\"{topic}\"}}\n");
     let line2 = format!(
         "{{\"id\":\"b\",\"time\":1001,\"event\":\"message\",\"topic\":\"{topic}\",\"message\":\"hello\",\"title\":\"approve\",\"tags\":[]}}\n"
     );
@@ -68,7 +68,11 @@ async fn ntfy_inbound_message_is_recorded() {
     // Build an in-memory store and CapabilityService.
     let store = Store::open_in_memory().expect("open in-memory store");
     let config = make_config(server_url, topic);
-    let service = Arc::new(CapabilityService::new(store.clone(), AuthMode::Disabled, config));
+    let service = Arc::new(CapabilityService::new(
+        store.clone(),
+        AuthMode::Disabled,
+        config,
+    ));
 
     // Subscribe to hook events before starting background tasks.
     let mut hook_rx = service.hook_engine.subscribe();
@@ -83,7 +87,10 @@ async fn ntfy_inbound_message_is_recorded() {
         let messages = store
             .list_channel_messages("ntfy-default", 10)
             .expect("list messages");
-        if messages.iter().any(|m| m.direction == "in" && m.body == "hello") {
+        if messages
+            .iter()
+            .any(|m| m.direction == "in" && m.body == "hello")
+        {
             found_row = true;
             break;
         }

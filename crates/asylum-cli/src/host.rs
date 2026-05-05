@@ -36,8 +36,6 @@ pub enum ServiceState {
 pub struct ServiceRenderConfig {
     pub binary: PathBuf,
     pub config: PathBuf,
-    pub database: PathBuf,
-    pub bind: String,
     pub log: PathBuf,
 }
 
@@ -118,12 +116,10 @@ impl ServiceManager {
         }
     }
 
-    pub fn render_config(&self, bind: &str) -> ServiceRenderConfig {
+    pub fn render_config(&self, _bind: &str) -> ServiceRenderConfig {
         ServiceRenderConfig {
             binary: self.binary.clone(),
             config: self.paths.config.clone(),
-            database: self.paths.database.clone(),
-            bind: bind.to_string(),
             log: self.paths.log.clone(),
         }
     }
@@ -212,13 +208,10 @@ impl ServiceManager {
             .with_context(|| format!("open log {}", self.paths.log.display()))?;
         let err_log = log.try_clone()?;
         let mut cmd = ProcessCommand::new(&self.binary);
-        cmd.arg("serve")
+        cmd.arg("daemon")
+            .arg("run")
             .arg("--config")
             .arg(&self.paths.config)
-            .arg("--database")
-            .arg(&self.paths.database)
-            .arg("--bind")
-            .arg(bind)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err_log));
@@ -272,7 +265,7 @@ impl ServiceManager {
 
     fn pid_metadata(&self, pid: u32, bind: &str) -> String {
         format!(
-            "pid={pid}\nbinary={}\ncommand=serve\nconfig={}\ndatabase={}\nbind={bind}\n",
+            "pid={pid}\nbinary={}\ncommand=daemon run\nconfig={}\ndatabase={}\nbind={bind}\n",
             self.binary.display(),
             self.paths.config.display(),
             self.paths.database.display(),
@@ -319,8 +312,6 @@ pub fn select_backend() -> ServiceBackend {
 pub fn render_launchd_plist(config: &ServiceRenderConfig) -> String {
     let binary = xml_escape(&config.binary.display().to_string());
     let config_path = xml_escape(&config.config.display().to_string());
-    let database = xml_escape(&config.database.display().to_string());
-    let bind = xml_escape(&config.bind);
     let log = xml_escape(&config.log.display().to_string());
     format!(
         concat!(
@@ -333,13 +324,10 @@ pub fn render_launchd_plist(config: &ServiceRenderConfig) -> String {
             "    <key>ProgramArguments</key>\n",
             "    <array>\n",
             "      <string>{binary}</string>\n",
-            "      <string>serve</string>\n",
+            "      <string>daemon</string>\n",
+            "      <string>run</string>\n",
             "      <string>--config</string>\n",
             "      <string>{config_path}</string>\n",
-            "      <string>--database</string>\n",
-            "      <string>{database}</string>\n",
-            "      <string>--bind</string>\n",
-            "      <string>{bind}</string>\n",
             "    </array>\n",
             "    <key>StandardOutPath</key>\n",
             "    <string>{log}</string>\n",
@@ -355,8 +343,6 @@ pub fn render_launchd_plist(config: &ServiceRenderConfig) -> String {
         label = LABEL,
         binary = binary,
         config_path = config_path,
-        database = database,
-        bind = bind,
         log = log,
     )
 }
@@ -369,7 +355,7 @@ pub fn render_systemd_unit(config: &ServiceRenderConfig) -> String {
             "After=network-online.target\n\n",
             "[Service]\n",
             "Type=simple\n",
-            "ExecStart={} serve --config {} --database {} --bind {}\n",
+            "ExecStart={} daemon run --config {}\n",
             "Restart=on-failure\n",
             "RestartSec=3\n",
             "StandardOutput=append:{}\n",
@@ -379,8 +365,6 @@ pub fn render_systemd_unit(config: &ServiceRenderConfig) -> String {
         ),
         systemd_quote_arg(&config.binary.display().to_string()),
         systemd_quote_arg(&config.config.display().to_string()),
-        systemd_quote_arg(&config.database.display().to_string()),
-        systemd_quote_arg(&config.bind),
         systemd_setting_path(&config.log.display().to_string()),
         systemd_setting_path(&config.log.display().to_string()),
     )
@@ -428,7 +412,7 @@ fn pid_metadata_matches(binary: &Path, pid: u32, content: &str) -> bool {
     let binary = binary.display().to_string();
     metadata_pid == Some(pid)
         && metadata_binary == Some(binary.as_str())
-        && metadata_command == Some("serve")
+        && metadata_command == Some("daemon run")
 }
 
 fn classify_pid_identity(
@@ -437,8 +421,7 @@ fn classify_pid_identity(
     metadata: Option<&str>,
     argv: Option<&[String]>,
 ) -> PidIdentity {
-    let metadata_match =
-        metadata.is_some_and(|content| pid_metadata_matches(binary, pid, content));
+    let metadata_match = metadata.is_some_and(|content| pid_metadata_matches(binary, pid, content));
 
     if let Some(argv) = argv {
         if !command_argv_matches_asylum(binary, argv) {
@@ -503,7 +486,9 @@ fn command_argv_matches_asylum(binary: &Path, argv: &[String]) -> bool {
     let executable_matches = argv0 == &binary
         || (Path::new(argv0).file_name() == binary_path_basename(binary.as_str())
             && !argv0.contains(std::path::MAIN_SEPARATOR));
-    executable_matches && argv.iter().any(|part| part == "serve")
+    executable_matches
+        && argv.iter().any(|part| part == "daemon")
+        && argv.iter().any(|part| part == "run")
 }
 
 fn binary_path_basename(binary: &str) -> Option<&std::ffi::OsStr> {
@@ -1016,8 +1001,6 @@ mod tests {
         ServiceRenderConfig {
             binary: PathBuf::from("/usr/local/bin/asylum"),
             config: PathBuf::from("/tmp/asylum/config.toml"),
-            database: PathBuf::from("/tmp/asylum/asylum.sqlite3"),
-            bind: "127.0.0.1:7717".to_string(),
             log: PathBuf::from("/tmp/asylum/logs/asylum.log"),
         }
     }
@@ -1026,16 +1009,19 @@ mod tests {
     fn launchd_renderer_uses_product_paths() {
         let plist = render_launchd_plist(&render_config());
         assert!(plist.contains("<string>/usr/local/bin/asylum</string>"));
+        assert!(plist.contains("<string>daemon</string>"));
+        assert!(plist.contains("<string>run</string>"));
         assert!(plist.contains("<string>--config</string>"));
         assert!(plist.contains("<string>/tmp/asylum/config.toml</string>"));
-        assert!(plist.contains("<string>/tmp/asylum/asylum.sqlite3</string>"));
         assert!(plist.contains("<string>/tmp/asylum/logs/asylum.log</string>"));
     }
 
     #[test]
     fn systemd_renderer_uses_product_paths() {
         let unit = render_systemd_unit(&render_config());
-        assert!(unit.contains("ExecStart=\"/usr/local/bin/asylum\" serve --config \"/tmp/asylum/config.toml\" --database \"/tmp/asylum/asylum.sqlite3\" --bind \"127.0.0.1:7717\""));
+        assert!(unit.contains(
+            "ExecStart=\"/usr/local/bin/asylum\" daemon run --config \"/tmp/asylum/config.toml\""
+        ));
         assert!(unit.contains("StandardOutput=append:/tmp/asylum/logs/asylum.log"));
     }
 
@@ -1044,14 +1030,11 @@ mod tests {
         let config = ServiceRenderConfig {
             binary: PathBuf::from("/opt/Asylum %bin/asylum"),
             config: PathBuf::from("/tmp/asylum config/config%.toml"),
-            database: PathBuf::from("/tmp/asylum data/asylum%.sqlite3"),
-            bind: "127.0.0.1:7717".to_string(),
             log: PathBuf::from("/tmp/asylum logs/asylum%.log"),
         };
         let unit = render_systemd_unit(&config);
         assert!(unit.contains("\"/opt/Asylum %%bin/asylum\""));
         assert!(unit.contains("\"/tmp/asylum config/config%%.toml\""));
-        assert!(unit.contains("\"/tmp/asylum data/asylum%%.sqlite3\""));
         assert!(unit.contains("StandardOutput=append:/tmp/asylum\\x20logs/asylum%%.log"));
         assert!(unit.contains("StandardError=append:/tmp/asylum\\x20logs/asylum%%.log"));
     }
@@ -1067,13 +1050,13 @@ mod tests {
     #[test]
     fn pid_metadata_requires_matching_binary_pid_and_command() {
         let binary = PathBuf::from("/usr/local/bin/asylum");
-        let content = "pid=42\nbinary=/usr/local/bin/asylum\ncommand=serve\n";
+        let content = "pid=42\nbinary=/usr/local/bin/asylum\ncommand=daemon run\n";
         assert!(pid_metadata_matches(&binary, 42, content));
         assert!(!pid_metadata_matches(&binary, 7, content));
         assert!(!pid_metadata_matches(
             &binary,
             42,
-            "pid=42\nbinary=/bin/sleep\ncommand=serve\n"
+            "pid=42\nbinary=/bin/sleep\ncommand=daemon run\n"
         ));
         assert!(!pid_metadata_matches(
             &binary,
@@ -1085,7 +1068,7 @@ mod tests {
     #[test]
     fn pid_identity_prefers_metadata_when_argv_is_missing() {
         let binary = PathBuf::from("/usr/local/bin/asylum");
-        let metadata = "pid=42\nbinary=/usr/local/bin/asylum\ncommand=serve\n";
+        let metadata = "pid=42\nbinary=/usr/local/bin/asylum\ncommand=daemon run\n";
         assert_eq!(
             classify_pid_identity(&binary, 42, Some(metadata), None),
             PidIdentity::Matches
@@ -1104,7 +1087,7 @@ mod tests {
                 &binary,
                 42,
                 Some(metadata),
-                Some(&argv(&["/usr/local/bin/asylum", "serve"]))
+                Some(&argv(&["/usr/local/bin/asylum", "daemon", "run"]))
             ),
             PidIdentity::Matches
         );
@@ -1113,7 +1096,7 @@ mod tests {
                 &binary,
                 42,
                 None,
-                Some(&argv(&["/usr/local/bin/asylum", "serve"]))
+                Some(&argv(&["/usr/local/bin/asylum", "daemon", "run"]))
             ),
             PidIdentity::Unknown
         );
@@ -1121,7 +1104,7 @@ mod tests {
             classify_pid_identity(
                 &binary,
                 42,
-                Some("pid=42\nbinary=/bin/asylum\ncommand=serve\n"),
+                Some("pid=42\nbinary=/bin/asylum\ncommand=daemon run\n"),
                 None
             ),
             PidIdentity::Mismatch
@@ -1133,19 +1116,19 @@ mod tests {
         let binary = PathBuf::from("/usr/local/bin/asylum");
         assert!(command_argv_matches_asylum(
             &binary,
-            &argv(&["/usr/local/bin/asylum", "serve"])
+            &argv(&["/usr/local/bin/asylum", "daemon", "run"])
         ));
         assert!(command_argv_matches_asylum(
             &binary,
-            &argv(&["asylum", "serve"])
+            &argv(&["asylum", "daemon", "run"])
         ));
         assert!(!command_argv_matches_asylum(
             &binary,
-            &argv(&["/usr/local/bin/asylum-helper", "serve"])
+            &argv(&["/usr/local/bin/asylum-helper", "daemon", "run"])
         ));
         assert!(!command_argv_matches_asylum(
             &binary,
-            &argv(&["sh", "-c", "/usr/local/bin/asylum serve"])
+            &argv(&["sh", "-c", "/usr/local/bin/asylum daemon run"])
         ));
         assert!(!command_argv_matches_asylum(
             &binary,
@@ -1153,20 +1136,21 @@ mod tests {
                 "/usr/local/bin/asylum-helper",
                 "--old",
                 "/usr/local/bin/asylum",
-                "serve"
+                "daemon",
+                "run"
             ])
         ));
         assert!(!command_argv_matches_asylum(
             &binary,
-            &argv(&["/usr/local/bin/asylum serve"])
+            &argv(&["/usr/local/bin/asylum daemon run"])
         ));
         assert!(!command_argv_matches_asylum(
             &binary,
-            &argv(&["/usr/local/bin/asylum", "serve worker"])
+            &argv(&["/usr/local/bin/asylum", "daemon run"])
         ));
         assert!(command_argv_matches_asylum(
             &PathBuf::from("/Applications/Asylum Bin/asylum"),
-            &argv(&["/Applications/Asylum Bin/asylum", "serve"])
+            &argv(&["/Applications/Asylum Bin/asylum", "daemon", "run"])
         ));
     }
 
@@ -1186,12 +1170,8 @@ mod tests {
     fn host_state_collects_for_empty_runtime() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let home = tempdir.path().join("nope");
-        let paths = RuntimePaths::from_values(
-            Some(home),
-            None,
-            None,
-            Some(tempdir.path().to_path_buf()),
-        );
+        let paths =
+            RuntimePaths::from_values(Some(home), None, None, Some(tempdir.path().to_path_buf()));
         let state = HostState::collect(&paths);
         assert_eq!(state.schema_version, HOST_STATE_SCHEMA_VERSION);
         assert!(!state.runtime_dir.present);

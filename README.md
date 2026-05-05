@@ -141,7 +141,7 @@ npm --prefix cockpit run build
 ### Source Run
 
 ```bash
-./target/debug/asylum serve --database ./.asylum/asylum.sqlite3
+./target/debug/asylum daemon run --database ./.asylum/asylum.sqlite3
 ```
 
 For protected mode, bootstrap with an owner token and point CLI/Cockpit at it:
@@ -149,15 +149,16 @@ For protected mode, bootstrap with an owner token and point CLI/Cockpit at it:
 ```bash
 # terminal A
 export ASYLUM_OWNER_TOKEN="$(uuidgen)"
-./target/debug/asylum serve --owner-tokens-enabled
+./target/debug/asylum daemon run --owner-tokens-enabled
 
 # terminal B
 ASYLUM_TOKEN="$ASYLUM_OWNER_TOKEN" ./target/debug/asylum graph get
 open "http://127.0.0.1:7717/?token=$ASYLUM_OWNER_TOKEN"
 ```
 
-The debug daemon serves:
-- `http://127.0.0.1:7717/api/...` for APIs
+The debug daemon exposes:
+- `~/.asylum/run/asylum.sock` for local CLI/MCP control
+- `http://127.0.0.1:7717/api/...` for Cockpit HTTP APIs
 - `/` for the Cockpit single-page UI when `cockpit/dist/index.html` exists
 - `/assets/*` for static assets from `cockpit/dist/assets`
 
@@ -190,7 +191,8 @@ These commands print service definitions you can save as launch artifacts.
 ```
 
 `asylum` also reads optional environment:
-- `ASYLUM_BASE_URL` (default `http://127.0.0.1:7717`)
+- `ASYLUM_SOCKET_PATH` (default `~/.asylum/run/asylum.sock`) for local CLI/MCP daemon control
+- `ASYLUM_BASE_URL` (default `http://127.0.0.1:7717`) for Cockpit URLs and explicit HTTP clients
 - `ASYLUM_TOKEN` (Bearer token for protected endpoints)
 - `ASYLUM_OWNER_TOKEN` and `ASYLUM_OWNER_TOKENS_ENABLED` for daemon-side owner-token auth
 - `ASYLUM_ATTACH_SECRET` for attach URL signing; omitted means a per-process random secret
@@ -201,7 +203,7 @@ When Loon is enabled, Asylum drives the documented `loon` CLI contract (`spawn`,
 
 ### Acceptance Walkthrough
 
-1. Build and run `asylum serve` and confirm startup succeeds.
+1. Build and run `asylum daemon run` and confirm startup succeeds.
 2. `curl http://127.0.0.1:7717/api/graph` returns a JSON object with `graph`.
 3. Create a node:
    - `asylum node create --harness codex --substrate local --role worker`
@@ -219,5 +221,5 @@ When Loon is enabled, Asylum drives the documented `loon` CLI contract (`spawn`,
 8. Exercise remote commands:
    - Issue a token, then `curl -X POST -H 'Content-Type: application/json' -d '{"command":"status token=<token>"}' http://127.0.0.1:7717/api/remote-commands`.
 9. If Loon is configured:
-   - `asylum serve --loon-enabled --loon-endpoint https://<host>:7777`
+   - `asylum daemon run --loon-enabled --loon-endpoint https://<host>:7777`
    - `asylum node create --harness claude_code --substrate loon --role worker`

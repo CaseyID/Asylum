@@ -10,6 +10,8 @@ pub struct HealthResponse {
     pub status: String,
     pub daemon_version: String,
     pub bind_addr: String,
+    pub base_url: String,
+    pub socket_path: Option<String>,
     pub database_path: String,
     pub database_size_bytes: u64,
     pub transcripts_dir: String,

@@ -6,18 +6,7 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-asylum-core = { path = "../asylum-core" }
+asylum-cli = { path = "../asylum-cli" }
 asylum-daemon = { path = "../asylum-daemon" }
-clap.workspace = true
-dirs.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-reqwest.workspace = true
-toml.workspace = true
-uuid.workspace = true
-libc.workspace = true
-
-[dev-dependencies]
-tempfile = "3"

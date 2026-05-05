@@ -1,16 +1,17 @@
 use std::io::{Read, Write};
 use std::net::SocketAddr;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
-use asylum_core::api::{
+use anyhow::{bail, Context, Result};
+use asylum_types::api::{
     ChannelCreateRequest, ChannelInboundRequest, ChannelTestRequest, ChannelUpdateRequest,
     CreateNodeRequest, ErrorPayload, ForkNodeRequest, HookCreateRequest, HookUpdateRequest,
     LaunchPacketResponse, RecipeSpawnRequest, SendInputRequest,
 };
-use asylum_core::config::AsylumConfig;
-use asylum_core::node::SubstrateKind;
-use asylum_core::security::TokenRequest;
+use asylum_types::config::AsylumConfig;
+use asylum_types::node::SubstrateKind;
+use asylum_types::security::TokenRequest;
 use axum::extract::ws::Message;
 use axum::{
     extract::{
@@ -27,6 +28,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast::error::RecvError, mpsc, Mutex};
 use uuid::Uuid;
 
@@ -66,6 +69,54 @@ const MISSING_COCKPIT_ASSETS_MESSAGE: &str =
     "cockpit assets not present; run `npm --prefix cockpit run build` and serve `cockpit/dist`";
 
 pub async fn serve(bind: SocketAddr, database: String, config: AsylumConfig) -> Result<()> {
+    serve_with_socket(bind, database, None, config).await
+}
+
+pub async fn serve_with_socket(
+    bind: SocketAddr,
+    database: String,
+    socket_path: Option<PathBuf>,
+    config: AsylumConfig,
+) -> Result<()> {
+    let state = build_state(bind, database, socket_path.clone(), config)?;
+    let service_arc = Arc::new(state.service.clone());
+    service_arc.start_background_tasks();
+
+    let tcp_router = build_router_for_transport(state.clone(), true);
+    println!("Asylum daemon HTTP listening on http://{bind}");
+    let tcp_listener = TcpListener::bind(bind).await?;
+    let tcp_server = axum::serve(tcp_listener, tcp_router.into_make_service());
+
+    #[cfg(unix)]
+    if let Some(socket_path) = socket_path {
+        let socket_listener = bind_unix_socket(&socket_path).await?;
+        let socket_router = build_router_for_transport(state.clone(), false);
+        println!(
+            "Asylum daemon local control listening on {}",
+            socket_path.display()
+        );
+        tokio::select! {
+            result = tcp_server => result?,
+            result = axum::serve(socket_listener, socket_router.into_make_service()) => result?,
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    if socket_path.is_some() {
+        bail!("local control sockets are only supported on Unix platforms");
+    }
+
+    tcp_server.await?;
+    Ok(())
+}
+
+fn build_state(
+    bind: SocketAddr,
+    database: String,
+    socket_path: Option<PathBuf>,
+    config: AsylumConfig,
+) -> Result<Arc<AppState>> {
     let store = Store::open(database)?;
     // The static config token (from env/flag) has no DB row so we store its hash
     // separately for a direct short-circuit.  All DB-issued tokens are validated
@@ -112,6 +163,7 @@ pub async fn serve(bind: SocketAddr, database: String, config: AsylumConfig) -> 
         AppConfig {
             base_url,
             bind_addr: format!("{bind}"),
+            socket_path: socket_path.map(|path| path.display().to_string()),
             transcripts_dir,
             workspace_recent_limit: config.workspace.recent_limit,
             ntfy_server: config.ntfy.server,
@@ -123,17 +175,45 @@ pub async fn serve(bind: SocketAddr, database: String, config: AsylumConfig) -> 
         },
     );
 
-    let state = Arc::new(AppState { service });
-    let service_arc = Arc::new(state.service.clone());
-    service_arc.start_background_tasks();
-    let router = build_router(state.clone());
-    println!("Asylum serving on http://{bind}");
-    let listener = TcpListener::bind(bind).await?;
-    axum::serve(listener, router.into_make_service()).await?;
-    Ok(())
+    Ok(Arc::new(AppState { service }))
+}
+
+#[cfg(unix)]
+async fn bind_unix_socket(path: &FsPath) -> Result<UnixListener> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create socket directory {}", parent.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    if path.exists() {
+        if UnixStream::connect(path).await.is_ok() {
+            bail!("local control socket is already in use: {}", path.display());
+        }
+        tokio::fs::remove_file(path)
+            .await
+            .with_context(|| format!("remove stale socket {}", path.display()))?;
+    }
+
+    let listener = UnixListener::bind(path)
+        .with_context(|| format!("bind local control socket {}", path.display()))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(listener)
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
+    build_router_for_transport(state, true)
+}
+
+pub fn build_router_for_transport(state: Arc<AppState>, require_auth: bool) -> Router {
     let protected = Router::new()
         .route("/api/capabilities", get(api_capabilities))
         .route("/api/client-config", get(api_client_config))
@@ -199,11 +279,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/hooks/{id}/test", post(api_hook_test))
         .route("/api/recipes", get(api_recipes_list))
         .route("/api/recipes/{id}/spawn", post(api_recipe_spawn))
-        .route("/api/nodes/{id}/fork", post(api_node_fork))
-        .layer(middleware::from_fn_with_state(
+        .route("/api/nodes/{id}/fork", post(api_node_fork));
+    let protected = if require_auth {
+        protected.layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
-        ));
+        ))
+    } else {
+        protected
+    };
 
     let mut router = Router::new()
         .route("/attach/{token}", get(api_attach_page))
@@ -230,38 +314,38 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
 pub async fn api_health(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_core::api::HealthResponse> {
+) -> Json<asylum_types::api::HealthResponse> {
     Json(state.service.health().await)
 }
 
 pub async fn api_capabilities(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_core::api::CapabilityListResponse> {
+) -> Json<asylum_types::api::CapabilityListResponse> {
     Json(state.service.capabilities().await)
 }
 
 pub async fn api_client_config(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_core::api::ClientConfigResponse> {
+) -> Json<asylum_types::api::ClientConfigResponse> {
     Json(state.service.client_config().await)
 }
 
 pub async fn api_nodes_list(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_core::api::NodeListResponse> {
+) -> Json<asylum_types::api::NodeListResponse> {
     Json(state.service.list_nodes().await)
 }
 
 pub async fn api_graph(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_core::api::GraphGetResponse> {
+) -> Json<asylum_types::api::GraphGetResponse> {
     Json(state.service.graph().await)
 }
 
 pub async fn api_nodes_create(
     Extension(state): Extension<Arc<AppState>>,
     Json(request): Json<CreateNodeRequest>,
-) -> Result<Json<asylum_core::api::NodeCreateResponse>, AppError> {
+) -> Result<Json<asylum_types::api::NodeCreateResponse>, AppError> {
     let response = state
         .service
         .create_node(request)
@@ -273,7 +357,7 @@ pub async fn api_nodes_create(
 pub async fn api_node_inspect(
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<asylum_core::api::NodeInspectResponse>, AppError> {
+) -> Result<Json<asylum_types::api::NodeInspectResponse>, AppError> {
     let id = Uuid::parse_str(&id)
         .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
     let response = state
@@ -287,7 +371,7 @@ pub async fn api_node_inspect(
 pub async fn api_node_events(
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<asylum_core::api::NodeEventsResponse>, AppError> {
+) -> Result<Json<asylum_types::api::NodeEventsResponse>, AppError> {
     let id = Uuid::parse_str(&id)
         .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
     Ok(Json(state.service.node_events(id).await))
@@ -353,7 +437,7 @@ pub async fn api_node_archive(
 pub async fn api_node_attach_browser(
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<asylum_core::api::AttachResponse>, AppError> {
+) -> Result<Json<asylum_types::api::AttachResponse>, AppError> {
     let id = Uuid::parse_str(&id)
         .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
     let response = state
@@ -367,7 +451,7 @@ pub async fn api_node_attach_browser(
 pub async fn api_node_attach_native(
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<asylum_core::api::NativeAttachResponse>, AppError> {
+) -> Result<Json<asylum_types::api::NativeAttachResponse>, AppError> {
     let id = Uuid::parse_str(&id)
         .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
     let response = state
@@ -461,26 +545,26 @@ async fn handle_node_observe_ws(
 
 pub async fn api_harnesses(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_core::api::HarnessListResponse> {
+) -> Json<asylum_types::api::HarnessListResponse> {
     Json(state.service.list_harnesses().await)
 }
 
 pub async fn api_substrates(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_core::api::SubstrateListResponse> {
+) -> Json<asylum_types::api::SubstrateListResponse> {
     let response = state.service.list_substrates().await;
     Json(response)
 }
 
 pub async fn api_harness_descriptors(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_core::api::HarnessDescriptorResponse> {
+) -> Json<asylum_types::api::HarnessDescriptorResponse> {
     Json(state.service.list_harness_descriptors().await)
 }
 
 pub async fn api_substrate_descriptors(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_core::api::SubstrateDescriptorResponse> {
+) -> Json<asylum_types::api::SubstrateDescriptorResponse> {
     Json(state.service.list_substrate_descriptors().await)
 }
 
@@ -492,7 +576,7 @@ pub async fn api_recent_workspaces(
 
 pub async fn api_system_map(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_core::api::GraphGetResponse> {
+) -> Json<asylum_types::api::GraphGetResponse> {
     Json(state.service.graph().await)
 }
 
@@ -512,8 +596,8 @@ pub async fn api_launch_packet(
 
 pub async fn api_create_relationship(
     Extension(state): Extension<Arc<AppState>>,
-    Json(request): Json<asylum_core::api::RelationshipCreateRequest>,
-) -> Result<Json<asylum_core::relationship::RelationshipRecord>, AppError> {
+    Json(request): Json<asylum_types::api::RelationshipCreateRequest>,
+) -> Result<Json<asylum_types::relationship::RelationshipRecord>, AppError> {
     let response = state
         .service
         .create_relationship(request)
@@ -524,7 +608,7 @@ pub async fn api_create_relationship(
 
 pub async fn api_list_relationships(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_core::api::RelationshipResponse> {
+) -> Json<asylum_types::api::RelationshipResponse> {
     Json(state.service.list_relationships().await)
 }
 
@@ -545,7 +629,7 @@ pub async fn api_delete_relationship(
 pub async fn api_issue_token(
     Extension(state): Extension<Arc<AppState>>,
     Json(payload): Json<TokenRequest>,
-) -> Result<Json<asylum_core::api::TokenIssueResponse>, AppError> {
+) -> Result<Json<asylum_types::api::TokenIssueResponse>, AppError> {
     let response = state
         .service
         .issue_token(payload)
@@ -570,7 +654,7 @@ pub async fn api_revoke_token(
 
 pub async fn api_tokens_list(
     Extension(state): Extension<Arc<AppState>>,
-) -> Result<Json<asylum_core::api::TokenListResponse>, AppError> {
+) -> Result<Json<asylum_types::api::TokenListResponse>, AppError> {
     let response = state
         .service
         .list_tokens()
@@ -582,7 +666,7 @@ pub async fn api_tokens_list(
 pub async fn api_token_rotate(
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<asylum_core::api::TokenRotateResponse>, AppError> {
+) -> Result<Json<asylum_types::api::TokenRotateResponse>, AppError> {
     let id = Uuid::parse_str(&id)
         .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "invalid token id".to_string()))?;
     let response = state
@@ -595,7 +679,7 @@ pub async fn api_token_rotate(
 
 pub async fn api_notifications(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_core::api::NotificationsResponse> {
+) -> Json<asylum_types::api::NotificationsResponse> {
     Json(state.service.list_notifications().await)
 }
 
@@ -613,7 +697,7 @@ pub async fn api_notification_read(
 pub async fn api_remote_commands(
     Extension(state): Extension<Arc<AppState>>,
     Json(payload): Json<serde_json::Value>,
-) -> Result<Json<asylum_core::api::RemoteCommandResponse>, AppError> {
+) -> Result<Json<asylum_types::api::RemoteCommandResponse>, AppError> {
     let raw = payload
         .get("command")
         .and_then(serde_json::Value::as_str)
@@ -904,7 +988,7 @@ pub struct LimitQuery {
 
 pub async fn api_channels_list(
     Extension(state): Extension<Arc<AppState>>,
-) -> Result<Json<asylum_core::api::ChannelListResponse>, AppError> {
+) -> Result<Json<asylum_types::api::ChannelListResponse>, AppError> {
     let response = state
         .service
         .list_channels()
@@ -916,7 +1000,7 @@ pub async fn api_channels_list(
 pub async fn api_channels_create(
     Extension(state): Extension<Arc<AppState>>,
     Json(request): Json<ChannelCreateRequest>,
-) -> Result<Json<asylum_core::api::ChannelDescriptor>, AppError> {
+) -> Result<Json<asylum_types::api::ChannelDescriptor>, AppError> {
     let response = state
         .service
         .create_channel(request)
@@ -928,7 +1012,7 @@ pub async fn api_channels_create(
 pub async fn api_channel_inspect(
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<asylum_core::api::ChannelDescriptor>, AppError> {
+) -> Result<Json<asylum_types::api::ChannelDescriptor>, AppError> {
     let response = state
         .service
         .inspect_channel(&id)
@@ -941,7 +1025,7 @@ pub async fn api_channel_update(
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<String>,
     Json(request): Json<ChannelUpdateRequest>,
-) -> Result<Json<asylum_core::api::ChannelDescriptor>, AppError> {
+) -> Result<Json<asylum_types::api::ChannelDescriptor>, AppError> {
     let response = state
         .service
         .update_channel(&id, request)
@@ -965,7 +1049,7 @@ pub async fn api_channel_messages(
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<String>,
     Query(query): Query<LimitQuery>,
-) -> Result<Json<asylum_core::api::ChannelMessagesResponse>, AppError> {
+) -> Result<Json<asylum_types::api::ChannelMessagesResponse>, AppError> {
     let limit = query.limit.unwrap_or(200).min(1000);
     let response = state
         .service
@@ -979,7 +1063,7 @@ pub async fn api_channel_test(
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<String>,
     Json(request): Json<ChannelTestRequest>,
-) -> Result<Json<asylum_core::api::ChannelTestResponse>, AppError> {
+) -> Result<Json<asylum_types::api::ChannelTestResponse>, AppError> {
     let response = state
         .service
         .channel_test(&id, request)
@@ -1003,7 +1087,7 @@ pub async fn api_channel_inbound(
 
 pub async fn api_hooks_list(
     Extension(state): Extension<Arc<AppState>>,
-) -> Result<Json<asylum_core::api::HookListResponse>, AppError> {
+) -> Result<Json<asylum_types::api::HookListResponse>, AppError> {
     let response = state
         .service
         .list_hooks()
@@ -1015,7 +1099,7 @@ pub async fn api_hooks_list(
 pub async fn api_hooks_create(
     Extension(state): Extension<Arc<AppState>>,
     Json(request): Json<HookCreateRequest>,
-) -> Result<Json<asylum_core::api::HookRule>, AppError> {
+) -> Result<Json<asylum_types::api::HookRule>, AppError> {
     let response = state
         .service
         .create_hook(request)
@@ -1027,7 +1111,7 @@ pub async fn api_hooks_create(
 pub async fn api_hook_inspect(
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<asylum_core::api::HookRule>, AppError> {
+) -> Result<Json<asylum_types::api::HookRule>, AppError> {
     let response = state
         .service
         .inspect_hook(&id)
@@ -1040,7 +1124,7 @@ pub async fn api_hook_update(
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<String>,
     Json(request): Json<HookUpdateRequest>,
-) -> Result<Json<asylum_core::api::HookRule>, AppError> {
+) -> Result<Json<asylum_types::api::HookRule>, AppError> {
     let response = state
         .service
         .update_hook(&id, request)
@@ -1063,7 +1147,7 @@ pub async fn api_hook_delete(
 pub async fn api_hook_firings(
     Extension(state): Extension<Arc<AppState>>,
     Query(query): Query<LimitQuery>,
-) -> Result<Json<asylum_core::api::HookFiringsResponse>, AppError> {
+) -> Result<Json<asylum_types::api::HookFiringsResponse>, AppError> {
     let limit = query.limit.unwrap_or(200).min(1000);
     let response = state
         .service
@@ -1075,14 +1159,14 @@ pub async fn api_hook_firings(
 
 pub async fn api_hook_events(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_core::api::HookEventCatalogResponse> {
+) -> Json<asylum_types::api::HookEventCatalogResponse> {
     Json(state.service.hook_event_catalog().await)
 }
 
 pub async fn api_hook_test(
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<asylum_core::api::HookTestResponse>, AppError> {
+) -> Result<Json<asylum_types::api::HookTestResponse>, AppError> {
     let response = state
         .service
         .hook_test(&id)
@@ -1093,7 +1177,7 @@ pub async fn api_hook_test(
 
 pub async fn api_recipes_list(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_core::api::RecipeListResponse> {
+) -> Json<asylum_types::api::RecipeListResponse> {
     Json(state.service.list_recipes().await)
 }
 
@@ -1101,7 +1185,7 @@ pub async fn api_recipe_spawn(
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<String>,
     Json(request): Json<RecipeSpawnRequest>,
-) -> Result<Json<asylum_core::api::RecipeSpawnResponse>, AppError> {
+) -> Result<Json<asylum_types::api::RecipeSpawnResponse>, AppError> {
     let response = state
         .service
         .spawn_recipe(&id, request)
@@ -1114,7 +1198,7 @@ pub async fn api_node_fork(
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<String>,
     Json(request): Json<ForkNodeRequest>,
-) -> Result<Json<asylum_core::node::NodeRecord>, AppError> {
+) -> Result<Json<asylum_types::node::NodeRecord>, AppError> {
     let id = Uuid::parse_str(&id)
         .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
     let node = state

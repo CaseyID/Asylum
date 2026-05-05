@@ -45,15 +45,9 @@ pub struct AttachToken {
 }
 
 impl AttachToken {
-    pub fn is_expired(&self) -> bool {
-        let now = chrono_like_unix_now();
-        self.expires_at_epoch_secs <= now
+    pub fn is_expired_at(&self, now_epoch_secs: i64) -> bool {
+        self.expires_at_epoch_secs <= now_epoch_secs
     }
-}
-
-pub fn chrono_like_unix_now() -> i64 {
-    let duration = time::OffsetDateTime::now_utc() - time::OffsetDateTime::UNIX_EPOCH;
-    duration.whole_seconds()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

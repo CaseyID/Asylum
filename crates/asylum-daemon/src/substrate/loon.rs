@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
-use asylum_core::api::SubstrateHealth;
-use asylum_core::node::{CapabilitySnapshot, HarnessKind};
+use asylum_types::api::SubstrateHealth;
+use asylum_types::node::{CapabilitySnapshot, HarnessKind};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;

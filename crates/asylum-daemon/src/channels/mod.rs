@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use asylum_core::api::{ChannelDescriptor, ChannelMessageRecord};
+use asylum_types::api::{ChannelDescriptor, ChannelMessageRecord};
 
 use crate::storage::{ChannelMessageRow, ChannelRow, Store};
 

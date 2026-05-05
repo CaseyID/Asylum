@@ -1,6 +1,6 @@
 # CLI composability + `asylum uninstall` — design review
 
-**Status:** design review, decisions captured. Ready to convert to per-PR plans.
+**Status:** design review, decisions captured. Lifecycle goals remain, but crate layout and daemon-entry details are now rebased onto the finalized 2026-05-04 architecture spec.
 **Date:** 2026-04-30
 **Owner:** Casey
 **Scope:** v0.1.x. Architecture for shared host-state introspection, a friendly `asylum uninstall`, and trimming the install-time shell script down to a thin bootstrap.
@@ -10,8 +10,8 @@
 Today, lifecycle logic is scattered:
 
 - `scripts/install.sh` knows about platform/arch detection, archive layout, signature verification, install paths, and PATH hints.
-- `crates/asylum/src/cli.rs` has its own implementations of "is the daemon running?", "is `~/.asylum` set up?", "what's the binary version?" inside `setup`, `status`, `doctor`, and `update` — each command answers similar questions slightly differently.
-- `crates/asylum/src/service.rs` already encodes launchd / systemd-user / pid-fallback detection, but it's only consumed by a couple of commands and the same shape isn't exposed as data anywhere else.
+- `crates/asylum-cli/src/cli.rs` has its own implementations of "is the daemon running?", "is `~/.asylum` set up?", "what's the binary version?" inside `setup`, `status`, `doctor`, and `update` — each command answers similar questions slightly differently.
+- `crates/asylum-cli/src/service.rs` already encodes launchd / systemd-user / pid-fallback detection, but it's only consumed by a couple of commands and the same shape isn't exposed as data anywhere else.
 - `asylum install systemd|launchd` is misnamed: it only prints unit text to stdout. Nothing is actually installed.
 - There is no way to cleanly remove an Asylum install. Users (and us, during release testing) `rm` files by hand, which is fine for `~/.local/bin/asylum` but error-prone around `~/.asylum/`, `~/.config/asylum/` (signing keys live there), and service units.
 
@@ -19,13 +19,14 @@ The goal is one place where lifecycle state is defined, and a CLI surface that c
 
 ## 2. Crate architecture context
 
-There are three crates today:
+The finalized architecture has four crates:
 
-- **`asylum-core`** — pure data contracts (request/response types, capability tokens, event shapes). Deps are minimal: `serde`, `uuid`, `time`. No I/O, no filesystem, no process spawning. Both the daemon and the CLI agree on these types; a third-party tool talking to the API would pull just this crate.
-- **`asylum-daemon`** — the long-running server. Owns `axum`, `rusqlite`, `portable-pty`, `rust-embed` (cockpit baked in at compile time), plus substrate / harness / channels / hooks / notifications. Depends on `asylum-core`.
-- **`asylum`** — the CLI binary. `cli.rs` (clap), `client.rs` (HTTP client), `service.rs` (service-backend detection), `runtime.rs`, `mcp.rs`, `native_attach.rs`. Depends on both other crates.
+- **`asylum`** — tiny composition crate that builds the only installed binary target, `asylum`.
+- **`asylum-cli`** — CLI, MCP bridge, Unix-socket daemon client, service lifecycle, runtime, and native attach helpers. Depends on `asylum-types`.
+- **`asylum-daemon`** — the long-running server. Owns `axum`, `rusqlite`, `portable-pty`, `rust-embed` (cockpit baked in at compile time), plus substrate / harness / channels / hooks / notifications. Depends on `asylum-types`.
+- **`asylum-types`** — pure data contracts (request/response types, capability tokens, event shapes). Deps are minimal: `serde`, `uuid`, `time`. No I/O, no filesystem, no process spawning.
 
-There is exactly **one binary on disk**: `asylum`. The "daemon" isn't a separate binary — `asylum serve` links `asylum-daemon` into the CLI binary and runs its entrypoint. So lifecycle introspection ("is anything running, where is my binary, what's in `~/.asylum`") is fundamentally a CLI-side concern: the CLI introspects the host; the daemon doesn't introspect itself.
+There is exactly **one binary on disk**: `asylum`. The "daemon" is not a separate binary; foreground daemon mode is `asylum daemon run`, which dispatches from the composition crate into `asylum-daemon`. Lifecycle introspection ("is anything running, where is my binary, what's in `~/.asylum`") is fundamentally a CLI-side concern: `asylum-cli` introspects the host; the daemon doesn't introspect itself. Local CLI/MCP daemon control uses the Unix socket at `~/.asylum/run/asylum.sock`; Cockpit remains on HTTP/WebSocket.
 
 This frames where new shared lifecycle code should live.
 
@@ -37,7 +38,7 @@ Three layers, top to bottom.
 
 A single struct describing "what does this machine look like from Asylum's perspective." Cheap to construct, side-effect-free.
 
-**Location: `crates/asylum/src/host.rs`** (in the CLI crate, alongside `cli.rs` / `service.rs` / `client.rs`). Not `asylum-core` — that crate is data-contracts-only and adding sysinfo / fs / process / launchd / systemd code there forces every consumer of the protocol types to inherit OS-introspection deps. Not a new `asylum-host` crate either — there is no second consumer today, and extracting later is a mechanical refactor (move the file, change one `use` path). The current `service.rs` content folds into `host.rs` as part of this.
+**Location: `crates/asylum-cli/src/host.rs`** (in the CLI crate, alongside `cli.rs` / `service.rs` / `client.rs`). Not `asylum-types` — that crate is data-contracts-only and adding sysinfo / fs / process / launchd / systemd code there forces every consumer of the protocol types to inherit OS-introspection deps. Not a new `asylum-host` crate either — there is no second consumer today, and extracting later is a mechanical refactor (move the file, change one `use` path). The current `service.rs` content folds into `host.rs` as part of this.
 
 Rough shape:
 
@@ -129,7 +130,7 @@ This is the only intentional CLI break in this batch and lands in v0.1.x where s
 
 ## 7. Out of scope
 
-- No daemon-mode rework. `serve` stays as-is.
+- No daemon-mode rework beyond the finalized `asylum daemon run` and Unix-socket architecture refactor. `asylum serve` is removed there, not retained.
 - No cockpit asset overhaul. Cockpit's footprint shows up in `HostState`, but build/dev/embed pipelines don't change.
 - No multi-user / system-wide install. Everything stays per-user (`~/.local/bin`, `~/.asylum`, user systemd, user launchd).
 - No Windows. Not yet.
@@ -139,7 +140,7 @@ This is the only intentional CLI break in this batch and lands in v0.1.x where s
 
 | # | Decision |
 |---|---|
-| 1 | `HostState` lives at `crates/asylum/src/host.rs` (CLI crate). `service.rs` detection folds in. |
+| 1 | `HostState` lives at `crates/asylum-cli/src/host.rs` (CLI crate). `service.rs` detection folds in. |
 | 2 | `status --json` ships with `schema_version` from day one; schema is versioned, not promised stable across v0.1.x → v0.2. |
 | 3 | No `install --post-bootstrap` flag. `install.sh` ends with `exec asylum setup`. First-run banner is a property of `setup`. |
 | 4 | First-run banner from bare `asylum` only when `~/.asylum` does not yet exist; otherwise clap help. |

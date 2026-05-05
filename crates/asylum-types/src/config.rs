@@ -19,6 +19,13 @@ pub struct AsylumConfig {
     pub workspace: WorkspaceConfig,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AsylumFileConfig {
+    #[serde(flatten)]
+    pub core: AsylumConfig,
+    pub database: String,
+}
+
 impl Default for AsylumConfig {
     fn default() -> Self {
         Self {

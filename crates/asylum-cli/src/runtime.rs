@@ -10,6 +10,7 @@ pub struct RuntimePaths {
     pub database: PathBuf,
     pub log: PathBuf,
     pub pid: PathBuf,
+    pub socket: PathBuf,
 }
 
 impl RuntimePaths {
@@ -35,9 +36,13 @@ impl RuntimePaths {
         });
         let config = config_override.unwrap_or_else(|| home.join("config.toml"));
         let database = database_override.unwrap_or_else(|| home.join("asylum.sqlite3"));
+        let socket = env::var_os("ASYLUM_SOCKET_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("run").join("asylum.sock"));
         Self {
             log: home.join("logs").join("asylum.log"),
             pid: home.join("run").join("asylum.pid"),
+            socket,
             home,
             config,
             database,
@@ -63,6 +68,10 @@ impl RuntimePaths {
 
     pub fn run_dir(&self) -> PathBuf {
         self.home.join("run")
+    }
+
+    pub fn socket_path(&self) -> PathBuf {
+        self.socket.clone()
     }
 }
 
@@ -90,6 +99,10 @@ mod tests {
         assert_eq!(
             paths.pid,
             PathBuf::from("/Users/example/.asylum/run/asylum.pid")
+        );
+        assert_eq!(
+            paths.socket,
+            PathBuf::from("/Users/example/.asylum/run/asylum.sock")
         );
     }
 

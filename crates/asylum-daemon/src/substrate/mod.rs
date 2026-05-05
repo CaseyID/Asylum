@@ -1,6 +1,6 @@
 use uuid::Uuid;
 
-use asylum_core::node::HarnessKind;
+use asylum_types::node::HarnessKind;
 
 #[derive(Clone)]
 pub struct SubstrateContext {

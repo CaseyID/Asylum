@@ -1,4 +1,5 @@
 use std::env;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::{self, StatusCode};
@@ -6,15 +7,16 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use asylum_core::api::{
+use asylum_types::api::{
     CreateNodeRequest, GraphGetResponse, HealthResponse, NativeAttachResponse, NodeCreateResponse,
     NodeEventsResponse, NodeInspectResponse, NodeListResponse, SendInputRequest,
     TokenIssueResponse,
 };
-use asylum_core::security::TokenRequest;
+use asylum_types::security::TokenRequest;
 
 pub struct AsylumClient {
     base_url: String,
+    socket_path: Option<PathBuf>,
     token: Option<String>,
     http: reqwest::Client,
 }
@@ -34,14 +36,41 @@ impl AsylumClient {
     pub fn new(base_url: impl Into<String>, token: impl Into<Option<String>>) -> Self {
         Self {
             base_url: base_url.into(),
+            socket_path: None,
             token: token.into(),
             http: reqwest::Client::new(),
         }
     }
 
+    #[cfg(unix)]
+    pub fn new_socket(socket_path: impl AsRef<Path>) -> Result<Self> {
+        let socket_path = socket_path.as_ref().to_path_buf();
+        let http = reqwest::Client::builder()
+            .unix_socket(socket_path.clone())
+            .build()
+            .context("build Unix-socket daemon client")?;
+        Ok(Self {
+            base_url: "http://asylum.local".to_string(),
+            socket_path: Some(socket_path),
+            token: None,
+            http,
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub fn new_socket(_socket_path: impl AsRef<Path>) -> Result<Self> {
+        Err(anyhow!(
+            "Unix-socket daemon client is only supported on Unix platforms"
+        ))
+    }
+
     #[allow(dead_code)]
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    pub fn socket_path(&self) -> Option<&Path> {
+        self.socket_path.as_deref()
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -175,7 +204,7 @@ impl AsylumClient {
             .await
     }
 
-    pub async fn browser_attach_url(&self, id: Uuid) -> Result<asylum_core::api::AttachResponse> {
+    pub async fn browser_attach_url(&self, id: Uuid) -> Result<asylum_types::api::AttachResponse> {
         let path = format!("/api/nodes/{id}/attach/browser");
         self.send_request(reqwest::Method::POST, &path, Option::<&str>::None)
             .await
