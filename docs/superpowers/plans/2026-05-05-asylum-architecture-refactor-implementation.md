@@ -45,5 +45,5 @@ Implement [docs/reviews/2026-05-04-asylum-architecture-refactor-spec.md](../../r
 
 ## Release Status
 
-On branch, not released — implementation/refactor work only. No release cut in
-this task. See [RELEASES.md](../../RELEASES.md) for the release ledger.
+Released as v0.1.5. See [RELEASES.md](../../RELEASES.md) for the release
+ledger.

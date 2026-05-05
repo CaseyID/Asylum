@@ -665,5 +665,5 @@ checkpoint only. The completed refactor target is socket-based CLI/MCP control.
 
 ## Release Status
 
-Doc-only / internal architecture spec. No release needed. See
-[RELEASES.md](../../RELEASES.md) for the current published version ledger.
+Released as v0.1.5. See [RELEASES.md](../../RELEASES.md) for the current
+published version ledger.

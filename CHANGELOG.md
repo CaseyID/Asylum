@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.5 — 2026-05-05
+
+### Changed
+
+- Reshaped the Rust workspace around the finalized architecture: `asylum` is now the tiny single-binary composition crate, `asylum-cli` owns CLI/MCP/local lifecycle behavior, `asylum-daemon` owns the resident control process, and `asylum-types` owns shared data contracts.
+- Replaced foreground daemon mode `asylum serve` with `asylum daemon run`. Service templates and PID identity checks now use the new command shape.
+- Moved local CLI/MCP daemon control to the Unix socket at `~/.asylum/run/asylum.sock`, with `ASYLUM_SOCKET_PATH` override support. Cockpit remains on daemon HTTP/WebSocket.
+- Moved daemon run configuration loading into `asylum-daemon`, including bind/database/socket/base URL/env/CLI merge behavior.
+
+### Added
+
+- Daemon health now reports the effective Cockpit `base_url` and local `socket_path`.
+- Socket health integration coverage verifies local Unix-socket control bypasses HTTP bearer-token auth while HTTP remains protected.
+
+### Removed
+
+- `asylum serve` is gone; there is no compatibility alias.
+- `asylum-core` crate name is gone; shared contracts now live in `asylum-types`.
+
 ## 0.1.4 — 2026-04-30
 
 ### Added
