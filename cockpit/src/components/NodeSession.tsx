@@ -207,7 +207,6 @@ export function NodeSession({
         const url = typeof body.url === "string" ? body.url : (typeof body.attach_url === "string" ? body.attach_url : "");
         const targetNode = typeof body.node_id === "string" ? body.node_id : (evt.node_id ?? node.id);
         setEntries(p => [...p, { kind: "attach", node: targetNode, url }]);
-        if (onAttach) onAttach(targetNode);
         return;
       }
       default: {
@@ -325,12 +324,12 @@ function SessionHeader({
             size="sm"
             icon="external-link"
             iconOnly
-            title={node.substrate === "loon" ? "browser attach via loon attach" : "browser attach"}
+            title={node.substrate === "loon" ? "open attach tab via loon attach" : "open attach tab"}
             onClick={() => onAttach(node.id)}
           />
         )}
         {onNativeAttach && (
-          <Btn kind="ghost" size="sm" icon="terminal" iconOnly title="native attach" onClick={() => onNativeAttach(node.id)} />
+          <Btn kind="ghost" size="sm" icon="terminal" iconOnly title="open in terminal" onClick={() => onNativeAttach(node.id)} />
         )}
         {onInterrupt && (
           <Btn kind="ghost" size="sm" icon="square" iconOnly title="interrupt" onClick={() => onInterrupt(node.id)} />
@@ -431,11 +430,11 @@ function TermEntry({
       <div className="attach-preview">
         <div className="h">
           <Icon name="external-link" size={11} />
-          <span>browser attach: <span style={{ color: "var(--fg)" }}>{e.node}</span></span>
+          <span>attach tab: <span style={{ color: "var(--fg)" }}>{e.node}</span></span>
           <span className="right" style={{ marginLeft: "auto", color: "var(--fg-subtle)" }}>time-limited url</span>
         </div>
         <div className="body">
-          <span className="muted">{">"}</span> <span className="b">open an authenticated browser attach session for this node</span>{"\n"}
+          <span className="muted">{">"}</span> <span className="b">open a time-limited Cockpit attach view for this node</span>{"\n"}
           <span className="muted">url</span> {e.url}
         </div>
         <div className="foot">

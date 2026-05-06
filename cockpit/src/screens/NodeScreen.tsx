@@ -128,11 +128,11 @@ export function NodeScreen({
             <Pill status={state}>{uiStateLabel(state)}</Pill>
             {cc && <Tag kind="role">command-center</Tag>}
             <span className="right">
-              <Btn size="sm" icon="external-link" onClick={() => fire("attach", "attach url issued")}>
-                attach in browser
+              <Btn size="sm" icon="external-link" onClick={() => fire("attach", "attach link issued")}>
+                open attach tab
               </Btn>
-              <Btn size="sm" icon="terminal" onClick={() => fire("native-attach", "native attach prepared")}>
-                native attach
+              <Btn size="sm" icon="terminal" onClick={() => fire("native-attach", "terminal attach prepared")}>
+                open in terminal
               </Btn>
             </span>
           </div>
@@ -167,8 +167,8 @@ export function NodeScreen({
             key={node.id}
             node={node}
             mode="fullscreen"
-            onAttach={() => fire("attach", "attach url issued")}
-            onNativeAttach={() => fire("native-attach", "native attach prepared")}
+            onAttach={() => fire("attach", "attach link issued")}
+            onNativeAttach={() => fire("native-attach", "terminal attach prepared")}
             onInterrupt={() => fire("interrupt", "sigint sent · paused")}
           />
         )}

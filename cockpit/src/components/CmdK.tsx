@@ -38,7 +38,7 @@ export function CmdK({
     },
     {
       sec: "actions",
-      label: "attach in browser…",
+      label: "open attach tab…",
       icon: "external-link",
       action: () => onAttachInBrowser(),
     },

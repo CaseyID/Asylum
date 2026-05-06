@@ -302,7 +302,7 @@ export function App() {
     try {
       if (action === "attach") {
         const r = await requestBrowserAttach(target.id);
-        setLocalNotice(r.note ?? `attach url issued · ttl ${r.expires_in_seconds ?? 3600}s`);
+        setLocalNotice(r.note ?? `attach link issued · ttl ${r.expires_in_seconds ?? 3600}s`);
         if (typeof window !== "undefined" && r.attach_url) {
           window.open(r.attach_url, "_blank", "noopener,noreferrer");
         }
@@ -312,7 +312,7 @@ export function App() {
         if (typeof navigator !== "undefined" && navigator.clipboard) {
           await navigator.clipboard.writeText(cmd);
         }
-        setLocalNotice("native attach command copied to clipboard");
+        setLocalNotice("terminal attach command copied to clipboard");
       } else if (action === "send") {
         setSelectedNode(target.id);
         setChatNodeId(target.id);

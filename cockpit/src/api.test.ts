@@ -128,7 +128,7 @@ describe("attach api helpers", () => {
           url: "http://127.0.0.1:7800/attach/token-123",
           expires_in_seconds: 600,
           transport: "loon_attach_proxy",
-          note: "browser attach relays `loon attach`",
+          note: "attach tab relays `loon attach`",
         }),
         {
           status: 200,

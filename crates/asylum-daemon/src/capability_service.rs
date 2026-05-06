@@ -627,14 +627,14 @@ impl CapabilityService {
                 CapabilityName::NodeAttachBrowser,
                 "/api/nodes/{id}/attach/browser",
                 "POST",
-                "Issue a browser attach URL",
+                "Issue an attach-tab URL",
                 true,
             ),
             descriptor(
                 CapabilityName::NodeAttachNativeTarget,
                 "/api/nodes/{id}/attach/native-target",
                 "POST",
-                "Describe a native attach target",
+                "Describe a terminal attach target",
                 true,
             ),
             descriptor(
@@ -1427,7 +1427,7 @@ impl CapabilityService {
         let (transport, note) = if node.substrate == SubstrateKind::Loon {
             (
                 Some("loon_attach_proxy".to_string()),
-                Some("browser attach relays `loon attach`; live PTY-style observe is unavailable for Loon nodes".to_string()),
+                Some("attach tab relays `loon attach`; live PTY-style observe is unavailable for Loon nodes".to_string()),
             )
         } else {
             (Some("local_pty".to_string()), None)
