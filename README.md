@@ -68,6 +68,14 @@ export ASYLUM_NTFY_TOKEN="your-access-token"  # if your server requires auth
 
 When configured, the daemon subscribes to the topic at startup. Inbound ntfy messages appear as toasts in Cockpit and trigger `channel.inbound` hooks. Nodes can send outbound notifications via `asylum notify send`.
 
+### Known Limits
+
+- Asylum is single-user in v0.1.x. Owner tokens protect HTTP access, but token scopes are advisory labels, not per-route authorization.
+- Local substrate behavior is the most validated path. Loon is optional and requires a configured Loon endpoint plus the `loon` CLI contract.
+- Inbound ntfy/webhook messages are recorded and can trigger hooks, but node addressing/reply correlation is still limited.
+- Decisions are not yet a first-class operator workflow; remote approve/deny pieces exist, but pending decision surfacing is incomplete.
+- Keep Cockpit bound to localhost unless you are deliberately protecting access with a private network such as Tailscale. Browser attach URLs and transcripts are sensitive.
+
 ## Release Artifact Expectations
 
 Local release packaging produces archives named:
@@ -167,8 +175,8 @@ The debug daemon exposes:
 ### Service File Output
 
 ```bash
-./target/debug/asylum install launchd
-./target/debug/asylum install systemd
+./target/debug/asylum service generate launchd
+./target/debug/asylum service generate systemd
 ```
 
 These commands print service definitions you can save as launch artifacts.
@@ -191,6 +199,8 @@ These commands print service definitions you can save as launch artifacts.
 ./target/debug/asylum notify send --title "note" --body "message"
 ./target/debug/asylum mcp
 ```
+
+Token scopes are advisory labels in v0.1.x. Owner-token auth is enforced at the token level; per-route scope enforcement is not implemented yet.
 
 `asylum` also reads optional environment:
 - `ASYLUM_SOCKET_PATH` (default `~/.asylum/run/asylum.sock`) for local CLI/MCP daemon control

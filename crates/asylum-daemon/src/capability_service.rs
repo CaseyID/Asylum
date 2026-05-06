@@ -1,8 +1,9 @@
-use std::sync::Arc;
+use std::{env, path::Path, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use asylum_types::api::{
     AttachResponse, CapabilityListResponse, ClientConfigResponse, CreateNodeRequest,
+    DecisionCreateRequest, DecisionListResponse, DecisionRecord, DecisionResolveRequest,
     GraphGetResponse, HarnessDescriptor, HarnessDescriptorResponse, HarnessListResponse,
     HealthResponse, LaunchPacketResponse, NativeAttachResponse, NodeCreateResponse,
     NodeEventsResponse, NodeInspectResponse, NodeListResponse, Notification, NotificationsResponse,
@@ -19,6 +20,7 @@ use asylum_types::node::{
 use asylum_types::relationship::RelationshipKind;
 use asylum_types::security::TokenRequest;
 use serde_json::{json, Value as JsonValue};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::attach::AttachTokenIssuer;
@@ -28,6 +30,7 @@ use crate::channels::{
     descriptor_from_row, message_record_from_row, ntfy_inbound, render_template, require_channel,
     seed_builtin_channels, SeedConfig, NTFY_DEFAULT_ID,
 };
+use crate::decision_ingester::{DecisionProtocolRequest, ASYLUM_DECISION_PROTOCOL};
 use crate::harness::HarnessRegistry;
 use crate::hooks::{
     evaluate_filter, event_catalog, firing_record_from_row, rule_from_row, HookEngine, HookEvent,
@@ -35,7 +38,7 @@ use crate::hooks::{
 };
 use crate::notifications::send_with_optional_config;
 use crate::recipes;
-use crate::remote_commands::{ParsedRemoteCommand, RemoteCommandKind};
+use crate::remote_commands::{parse_remote_command, ParsedRemoteCommand, RemoteCommandKind};
 use crate::storage::Store;
 use crate::substrate::loon::{capability_flags_from_health, LoonHealth, LoonSubstrate};
 use crate::substrate::{LocalSubstrate, SubstrateContext};
@@ -48,6 +51,76 @@ use asylum_types::api::{
 };
 use asylum_types::config::{HarnessConfig, LoonConfig};
 use asylum_types::node::NodeRecord;
+
+const CHANNEL_REPLY_TOKEN_LENGTH: usize = 5;
+const CHANNEL_REPLY_CORRELATION_TTL_SECONDS: i64 = 60 * 30;
+const NODE_PERMISSION_REQUESTED_HOOK_EVENT: &str = "node.permission_requested";
+
+#[derive(Clone)]
+struct LocalDecisionIngestion {
+    store: Store,
+    hook_engine: Arc<HookEngine>,
+}
+
+impl LocalDecisionIngestion {
+    fn ingest_request(
+        &self,
+        node_id: Uuid,
+        request: DecisionProtocolRequest,
+    ) -> Result<DecisionRecord> {
+        let source = request.source;
+        let actions = request.actions;
+        let node = self.store.get_node(node_id)?.context("node not found")?;
+        if request.text.trim().is_empty() {
+            return Err(anyhow!("decision text required"));
+        }
+        let decision = map_decision(
+            self.store
+                .insert_decision(Some(node.id), request.text.trim())?,
+        );
+        let _ = self.store.insert_notification(
+            Some(node.id),
+            "decision",
+            "Decision requested",
+            &decision.text,
+        );
+        let _ = self.store.record_event(
+            node.id,
+            NodeEventKind::HumanInputRequested,
+            json!({
+                "decision": decision.id,
+                "text": decision.text,
+                "source": source.clone(),
+                "actions": actions.clone(),
+            }),
+        );
+        if let Err(e) = self
+            .store
+            .set_node_liveness(node.id, NodeLiveness::WaitingForInput)
+        {
+            tracing::warn!(error = %e, node_id = %node.id, "failed to set node waiting_for_input");
+        }
+        if hook_event_is_supported() {
+            self.hook_engine.post(HookEvent {
+                event: NODE_PERMISSION_REQUESTED_HOOK_EVENT.to_string(),
+                node_id: Some(node.id),
+                payload: json!({
+                    "decision": decision.id,
+                    "node": {"id": node.id.to_string()},
+                    "source": source,
+                    "actions": actions,
+                }),
+            });
+        }
+        Ok(decision)
+    }
+}
+
+fn hook_event_is_supported() -> bool {
+    event_catalog()
+        .iter()
+        .any(|event| event.id == NODE_PERMISSION_REQUESTED_HOOK_EVENT)
+}
 
 #[derive(Clone)]
 pub struct AppConfig {
@@ -81,12 +154,24 @@ impl CapabilityService {
         let issuer = AttachTokenIssuer::new(
             std::env::var("ASYLUM_ATTACH_SECRET").unwrap_or_else(|_| Uuid::new_v4().to_string()),
         );
+        let hook_engine = HookEngine::new();
         let sink_store = store.clone();
-        let local_substrate = LocalSubstrate::new(move |node_id, chunk| {
-            if let Err(e) = sink_store.append_transcript_chunk(node_id, chunk) {
-                tracing::warn!(error = %e, "failed to persist transcript chunk");
-            }
-        });
+        let decision_ingester = LocalDecisionIngestion {
+            store: store.clone(),
+            hook_engine: hook_engine.clone(),
+        };
+        let local_substrate = LocalSubstrate::new_with_decision_sink(
+            move |node_id, chunk| {
+                if let Err(e) = sink_store.append_transcript_chunk(node_id, chunk) {
+                    tracing::warn!(error = %e, "failed to persist transcript chunk");
+                }
+            },
+            move |node_id, request| {
+                if let Err(e) = decision_ingester.ingest_request(node_id, request) {
+                    tracing::warn!(error = %e, node_id = %node_id, "failed to ingest decision request");
+                }
+            },
+        );
         let loon_substrate = if config.loon.enabled {
             Some(Arc::new(LoonSubstrate::new(
                 &config.loon.endpoint,
@@ -106,7 +191,6 @@ impl CapabilityService {
         ) {
             tracing::error!(error = %err, "failed to seed built-in channels at startup");
         }
-        let hook_engine = HookEngine::new();
         Self {
             store,
             harnesses: HarnessRegistry::from_config(&config.harness),
@@ -202,17 +286,29 @@ impl CapabilityService {
         subject: &str,
         body: &str,
         replies: &[String],
+        node_id: Option<Uuid>,
+        correlation_token: Option<&str>,
     ) -> Result<()> {
-        self.store
-            .insert_channel_message(channel_id, "in", sender, subject, body, replies)?;
+        self.store.insert_channel_message(
+            channel_id,
+            "in",
+            sender,
+            subject,
+            body,
+            replies,
+            node_id,
+            correlation_token,
+        )?;
         self.post_hook_event(
             "channel.inbound",
-            None,
+            node_id,
             serde_json::json!({
                 "channel_id": channel_id,
                 "sender": sender,
                 "subject": subject,
                 "body": body,
+                "node_id": node_id.map(|id| id.to_string()),
+                "correlation_token": correlation_token,
             }),
         );
         Ok(())
@@ -294,7 +390,8 @@ impl CapabilityService {
                 });
                 let rendered_title = render_template(title, payload);
                 let rendered_body = render_template(&template, payload);
-                self.send_via_channel(&channel.id, &rendered_title, &rendered_body)
+                let node_id = payload_node_id(payload);
+                self.send_via_channel(&channel.id, &rendered_title, &rendered_body, node_id)
                     .await?;
                 Ok(format!("channel:{}", channel.id))
             }
@@ -359,7 +456,9 @@ impl CapabilityService {
             ));
         }
         if target == "transcript.checkpoint" {
-            return Ok("transcript.checkpoint:noop".to_string());
+            return Err(anyhow!(
+                "tool target 'transcript.checkpoint' is not supported yet"
+            ));
         }
         Err(anyhow!("unknown tool target '{target}'"))
     }
@@ -369,14 +468,40 @@ impl CapabilityService {
         channel_id: &str,
         title: &str,
         body: &str,
+        node_id: Option<Uuid>,
     ) -> Result<bool> {
         let channel = require_channel(&self.store, channel_id)?;
+        let mut sent_correlation_token: Option<String> = None;
+        let mut body_to_send = body.to_string();
+        let effective_node_id = node_id;
+
         let sent = if !channel.live {
             false
         } else if channel.kind == "ntfy" {
-            self.notify_send(title.to_string(), body.to_string(), None, None, None)
-                .await
-                .unwrap_or(false)
+            if let Some(node_id) = node_id {
+                let token = next_channel_reply_token();
+                let marked_body = ntfy_inbound::append_reply_marker(body, &token);
+                if self
+                    .send_ntfy(title, &marked_body, None, None, None)
+                    .await?
+                {
+                    let expires_at = OffsetDateTime::now_utc().unix_timestamp()
+                        + CHANNEL_REPLY_CORRELATION_TTL_SECONDS;
+                    self.store.insert_channel_reply_correlation(
+                        &token,
+                        &channel.id,
+                        node_id,
+                        expires_at,
+                    )?;
+                    body_to_send = marked_body;
+                    sent_correlation_token = Some(token);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                self.send_ntfy(title, body, None, None, None).await?
+            }
         } else {
             true
         };
@@ -390,8 +515,10 @@ impl CapabilityService {
             "out",
             "asylum",
             &recorded_subject,
-            body,
+            &body_to_send,
             &[],
+            effective_node_id,
+            sent_correlation_token.as_deref(),
         )?;
         Ok(sent)
     }
@@ -405,6 +532,24 @@ fn node_id_from_payload(payload: &JsonValue) -> Result<Uuid> {
         .or_else(|| payload.get("node_id").and_then(JsonValue::as_str))
         .ok_or_else(|| anyhow!("payload missing node id"))?;
     Ok(Uuid::parse_str(raw)?)
+}
+
+fn payload_node_id(payload: &JsonValue) -> Option<Uuid> {
+    payload
+        .get("node")
+        .and_then(|node| node.get("id"))
+        .and_then(JsonValue::as_str)
+        .or_else(|| payload.get("node_id").and_then(JsonValue::as_str))
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+}
+
+fn next_channel_reply_token() -> String {
+    Uuid::new_v4()
+        .to_string()
+        .replace('-', "")
+        .chars()
+        .take(CHANNEL_REPLY_TOKEN_LENGTH)
+        .collect()
 }
 
 impl CapabilityService {
@@ -588,6 +733,20 @@ impl CapabilityService {
                 "/api/remote-commands",
                 "POST",
                 "Receive and execute a remote command",
+                true,
+            ),
+            descriptor(
+                CapabilityName::DecisionRequest,
+                "/api/decisions",
+                "POST",
+                "Create and list operator decisions",
+                true,
+            ),
+            descriptor(
+                CapabilityName::DecisionResolve,
+                "/api/decisions/{id}/resolve",
+                "POST",
+                "Resolve an operator decision",
                 true,
             ),
             descriptor(
@@ -904,7 +1063,7 @@ impl CapabilityService {
                 id,
                 name,
                 kind: "cli".to_string(),
-                available: true,
+                available: command_available(adapter.command()),
                 command: adapter.command().to_string(),
                 caps,
             });
@@ -1017,13 +1176,14 @@ impl CapabilityService {
         )?;
         let mut launch_args = adapter.launch_args().to_vec();
         launch_args.extend(request.launch_args.clone());
+        let env = self.local_launch_env(&node, &harness, &substrate, &capabilities)?;
         let context = SubstrateContext {
             node_id: node.id,
             harness: harness.clone(),
             command: adapter.command().to_string(),
             args: launch_args,
             workspace: request.workspace.clone(),
-            env: vec![],
+            env,
         };
         match substrate {
             SubstrateKind::Local => {
@@ -1081,6 +1241,59 @@ impl CapabilityService {
         })
     }
 
+    fn local_launch_env(
+        &self,
+        node: &NodeRecord,
+        harness: &HarnessKind,
+        substrate: &SubstrateKind,
+        capabilities: &CapabilitySnapshot,
+    ) -> Result<Vec<(String, String)>> {
+        let mut env = vec![
+            ("ASYLUM_NODE_ID".to_string(), node.id.to_string()),
+            ("ASYLUM_NODE_ROLE".to_string(), node.role_hint.clone()),
+            ("ASYLUM_HARNESS".to_string(), harness.to_string()),
+            ("ASYLUM_SUBSTRATE".to_string(), substrate.to_string()),
+            ("ASYLUM_BASE_URL".to_string(), self.config.base_url.clone()),
+            (
+                "ASYLUM_CONTROL_TRANSPORT".to_string(),
+                if self.config.socket_path.is_some() {
+                    "unix-socket".to_string()
+                } else {
+                    "http".to_string()
+                },
+            ),
+            (
+                "ASYLUM_DECISION_PROTOCOL".to_string(),
+                ASYLUM_DECISION_PROTOCOL.to_string(),
+            ),
+            (
+                "ASYLUM_CAPABILITIES_JSON".to_string(),
+                serde_json::to_string(capabilities)?,
+            ),
+            (
+                "ASYLUM_GRAPH_SUMMARY".to_string(),
+                self.graph_summary()
+                    .unwrap_or_else(|_| "graph unavailable".to_string()),
+            ),
+        ];
+        if let Some(workspace) = &node.workspace {
+            env.push(("ASYLUM_WORKSPACE".to_string(), workspace.clone()));
+        }
+        if let Some(socket_path) = &self.config.socket_path {
+            env.push(("ASYLUM_SOCKET_PATH".to_string(), socket_path.clone()));
+        }
+        Ok(env)
+    }
+
+    fn graph_summary(&self) -> Result<String> {
+        let graph = self.store.graph()?;
+        Ok(format!(
+            "{} nodes with {} explicit edges",
+            graph.nodes.len(),
+            graph.relationships.len()
+        ))
+    }
+
     pub async fn create_relationship(
         &self,
         request: RelationshipCreateRequest,
@@ -1108,11 +1321,6 @@ impl CapabilityService {
 
     pub async fn send_input(&self, node_id: Uuid, payload: SendInputRequest) -> Result<()> {
         let node = self.store.get_node(node_id)?.context("node not found")?;
-        self.store.record_event(
-            node_id,
-            NodeEventKind::InputSent,
-            json!({ "text": payload.text }),
-        )?;
         match node.substrate {
             SubstrateKind::Local => {
                 self.local_substrate
@@ -1120,12 +1328,15 @@ impl CapabilityService {
                     .await?
             }
             SubstrateKind::Loon => {
-                if let Some(loon) = &self.loon_substrate {
-                    let external_id = node.external_id.context("missing loon external id")?;
-                    loon.send_input(&external_id, &payload.text).await?;
-                }
+                let (loon, external_id) = self.require_loon_target(&node)?;
+                loon.send_input(external_id, &payload.text).await?;
             }
         }
+        self.store.record_event(
+            node_id,
+            NodeEventKind::InputSent,
+            json!({ "text": payload.text }),
+        )?;
         Ok(())
     }
 
@@ -1134,10 +1345,8 @@ impl CapabilityService {
         match node.substrate {
             SubstrateKind::Local => self.local_substrate.interrupt(node_id).await?,
             SubstrateKind::Loon => {
-                if let Some(loon) = &self.loon_substrate {
-                    let external_id = node.external_id.context("missing loon external id")?;
-                    loon.interrupt(&external_id).await?;
-                }
+                let (loon, external_id) = self.require_loon_target(&node)?;
+                loon.interrupt(external_id).await?;
             }
         }
         self.store
@@ -1155,11 +1364,8 @@ impl CapabilityService {
         match node.substrate {
             SubstrateKind::Local => self.local_substrate.stop(node_id).await?,
             SubstrateKind::Loon => {
-                if let Some(loon) = &self.loon_substrate {
-                    if let Some(external) = node.external_id.as_deref() {
-                        loon.stop(external).await?;
-                    }
-                }
+                let (loon, external_id) = self.require_loon_target(&node)?;
+                loon.stop(external_id).await?;
             }
         }
         self.store
@@ -1179,11 +1385,8 @@ impl CapabilityService {
                     let _ = self.local_substrate.stop(node_id).await;
                 }
                 SubstrateKind::Loon => {
-                    if let (Some(loon), Some(external)) =
-                        (self.loon_substrate.as_ref(), node.external_id.as_deref())
-                    {
-                        loon.archive(external).await?;
-                    }
+                    let (loon, external_id) = self.require_loon_target(&node)?;
+                    loon.archive(external_id).await?;
                 }
             }
         }
@@ -1197,8 +1400,23 @@ impl CapabilityService {
         Ok(())
     }
 
+    fn require_loon_target<'a>(
+        &'a self,
+        node: &'a asylum_types::node::NodeRecord,
+    ) -> Result<(&'a LoonSubstrate, &'a str)> {
+        let loon = self
+            .loon_substrate
+            .as_deref()
+            .ok_or_else(|| anyhow!("loon substrate is not configured"))?;
+        let external_id = node
+            .external_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("missing loon external id"))?;
+        Ok((loon, external_id))
+    }
+
     pub async fn attach_browser(&self, node_id: Uuid) -> Result<AttachResponse> {
-        self.store.get_node(node_id)?.context("node not found")?;
+        let node = self.store.get_node(node_id)?.context("node not found")?;
         let token = self.attach_issuer.issue(node_id, 600)?;
         let fingerprint = &token.raw[..token.raw.len().min(6)];
         self.store.record_event(
@@ -1206,9 +1424,19 @@ impl CapabilityService {
             NodeEventKind::AttachIssued,
             json!({ "token_fingerprint": fingerprint }),
         )?;
+        let (transport, note) = if node.substrate == SubstrateKind::Loon {
+            (
+                Some("loon_attach_proxy".to_string()),
+                Some("browser attach relays `loon attach`; live PTY-style observe is unavailable for Loon nodes".to_string()),
+            )
+        } else {
+            (Some("local_pty".to_string()), None)
+        };
         Ok(AttachResponse {
             url: format!("{}/attach/{}", self.config.base_url, token.raw),
             expires_in_seconds: 600,
+            transport,
+            note,
         })
     }
 
@@ -1412,12 +1640,41 @@ impl CapabilityService {
                     Err(error) => Err(error),
                 }
             }
-            RemoteCommandKind::ApproveDecision => Ok((
-                None,
-                resolve_remote_decision(&self.store, &args, "approved")?,
-            )),
+            RemoteCommandKind::ApproveDecision => {
+                let decision_id = decision_id_from_remote_args(&args)?;
+                let decision = self
+                    .resolve_decision(
+                        decision_id,
+                        DecisionResolveRequest {
+                            status: "approved".to_string(),
+                        },
+                    )
+                    .await?;
+                Ok((
+                    None,
+                    json!({
+                        "decision": decision.id,
+                        "status": decision.status,
+                    }),
+                ))
+            }
             RemoteCommandKind::DenyDecision => {
-                Ok((None, resolve_remote_decision(&self.store, &args, "denied")?))
+                let decision_id = decision_id_from_remote_args(&args)?;
+                let decision = self
+                    .resolve_decision(
+                        decision_id,
+                        DecisionResolveRequest {
+                            status: "denied".to_string(),
+                        },
+                    )
+                    .await?;
+                Ok((
+                    None,
+                    json!({
+                        "decision": decision.id,
+                        "status": decision.status,
+                    }),
+                ))
             }
         };
 
@@ -1556,10 +1813,132 @@ impl CapabilityService {
         self.store.mark_notification_read(id)
     }
 
+    pub async fn create_decision(&self, request: DecisionCreateRequest) -> Result<DecisionRecord> {
+        if request.text.trim().is_empty() {
+            return Err(anyhow!("decision text required"));
+        }
+        let node_id = request
+            .node_id
+            .as_deref()
+            .map(Uuid::parse_str)
+            .transpose()
+            .context("invalid node_id")?;
+        if let Some(node_id) = node_id {
+            self.store.get_node(node_id)?.context("node not found")?;
+        }
+        let decision = map_decision(self.store.insert_decision(node_id, request.text.trim())?);
+        let _ = self.store.insert_notification(
+            node_id,
+            "decision",
+            "Decision requested",
+            &decision.text,
+        );
+        if let Some(node_id) = node_id {
+            let _ = self.store.record_event(
+                node_id,
+                NodeEventKind::HumanInputRequested,
+                json!({
+                    "decision": decision.id,
+                    "text": decision.text,
+                }),
+            );
+        }
+        Ok(decision)
+    }
+
+    pub async fn list_decisions(&self) -> Result<DecisionListResponse> {
+        Ok(DecisionListResponse {
+            decisions: self
+                .store
+                .list_decisions()?
+                .into_iter()
+                .map(map_decision)
+                .collect(),
+        })
+    }
+
+    pub async fn get_decision(&self, id: &str) -> Result<DecisionRecord> {
+        self.store
+            .get_decision(id)?
+            .map(map_decision)
+            .context("decision not found")
+    }
+
+    pub async fn resolve_decision(
+        &self,
+        id: &str,
+        request: DecisionResolveRequest,
+    ) -> Result<DecisionRecord> {
+        let status = match request.status.as_str() {
+            "approved" | "denied" => request.status,
+            _ => return Err(anyhow!("decision status must be approved or denied")),
+        };
+        let before = self.get_decision(id).await?;
+        if !self.store.resolve_decision(id, &status)? {
+            return Err(anyhow!("decision not found"));
+        }
+        let after = self.get_decision(id).await?;
+        let node_id = before
+            .node_id
+            .as_deref()
+            .and_then(|raw| Uuid::parse_str(raw).ok());
+        if let Some(node_id) = node_id {
+            if let Ok(Some(node)) = self.store.get_node(node_id) {
+                if matches!(node.liveness, NodeLiveness::WaitingForInput) {
+                    self.store
+                        .set_node_liveness(node_id, NodeLiveness::Running)?;
+                }
+            }
+        }
+        let _ = self.store.insert_notification(
+            node_id,
+            "decision",
+            "Decision resolved",
+            &format!("{}: {}", after.status, after.text),
+        );
+        if let Some(node_id) = node_id {
+            let _ = self.store.record_event(
+                node_id,
+                NodeEventKind::RemoteCommandReceived,
+                json!({
+                    "decision": after.id,
+                    "status": after.status,
+                }),
+            );
+        }
+        Ok(after)
+    }
+
     pub async fn notify_send(
         &self,
         title: impl AsRef<str>,
         body: impl AsRef<str>,
+        server: Option<String>,
+        topic: Option<String>,
+        token: Option<String>,
+    ) -> Result<bool> {
+        let sent = self
+            .send_ntfy(title.as_ref(), body.as_ref(), server, topic, token)
+            .await?;
+        if sent {
+            let _ = self.store.insert_channel_message(
+                NTFY_DEFAULT_ID,
+                "out",
+                "asylum",
+                title.as_ref(),
+                body.as_ref(),
+                &[],
+                None,
+                None,
+            );
+        }
+        Ok(sent)
+    }
+
+    async fn send_ntfy(
+        &self,
+        title: &str,
+        body: &str,
         server: Option<String>,
         topic: Option<String>,
         token: Option<String>,
@@ -1571,17 +1950,9 @@ impl CapabilityService {
             poll_interval_seconds: 30,
         };
         if configured.server.is_none() || configured.topic.is_none() {
-            return Ok(false);
+            return Err(anyhow!("ntfy notification channel is not configured"));
         }
-        send_with_optional_config(Some(&configured), title.as_ref(), body.as_ref()).await?;
-        let _ = self.store.insert_channel_message(
-            NTFY_DEFAULT_ID,
-            "out",
-            "asylum",
-            title.as_ref(),
-            body.as_ref(),
-            &[],
-        );
+        send_with_optional_config(Some(&configured), title, body).await?;
         Ok(true)
     }
 
@@ -1717,20 +2088,109 @@ impl CapabilityService {
         request: ChannelTestRequest,
     ) -> Result<ChannelTestResponse> {
         let sent = self
-            .send_via_channel(id, &request.title, &request.body)
+            .send_via_channel(id, &request.title, &request.body, None)
             .await?;
         Ok(ChannelTestResponse { sent })
     }
 
     pub async fn channel_inbound(&self, id: &str, request: ChannelInboundRequest) -> Result<()> {
-        require_channel(&self.store, id)?;
+        let channel = require_channel(&self.store, id)?;
+        if !channel.live {
+            return Err(anyhow!("channel '{id}' is not live"));
+        }
+        if !matches!(channel.direction.as_str(), "inbound" | "duplex") {
+            return Err(anyhow!("channel '{id}' does not accept inbound messages"));
+        }
+        let node_id = request
+            .node_id
+            .as_deref()
+            .map(Uuid::parse_str)
+            .transpose()
+            .context("invalid node_id")?;
+
+        let remote_command_result = self
+            .execute_inbound_remote_command_if_present(&request.body)
+            .await?;
+
+        if remote_command_result.is_none() {
+            if let Some(node_id) = node_id {
+                self.send_input(
+                    node_id,
+                    SendInputRequest {
+                        text: request.body.clone(),
+                    },
+                )
+                .await?;
+            }
+        }
+
         self.record_channel_inbound(
             id,
             &request.sender,
             &request.subject,
             &request.body,
             &request.replies,
-        )
+            remote_command_result.flatten().or(node_id),
+            request.correlation_token.as_deref(),
+        )?;
+        Ok(())
+    }
+
+    async fn execute_inbound_remote_command_if_present(
+        &self,
+        body: &str,
+    ) -> Result<Option<Option<Uuid>>> {
+        if !looks_like_remote_command(body) {
+            return Ok(None);
+        }
+        if !body
+            .split_whitespace()
+            .skip(1)
+            .any(|part| part.starts_with("token="))
+        {
+            return Ok(None);
+        }
+
+        let command = parse_remote_command(body)?;
+        if remote_command_requires_node(&command.kind) && command.node_id.is_none() {
+            return Err(anyhow!("command requires node"));
+        }
+        let token_id = self.token_id_for_raw(&command.token, true)?;
+        let token_id = token_id.ok_or_else(|| anyhow!("invalid token"))?;
+        let response = self.execute_remote_command(Some(token_id), command).await?;
+        let node_id = response
+            .node_id
+            .as_deref()
+            .map(Uuid::parse_str)
+            .transpose()
+            .context("invalid remote command response node_id")?;
+        Ok(Some(node_id))
+    }
+
+    pub async fn route_channel_inbound_from_subscriber(
+        &self,
+        id: &str,
+        sender: String,
+        subject: String,
+        body: String,
+        replies: Vec<String>,
+        node_id: Option<Uuid>,
+        correlation_token: Option<String>,
+    ) -> Result<()> {
+        let request = ChannelInboundRequest {
+            sender,
+            subject,
+            body,
+            replies,
+            node_id: node_id.map(|value| value.to_string()),
+            correlation_token,
+        };
+        self.channel_inbound(id, request).await
+    }
+
+    pub async fn route_raw_channel_input(&self, node_id: Uuid, body: String) -> Result<()> {
+        self.send_input(node_id, SendInputRequest { text: body })
+            .await
     }
 
     pub async fn list_hooks(&self) -> Result<HookListResponse> {
@@ -1973,6 +2433,35 @@ pub async fn loom_support_for_harness(
     Ok(capability_flags_from_health(&health, &harness))
 }
 
+fn command_available(command: &str) -> bool {
+    if command.trim().is_empty() {
+        return false;
+    }
+    let command_path = Path::new(command);
+    if command_path.components().count() > 1 {
+        return is_executable_file(command_path);
+    }
+    let Some(paths) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&paths).any(|dir| is_executable_file(&dir.join(command)))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
 fn parse_relationship_kind(raw: &str) -> Result<RelationshipKind> {
     Ok(match raw {
         "supervises" => RelationshipKind::Supervises,
@@ -1981,6 +2470,23 @@ fn parse_relationship_kind(raw: &str) -> Result<RelationshipKind> {
         "platform_responsibility" => RelationshipKind::PlatformResponsibility,
         _ => return Err(anyhow!("unsupported relationship kind")),
     })
+}
+
+fn looks_like_remote_command(raw: &str) -> bool {
+    matches!(
+        raw.split_whitespace().next(),
+        Some("status" | "attach" | "send" | "start" | "interrupt" | "stop" | "approve" | "deny")
+    )
+}
+
+fn remote_command_requires_node(kind: &RemoteCommandKind) -> bool {
+    matches!(
+        kind,
+        RemoteCommandKind::Attach
+            | RemoteCommandKind::SendInput
+            | RemoteCommandKind::Interrupt
+            | RemoteCommandKind::Stop
+    )
 }
 
 fn descriptor(
@@ -1999,21 +2505,23 @@ fn descriptor(
     }
 }
 
-fn resolve_remote_decision(
-    store: &Store,
-    args: &std::collections::HashMap<String, String>,
-    status: &str,
-) -> Result<serde_json::Value> {
-    let decision_id = args
-        .get("decision")
-        .ok_or_else(|| anyhow!("decision required"))?;
-    if !store.resolve_decision(decision_id, status)? {
-        return Err(anyhow!("decision not found"));
+fn decision_id_from_remote_args(args: &std::collections::HashMap<String, String>) -> Result<&str> {
+    args.get("decision")
+        .map(String::as_str)
+        .ok_or_else(|| anyhow!("decision required"))
+}
+
+fn map_decision(
+    (id, node_id, text, status, created_at, decided_at): crate::storage::DecisionStorageRecord,
+) -> DecisionRecord {
+    DecisionRecord {
+        id,
+        node_id,
+        text,
+        status,
+        created_at_epoch_secs: created_at,
+        decided_at_epoch_secs: decided_at,
     }
-    Ok(json!({
-        "decision": decision_id,
-        "status": status,
-    }))
 }
 
 #[cfg(test)]
@@ -2126,6 +2634,401 @@ mod tests {
             .await?;
         assert_eq!(send_failure.status, "failed");
         assert_eq!(send_failure.result["error"], "node not found");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_decision_resolution_emits_feedback_events(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+        let node = store.insert_node(
+            HarnessKind::Codex,
+            SubstrateKind::Local,
+            "worker",
+            Some("/tmp"),
+            Some("decision-node"),
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        let decision = service
+            .create_decision(DecisionCreateRequest {
+                node_id: Some(node.id.to_string()),
+                text: "approve?".to_string(),
+            })
+            .await?;
+
+        let resolved = service
+            .execute_remote_command(
+                Some(Uuid::nil()),
+                ParsedRemoteCommand {
+                    kind: RemoteCommandKind::ApproveDecision,
+                    token: "test".to_string(),
+                    node_id: None,
+                    args: HashMap::from([("decision".to_string(), decision.id.clone())]),
+                },
+            )
+            .await?;
+
+        assert_eq!(resolved.status, "success");
+        assert_eq!(resolved.result["status"], "approved");
+        assert!(store.list_notifications()?.iter().any(
+            |(_, notification_node_id, _, title, _, _, _)| {
+                notification_node_id.as_deref() == Some(node.id.to_string().as_str())
+                    && title == "Decision resolved"
+            }
+        ));
+        assert!(store.list_events(node.id)?.iter().any(|event| {
+            event.kind == NodeEventKind::RemoteCommandReceived
+                && event.body["decision"] == decision.id
+                && event.body["status"] == "approved"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn command_available_reflects_launchable_executable() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let workdir = tempfile::tempdir()?;
+        let executable = workdir.path().join("codex-test");
+        std::fs::write(&executable, "#!/bin/sh\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&executable)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&executable, permissions)?;
+        }
+
+        assert!(command_available(&executable.display().to_string()));
+        assert!(!command_available(""));
+        assert!(!command_available(
+            &workdir.path().join("missing").display().to_string()
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn harness_decision_protocol_ingest_records_pending_decision_event_notification_and_waiting_liveness(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+        let node = store.insert_node(
+            HarnessKind::Codex,
+            SubstrateKind::Local,
+            "worker",
+            Some("/tmp"),
+            Some("ingest-node"),
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        let ingester = LocalDecisionIngestion {
+            store: store.clone(),
+            hook_engine: service.hook_engine.clone(),
+        };
+
+        let decision = ingester.ingest_request(
+            node.id,
+            DecisionProtocolRequest {
+                text: "allow this action?".to_string(),
+                actions: vec!["approve".to_string(), "deny".to_string()],
+                source: Some("permission_prompt".to_string()),
+            },
+        )?;
+
+        assert_eq!(decision.status, "pending");
+        assert_eq!(decision.text, "allow this action?");
+        let stored = store.get_decision(&decision.id)?.unwrap();
+        assert_eq!(stored.2, "allow this action?");
+        let updated_node = store.get_node(node.id)?.expect("node should still exist");
+        assert_eq!(updated_node.liveness, NodeLiveness::WaitingForInput);
+
+        assert!(store.list_notifications()?.iter().any(
+            |(_, notification_node_id, _, title, body, _, _)| {
+                notification_node_id.as_deref() == Some(node.id.to_string().as_str())
+                    && title == "Decision requested"
+                    && body == "allow this action?"
+            }
+        ));
+
+        let events = store.list_events(node.id)?;
+        assert!(events.iter().any(|event| {
+            event.kind == NodeEventKind::HumanInputRequested
+                && event.body["decision"] == decision.id
+                && event.body["source"] == serde_json::json!("permission_prompt")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_decision_restores_running_from_waiting_for_input(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+        let node = store.insert_node(
+            HarnessKind::Codex,
+            SubstrateKind::Local,
+            "worker",
+            Some("/tmp"),
+            Some("resolve-node"),
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        store.set_node_liveness(node.id, NodeLiveness::WaitingForInput)?;
+
+        let decision = service
+            .create_decision(DecisionCreateRequest {
+                node_id: Some(node.id.to_string()),
+                text: "approve?".to_string(),
+            })
+            .await?;
+        let decision = service
+            .resolve_decision(
+                &decision.id,
+                DecisionResolveRequest {
+                    status: "approved".to_string(),
+                },
+            )
+            .await?;
+
+        assert_eq!(decision.status, "approved");
+        let updated_node = store.get_node(node.id)?.expect("node should still exist");
+        assert_eq!(updated_node.liveness, NodeLiveness::Running);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_create_decision_does_not_mutate_liveness(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+        let node = store.insert_node(
+            HarnessKind::Codex,
+            SubstrateKind::Local,
+            "worker",
+            Some("/tmp"),
+            Some("manual-node"),
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        store.set_node_liveness(node.id, NodeLiveness::Running)?;
+
+        let _decision = service
+            .create_decision(DecisionCreateRequest {
+                node_id: Some(node.id.to_string()),
+                text: "manual action".to_string(),
+            })
+            .await?;
+        let updated_node = store.get_node(node.id)?.expect("node should still exist");
+        assert_eq!(updated_node.liveness, NodeLiveness::Running);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn harness_descriptors_report_missing_commands_unavailable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = workdir.path().join("missing-codex").display().to_string();
+        config.harness.claude_command = workdir.path().join("missing-claude").display().to_string();
+        let service = CapabilityService::new(store, AuthMode::Disabled, config);
+
+        let response = service.list_harness_descriptors().await;
+
+        assert!(response.harnesses.iter().all(|harness| !harness.available));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn notify_send_errors_when_ntfy_is_unconfigured() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        let error = service
+            .notify_send("title", "body", None, None, None)
+            .await
+            .expect_err("unconfigured ntfy should not look like a sent=false success");
+
+        assert!(error.to_string().contains("not configured"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transcript_checkpoint_hook_tool_reports_unsupported(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+        let hook = service
+            .create_hook(HookCreateRequest {
+                name: "checkpoint".to_string(),
+                enabled: true,
+                event: "node.ctx_pressure".to_string(),
+                filter: "any".to_string(),
+                actions: vec![HookAction {
+                    kind: "tool".to_string(),
+                    target: "transcript.checkpoint".to_string(),
+                    template: None,
+                    args: serde_json::json!({}),
+                }],
+                future: false,
+            })
+            .await?;
+
+        let response = service.hook_test(&hook.id).await?;
+
+        assert!(!response.firing.ok);
+        assert!(response.firing.outcome.contains("not supported yet"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn routed_channel_inbound_fails_before_recording_when_node_delivery_fails(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+        let node = store.insert_node(
+            HarnessKind::Codex,
+            SubstrateKind::Local,
+            "worker",
+            Some("/tmp"),
+            Some("unattached"),
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+
+        let error = service
+            .channel_inbound(
+                "webhook-substrate",
+                ChannelInboundRequest {
+                    sender: "smoke".to_string(),
+                    subject: "route".to_string(),
+                    body: "must not persist".to_string(),
+                    replies: vec![],
+                    node_id: Some(node.id.to_string()),
+                    correlation_token: Some("corr".to_string()),
+                },
+            )
+            .await
+            .expect_err("routing to an unattached local runtime should fail");
+
+        assert!(
+            error.to_string().contains("node not running"),
+            "unexpected error: {error}"
+        );
+        assert!(store
+            .list_channel_messages("webhook-substrate", 10)?
+            .into_iter()
+            .all(|message| message.body != "must not persist"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loon_controls_fail_without_configured_target_before_mutating_state(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let send_node = store.insert_node(
+            HarnessKind::Codex,
+            SubstrateKind::Loon,
+            "worker",
+            Some("/tmp"),
+            Some("send"),
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        let send_error = service
+            .send_input(
+                send_node.id,
+                SendInputRequest {
+                    text: "hello".to_string(),
+                },
+            )
+            .await
+            .expect_err("send should fail when Loon is not configured");
+        assert!(send_error.to_string().contains("not configured"));
+        assert!(store
+            .list_events(send_node.id)?
+            .iter()
+            .all(|event| event.kind != NodeEventKind::InputSent));
+
+        for operation in ["interrupt", "stop", "archive"] {
+            let node = store.insert_node(
+                HarnessKind::Codex,
+                SubstrateKind::Loon,
+                "worker",
+                Some("/tmp"),
+                Some(operation),
+                None,
+                CapabilitySnapshot::default(),
+                None,
+            )?;
+            let error = match operation {
+                "interrupt" => service.interrupt_node(node.id).await,
+                "stop" => service.stop_node(node.id).await,
+                "archive" => service.archive_node(node.id).await,
+                _ => unreachable!(),
+            }
+            .expect_err("operation should fail when Loon is not configured");
+            assert!(error.to_string().contains("not configured"));
+            let stored = store.get_node(node.id)?.expect("node should remain stored");
+            assert_eq!(stored.liveness, NodeLiveness::Starting);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loon_browser_attach_response_discloses_transport(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let node = store.insert_node(
+            HarnessKind::Codex,
+            SubstrateKind::Loon,
+            "worker",
+            Some("/tmp"),
+            Some("loon"),
+            Some("loon-instance-1"),
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+
+        let response = service.attach_browser(node.id).await?;
+
+        assert_eq!(response.transport.as_deref(), Some("loon_attach_proxy"));
+        assert!(response
+            .note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("loon attach"));
         Ok(())
     }
 

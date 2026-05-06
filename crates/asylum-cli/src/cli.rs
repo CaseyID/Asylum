@@ -20,7 +20,12 @@ use crate::host::{
 use crate::mcp;
 use crate::native_attach::format_native_attach_prompt;
 use crate::runtime::RuntimePaths;
-use asylum_types::api::{CreateNodeRequest, HealthResponse};
+use asylum_types::api::{
+    ChannelCreateRequest, ChannelInboundRequest, ChannelTestRequest, ChannelUpdateRequest,
+    CreateNodeRequest, DecisionCreateRequest, DecisionResolveRequest, ForkNodeRequest,
+    HealthResponse, HookAction, HookCreateRequest, RecipeSpawnRequest, RelationshipCreateRequest,
+    RemoteCommandRequest,
+};
 use asylum_types::config::{AsylumConfig, AsylumFileConfig};
 use asylum_types::security::TokenRequest;
 
@@ -137,6 +142,11 @@ pub async fn run(action: CliAction) -> Result<()> {
                 let response = client.create_node(request.into_request()).await?;
                 println!("created node {}", response.node_id);
             }
+            NodeCommand::Fork(args) => {
+                let (node_id, request) = args.into_request();
+                let node = client.fork_node(node_id, request).await?;
+                println!("forked node {}", node.id);
+            }
             NodeCommand::List => {
                 let response = client.list_nodes().await?;
                 println!("{}", serde_json::to_string_pretty(&response.nodes)?);
@@ -162,12 +172,26 @@ pub async fn run(action: CliAction) -> Result<()> {
                 println!("node archived");
             }
         },
-        Command::Graph {
-            command: GraphCommand::Get,
-        } => {
-            let response = client.graph().await?;
-            println!("{}", serde_json::to_string_pretty(&response.graph)?);
-        }
+        Command::Graph { command: graph } => match graph {
+            GraphCommand::Get => {
+                let response = client.graph().await?;
+                println!("{}", serde_json::to_string_pretty(&response.graph)?);
+            }
+            GraphCommand::Relationships { command } => match command {
+                RelationshipCommand::Create(args) => {
+                    let relationship = client.create_relationship(args.into_request()).await?;
+                    println!("{}", serde_json::to_string_pretty(&relationship)?);
+                }
+                RelationshipCommand::List => {
+                    let response = client.list_relationships().await?;
+                    println!("{}", serde_json::to_string_pretty(&response.relationships)?);
+                }
+                RelationshipCommand::Remove { relationship_id } => {
+                    client.remove_relationship(relationship_id).await?;
+                    println!("relationship removed");
+                }
+            },
+        },
         Command::Attach { node_id } => {
             let target = client.native_attach_target(node_id).await?;
             println!("{label}", label = target.label);
@@ -194,6 +218,174 @@ pub async fn run(action: CliAction) -> Result<()> {
             NotifyCommand::Send { title, body } => {
                 let sent = client.notify_send(title, body).await?;
                 println!("notify sent: {sent}");
+            }
+            NotifyCommand::List => {
+                let response = client.list_notifications().await?;
+                println!("{}", serde_json::to_string_pretty(&response.notifications)?);
+            }
+            NotifyCommand::Read { notification_id } => {
+                client.mark_notification_read(notification_id).await?;
+                println!("notification marked read");
+            }
+        },
+        Command::Channel { command } => match command {
+            ChannelCommand::List => {
+                let response = client.list_channels().await?;
+                println!("{}", serde_json::to_string_pretty(&response.channels)?);
+            }
+            ChannelCommand::Create(args) => {
+                let channel = client.create_channel(args.into_request()?).await?;
+                println!("{}", serde_json::to_string_pretty(&channel)?);
+            }
+            ChannelCommand::Inspect { channel_id } => {
+                let channel = client.inspect_channel(&channel_id).await?;
+                println!("{}", serde_json::to_string_pretty(&channel)?);
+            }
+            ChannelCommand::Update(args) => {
+                let (channel_id, request) = args.into_request()?;
+                let channel = client.update_channel(&channel_id, request).await?;
+                println!("{}", serde_json::to_string_pretty(&channel)?);
+            }
+            ChannelCommand::Delete { channel_id } => {
+                client.delete_channel(&channel_id).await?;
+                println!("channel deleted");
+            }
+            ChannelCommand::Messages { channel_id, limit } => {
+                let response = client.channel_messages(&channel_id, limit).await?;
+                println!("{}", serde_json::to_string_pretty(&response.messages)?);
+            }
+            ChannelCommand::Test {
+                channel_id,
+                title,
+                body,
+            } => {
+                let response = client
+                    .test_channel(&channel_id, ChannelTestRequest { title, body })
+                    .await?;
+                println!("channel test sent: {}", response.sent);
+            }
+            ChannelCommand::Inbound {
+                channel_id,
+                sender,
+                subject,
+                body,
+                reply,
+                node_id,
+                correlation_token,
+            } => {
+                client
+                    .inbound_channel(
+                        &channel_id,
+                        ChannelInboundRequest {
+                            sender,
+                            subject,
+                            body,
+                            replies: reply,
+                            node_id: node_id.map(|id| id.to_string()),
+                            correlation_token,
+                        },
+                    )
+                    .await?;
+                println!("inbound message recorded");
+            }
+        },
+        Command::Hook { command } => match command {
+            HookCommand::List => {
+                let response = client.list_hooks().await?;
+                println!("{}", serde_json::to_string_pretty(&response.hooks)?);
+            }
+            HookCommand::Create(args) => {
+                let hook = client.create_hook(args.into_request()?).await?;
+                println!("{}", serde_json::to_string_pretty(&hook)?);
+            }
+            HookCommand::Delete { hook_id } => {
+                client.delete_hook(&hook_id).await?;
+                println!("hook deleted");
+            }
+            HookCommand::Firings { limit } => {
+                let response = client.list_hook_firings(limit).await?;
+                println!("{}", serde_json::to_string_pretty(&response.firings)?);
+            }
+            HookCommand::Catalog => {
+                let response = client.hook_event_catalog().await?;
+                println!("{}", serde_json::to_string_pretty(&response.events)?);
+            }
+            HookCommand::Test { hook_id } => {
+                let response = client.test_hook(&hook_id).await?;
+                println!("{}", serde_json::to_string_pretty(&response.firing)?);
+            }
+        },
+        Command::Recipe { command } => match command {
+            RecipeCommand::List => {
+                let response = client.list_recipes().await?;
+                println!("{}", serde_json::to_string_pretty(&response.recipes)?);
+            }
+            RecipeCommand::Spawn(args) => {
+                let (recipe_id, request) = args.into_request();
+                let response = client.spawn_recipe(&recipe_id, request).await?;
+                println!("{}", serde_json::to_string_pretty(&response.node_ids)?);
+            }
+        },
+        Command::RemoteCommand { command } => {
+            let request = RemoteCommandRequest {
+                command: command.into_raw_command()?,
+            };
+            let response = client.send_remote_command(request).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+        Command::Decision { command } => match command {
+            DecisionCommand::Create(args) => {
+                let decision = client.create_decision(args.into_request()).await?;
+                println!("{}", serde_json::to_string_pretty(&decision)?);
+            }
+            DecisionCommand::List => {
+                let response = client.list_decisions().await?;
+                println!("{}", serde_json::to_string_pretty(&response.decisions)?);
+            }
+            DecisionCommand::Inspect { decision_id } => {
+                let decision = client.get_decision(&decision_id).await?;
+                println!("{}", serde_json::to_string_pretty(&decision)?);
+            }
+            DecisionCommand::Approve { decision_id } => {
+                let decision = client
+                    .resolve_decision(
+                        &decision_id,
+                        DecisionResolveRequest {
+                            status: "approved".to_string(),
+                        },
+                    )
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&decision)?);
+            }
+            DecisionCommand::Deny { decision_id } => {
+                let decision = client
+                    .resolve_decision(
+                        &decision_id,
+                        DecisionResolveRequest {
+                            status: "denied".to_string(),
+                        },
+                    )
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&decision)?);
+            }
+        },
+        Command::Workspace { command } => match command {
+            WorkspaceCommand::Recent => {
+                let response = client.recent_workspaces().await?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            }
+        },
+        Command::Context { command } => match command {
+            ContextCommand::SystemMap => {
+                let response = client.system_map().await?;
+                println!("{}", serde_json::to_string_pretty(&response.graph)?);
+            }
+            ContextCommand::LaunchPacket { node_id } => {
+                let response = client.launch_packet(node_id).await?;
+                println!("{}", response.markdown);
+                if let Some(artifact_id) = response.artifact_id {
+                    println!("artifact_id: {artifact_id}");
+                }
             }
         },
         Command::Mcp => {
@@ -281,7 +473,7 @@ enum Command {
         after_help = "Examples:\n  asylum uninstall --dry-run\n  asylum uninstall --keep state\n  asylum uninstall --purge   # also removes ~/.config/asylum (signing keys)"
     )]
     Uninstall(UninstallArgs),
-    /// Manage harness nodes (create / list / stop).
+    /// Manage harness nodes.
     Node {
         #[command(subcommand)]
         command: NodeCommand,
@@ -305,6 +497,42 @@ enum Command {
     Notify {
         #[command(subcommand)]
         command: NotifyCommand,
+    },
+    /// Manage notification and remote-command channels.
+    Channel {
+        #[command(subcommand)]
+        command: ChannelCommand,
+    },
+    /// Manage automation hooks.
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
+    },
+    /// List and spawn starter recipes.
+    Recipe {
+        #[command(subcommand)]
+        command: RecipeCommand,
+    },
+    /// Send a remote command through the daemon's command receiver.
+    #[command(name = "remote-command", alias = "remote")]
+    RemoteCommand {
+        #[command(subcommand)]
+        command: RemoteCommand,
+    },
+    /// Create, inspect, and resolve operator decisions.
+    Decision {
+        #[command(subcommand)]
+        command: DecisionCommand,
+    },
+    /// Inspect workspace hints discovered from nodes.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
+    /// Inspect Asylum launch/context packets.
+    Context {
+        #[command(subcommand)]
+        command: ContextCommand,
     },
     /// Run the MCP server over stdio (for editor integrations).
     Mcp,
@@ -408,6 +636,41 @@ enum KeepKind {
 #[derive(Subcommand)]
 enum GraphCommand {
     Get,
+    #[command(alias = "relationship")]
+    Relationships {
+        #[command(subcommand)]
+        command: RelationshipCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RelationshipCommand {
+    Create(RelationshipCreateArgs),
+    List,
+    Remove { relationship_id: Uuid },
+}
+
+#[derive(Args)]
+struct RelationshipCreateArgs {
+    #[arg(long)]
+    source_node_id: Uuid,
+    #[arg(long)]
+    target_node_id: Uuid,
+    #[arg(long)]
+    kind: String,
+    #[arg(long)]
+    label: Option<String>,
+}
+
+impl RelationshipCreateArgs {
+    fn into_request(self) -> RelationshipCreateRequest {
+        RelationshipCreateRequest {
+            source_node_id: self.source_node_id.to_string(),
+            target_node_id: self.target_node_id.to_string(),
+            kind: self.kind,
+            label: self.label,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -430,11 +693,404 @@ enum NotifyCommand {
         #[arg(long)]
         body: String,
     },
+    List,
+    Read {
+        notification_id: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCommand {
+    Recent,
+}
+
+#[derive(Subcommand)]
+enum ContextCommand {
+    #[command(name = "system-map")]
+    SystemMap,
+    #[command(name = "launch-packet")]
+    LaunchPacket { node_id: Uuid },
+}
+
+#[derive(Subcommand)]
+enum ChannelCommand {
+    List,
+    Create(ChannelCreateArgs),
+    Inspect {
+        channel_id: String,
+    },
+    Update(ChannelUpdateArgs),
+    Delete {
+        channel_id: String,
+    },
+    Messages {
+        channel_id: String,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    Test {
+        channel_id: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        body: String,
+    },
+    Inbound {
+        channel_id: String,
+        #[arg(long)]
+        sender: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        body: String,
+        #[arg(long = "reply")]
+        reply: Vec<String>,
+        #[arg(long)]
+        node_id: Option<Uuid>,
+        #[arg(long)]
+        correlation_token: Option<String>,
+    },
+}
+
+#[derive(Args)]
+struct ChannelCreateArgs {
+    #[arg(long)]
+    kind: String,
+    #[arg(long)]
+    name: String,
+    #[arg(long)]
+    direction: String,
+    #[arg(long)]
+    label: Option<String>,
+    #[arg(long, default_value = "")]
+    detail: String,
+    #[arg(long, default_value = "{}")]
+    config_json: String,
+    #[arg(long)]
+    live: bool,
+}
+
+impl ChannelCreateArgs {
+    fn into_request(self) -> Result<ChannelCreateRequest> {
+        Ok(ChannelCreateRequest {
+            kind: self.kind,
+            name: self.name,
+            label: self.label,
+            direction: self.direction,
+            detail: self.detail,
+            config: serde_json::from_str(&self.config_json)
+                .context("parse --config-json as JSON")?,
+            live: self.live,
+        })
+    }
+}
+
+#[derive(Args)]
+struct ChannelUpdateArgs {
+    channel_id: String,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    label: Option<String>,
+    #[arg(long)]
+    detail: Option<String>,
+    #[arg(long)]
+    direction: Option<String>,
+    #[arg(long)]
+    status: Option<String>,
+    #[arg(long)]
+    config_json: Option<String>,
+    #[arg(long)]
+    live: Option<bool>,
+}
+
+impl ChannelUpdateArgs {
+    fn into_request(self) -> Result<(String, ChannelUpdateRequest)> {
+        let config = self
+            .config_json
+            .map(|raw| serde_json::from_str(&raw).context("parse --config-json as JSON"))
+            .transpose()?;
+        Ok((
+            self.channel_id,
+            ChannelUpdateRequest {
+                name: self.name,
+                label: self.label,
+                detail: self.detail,
+                direction: self.direction,
+                status: self.status,
+                config,
+                live: self.live,
+            },
+        ))
+    }
+}
+
+#[derive(Subcommand)]
+enum HookCommand {
+    List,
+    Create(HookCreateArgs),
+    Delete {
+        hook_id: String,
+    },
+    Firings {
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    Catalog,
+    Test {
+        hook_id: String,
+    },
+}
+
+#[derive(Args)]
+struct HookCreateArgs {
+    #[arg(long)]
+    name: String,
+    #[arg(long)]
+    event: String,
+    #[arg(long, default_value = "any")]
+    filter: String,
+    #[arg(long, default_value = "[]")]
+    actions_json: String,
+    #[arg(long, default_value_t = true)]
+    enabled: bool,
+    #[arg(long)]
+    future: bool,
+}
+
+impl HookCreateArgs {
+    fn into_request(self) -> Result<HookCreateRequest> {
+        Ok(HookCreateRequest {
+            name: self.name,
+            enabled: self.enabled,
+            event: self.event,
+            filter: self.filter,
+            actions: serde_json::from_str::<Vec<HookAction>>(&self.actions_json)
+                .context("parse --actions-json as JSON array")?,
+            future: self.future,
+        })
+    }
+}
+
+#[derive(Subcommand)]
+enum RecipeCommand {
+    List,
+    Spawn(RecipeSpawnArgs),
+}
+
+#[derive(Args)]
+struct RecipeSpawnArgs {
+    recipe_id: String,
+    #[arg(long)]
+    harness: String,
+    #[arg(long)]
+    substrate: String,
+    #[arg(long)]
+    workspace: Option<String>,
+    #[arg(long)]
+    description: Option<String>,
+    #[arg(long, alias = "role_hint")]
+    role: Option<String>,
+}
+
+impl RecipeSpawnArgs {
+    fn into_request(self) -> (String, RecipeSpawnRequest) {
+        (
+            self.recipe_id,
+            RecipeSpawnRequest {
+                harness: self.harness,
+                substrate: self.substrate,
+                workspace: self.workspace,
+                description: self.description,
+                role_hint: self.role,
+            },
+        )
+    }
+}
+
+#[derive(Subcommand)]
+enum RemoteCommand {
+    Status(RemoteCommandTokenArgs),
+    Attach(RemoteCommandNodeArgs),
+    Send(RemoteCommandSendArgs),
+    Start(RemoteCommandStartArgs),
+    Interrupt(RemoteCommandNodeArgs),
+    Stop(RemoteCommandNodeArgs),
+    Approve(RemoteCommandDecisionArgs),
+    Deny(RemoteCommandDecisionArgs),
+}
+
+#[derive(Subcommand)]
+enum DecisionCommand {
+    Create(DecisionCreateArgs),
+    List,
+    Inspect { decision_id: String },
+    Approve { decision_id: String },
+    Deny { decision_id: String },
+}
+
+#[derive(Args)]
+struct DecisionCreateArgs {
+    #[arg(long)]
+    text: String,
+    #[arg(long)]
+    node_id: Option<Uuid>,
+}
+
+impl DecisionCreateArgs {
+    fn into_request(self) -> DecisionCreateRequest {
+        DecisionCreateRequest {
+            node_id: self.node_id.map(|id| id.to_string()),
+            text: self.text,
+        }
+    }
+}
+
+impl RemoteCommand {
+    fn into_raw_command(self) -> Result<String> {
+        match self {
+            RemoteCommand::Status(args) => Ok(remote_command_line(
+                "status",
+                args.token,
+                std::iter::empty::<(&str, String)>(),
+            )),
+            RemoteCommand::Attach(args) => args.into_command_line("attach"),
+            RemoteCommand::Send(args) => args.into_command_line(),
+            RemoteCommand::Start(args) => args.into_command_line(),
+            RemoteCommand::Interrupt(args) => args.into_command_line("interrupt"),
+            RemoteCommand::Stop(args) => args.into_command_line("stop"),
+            RemoteCommand::Approve(args) => args.into_command_line("approve"),
+            RemoteCommand::Deny(args) => args.into_command_line("deny"),
+        }
+    }
+}
+
+#[derive(Args)]
+struct RemoteCommandTokenArgs {
+    #[arg(long)]
+    token: Option<String>,
+}
+
+#[derive(Args)]
+struct RemoteCommandNodeArgs {
+    #[arg(long)]
+    node: Uuid,
+    #[arg(long)]
+    token: Option<String>,
+}
+
+impl RemoteCommandNodeArgs {
+    fn into_command_line(self, command: &'static str) -> Result<String> {
+        Ok(remote_command_line(
+            command,
+            self.token,
+            [("node", self.node.to_string())],
+        ))
+    }
+}
+
+#[derive(Args)]
+struct RemoteCommandSendArgs {
+    #[arg(long)]
+    node: Uuid,
+    #[arg(long)]
+    text: String,
+    #[arg(long)]
+    token: Option<String>,
+}
+
+impl RemoteCommandSendArgs {
+    fn into_command_line(self) -> Result<String> {
+        let text = remote_command_value("text", self.text)?;
+        Ok(remote_command_line(
+            "send",
+            self.token,
+            [("node", self.node.to_string()), ("text", text)],
+        ))
+    }
+}
+
+#[derive(Args)]
+struct RemoteCommandStartArgs {
+    #[arg(long)]
+    harness: String,
+    #[arg(long)]
+    substrate: String,
+    #[arg(long)]
+    role: Option<String>,
+    #[arg(long)]
+    workspace: Option<String>,
+    #[arg(long)]
+    token: Option<String>,
+}
+
+impl RemoteCommandStartArgs {
+    fn into_command_line(self) -> Result<String> {
+        let mut args = vec![
+            ("harness", remote_command_value("harness", self.harness)?),
+            (
+                "substrate",
+                remote_command_value("substrate", self.substrate)?,
+            ),
+        ];
+        if let Some(role) = self.role {
+            args.push(("role", remote_command_value("role", role)?));
+        }
+        if let Some(workspace) = self.workspace {
+            args.push(("workspace", remote_command_value("workspace", workspace)?));
+        }
+        Ok(remote_command_line("start", self.token, args))
+    }
+}
+
+#[derive(Args)]
+struct RemoteCommandDecisionArgs {
+    #[arg(long)]
+    decision: String,
+    #[arg(long)]
+    token: Option<String>,
+}
+
+impl RemoteCommandDecisionArgs {
+    fn into_command_line(self, command: &'static str) -> Result<String> {
+        let decision = remote_command_value("decision", self.decision)?;
+        Ok(remote_command_line(
+            command,
+            self.token,
+            [("decision", decision)],
+        ))
+    }
+}
+
+fn remote_command_line<I, K, V>(command: &'static str, token: Option<String>, args: I) -> String
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let mut parts = vec![command.to_string()];
+    if let Some(token) = token.or_else(|| env::var("ASYLUM_REMOTE_TOKEN").ok()) {
+        parts.push(format!("token={token}"));
+    }
+    for (key, value) in args {
+        parts.push(format!("{}={}", key.as_ref(), value.as_ref()));
+    }
+    parts.join(" ")
+}
+
+fn remote_command_value(name: &str, value: String) -> Result<String> {
+    if value.split_whitespace().count() > 1 || value.chars().any(char::is_whitespace) {
+        return Err(anyhow!(
+            "remote command --{name} cannot contain whitespace; the daemon remote command parser accepts space-delimited key=value fields"
+        ));
+    }
+    Ok(value)
 }
 
 #[derive(Subcommand)]
 enum NodeCommand {
     Create(NodeCreateArgs),
+    Fork(NodeForkArgs),
     List,
     Inspect { node_id: Uuid },
     Send { node_id: Uuid, text: String },
@@ -455,6 +1111,30 @@ struct NodeCreateArgs {
     workspace: Option<String>,
     #[arg(long)]
     description: Option<String>,
+}
+
+#[derive(Args)]
+struct NodeForkArgs {
+    node_id: Uuid,
+    #[arg(long, alias = "role_hint")]
+    role: Option<String>,
+    #[arg(long)]
+    workspace: Option<String>,
+    #[arg(long)]
+    description: Option<String>,
+}
+
+impl NodeForkArgs {
+    fn into_request(self) -> (Uuid, ForkNodeRequest) {
+        (
+            self.node_id,
+            ForkNodeRequest {
+                role_hint: self.role,
+                workspace: self.workspace,
+                description: self.description,
+            },
+        )
+    }
 }
 
 impl NodeCreateArgs {
@@ -772,11 +1452,11 @@ async fn run_status(paths: &RuntimePaths, client: &AsylumClient, json: bool) -> 
     let mut state = HostState::collect(paths);
     let health = client.health().await.ok();
     if let Some(health) = health.as_ref() {
-        state.daemon.healthy = true;
-        state.daemon.state = ServiceState::Running;
-        state.daemon.daemon_version = Some(health.daemon_version.clone());
-        state.daemon.base_url = health.base_url.clone();
-        state.daemon.bind = Some(health.bind_addr.clone());
+        state.apply_daemon_health(
+            health.bind_addr.clone(),
+            health.base_url.clone(),
+            health.daemon_version.clone(),
+        );
     }
 
     if json {
@@ -832,6 +1512,9 @@ async fn run_status(paths: &RuntimePaths, client: &AsylumClient, json: bool) -> 
             println!("Port: in use (pid {pid_text}, command {command_text})");
         }
         PortInUse::Unknown { reason } => println!("Port: unknown ({reason})"),
+    }
+    if let Some(warning) = &state.network.exposure_warning {
+        println!("Warning: {warning}");
     }
     println!(
         "Config dir: {} ({} entries)",
@@ -922,7 +1605,7 @@ async fn doctor_checks(
     client: &AsylumClient,
     verbose: bool,
 ) -> Vec<DoctorCheck> {
-    let host = HostState::collect(paths);
+    let mut host = HostState::collect(paths);
     let mut checks = Vec::new();
     checks.push(match host.binary.path.as_ref() {
         Some(binary) => DoctorCheck::new(
@@ -948,18 +1631,33 @@ async fn doctor_checks(
     checks.push(path_check("home", &paths.home, true));
     checks.push(path_check("config", &paths.config, false));
     checks.push(database_check(paths));
-    checks.push(match client.health().await {
-        Ok(health) => DoctorCheck::new(
-            CheckStatus::Ok,
-            "health",
-            format!("{} version {}", health.status, health.daemon_version),
-        ),
+    let health_check = match client.health().await {
+        Ok(health) => {
+            host.apply_daemon_health(
+                health.bind_addr.clone(),
+                health.base_url.clone(),
+                health.daemon_version.clone(),
+            );
+            DoctorCheck::new(
+                CheckStatus::Ok,
+                "health",
+                format!("{} version {}", health.status, health.daemon_version),
+            )
+        }
         Err(_) => DoctorCheck::new(
             CheckStatus::Warn,
             "health",
             "control plane is not responding",
         ),
-    });
+    };
+    checks.push(health_check);
+    if let Some(warning) = &host.network.exposure_warning {
+        checks.push(DoctorCheck::new(
+            CheckStatus::Warn,
+            "network exposure",
+            warning,
+        ));
+    }
     checks.push(cockpit_assets_check());
     let config = load_config_file(paths).unwrap_or_else(|_| default_file_config_for_paths(paths));
     checks.push(classify_required(

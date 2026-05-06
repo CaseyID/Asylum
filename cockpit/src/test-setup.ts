@@ -50,3 +50,50 @@ if (typeof window !== "undefined") {
     value: new MemoryStorage(),
   });
 }
+
+class TestResizeObserver implements ResizeObserver {
+  private callback: ResizeObserverCallback;
+
+  constructor(callback: ResizeObserverCallback) {
+    this.callback = callback;
+  }
+
+  observe(target: Element): void {
+    this.callback(
+      [
+        {
+          target,
+          contentRect: {
+            x: 0,
+            y: 0,
+            width: 1024,
+            height: 768,
+            top: 0,
+            right: 1024,
+            bottom: 768,
+            left: 0,
+            toJSON: () => ({}),
+          },
+          borderBoxSize: [],
+          contentBoxSize: [],
+          devicePixelContentBoxSize: [],
+        },
+      ],
+      this,
+    );
+  }
+
+  unobserve(): void {}
+  disconnect(): void {}
+}
+
+Object.defineProperty(globalThis, "ResizeObserver", {
+  configurable: true,
+  value: TestResizeObserver,
+});
+if (typeof window !== "undefined") {
+  Object.defineProperty(window, "ResizeObserver", {
+    configurable: true,
+    value: TestResizeObserver,
+  });
+}

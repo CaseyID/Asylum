@@ -35,6 +35,7 @@ export function Nav({
     { id: "cockpit", label: "cockpit", icon: "layout-grid" },
     { id: "fleet", label: "nodes", icon: "list", count: fleetCount },
     { id: "chat", label: "chat", icon: "terminal" },
+    { id: "decisions", label: "decisions", icon: "git-pull-request" },
     { id: "logs", label: "logs", icon: "activity" },
   ];
 
@@ -89,7 +90,7 @@ export function Nav({
 
       {!collapsed && (
         <div className="footer-info">
-          <div>{daemonVersion ?? "asylum 0.1.0"}</div>
+          <div>{daemonVersion ?? "asylum"}</div>
           {bindAddr && <div className="muted">{bindAddr}</div>}
         </div>
       )}

@@ -7,7 +7,10 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use uuid::Uuid;
 
-use super::{SubstrateContext, SubstrateOutput};
+use super::SubstrateContext;
+use crate::decision_ingester::{
+    DecisionProtocolRequest, StdoutDecisionIngestionEvent, StdoutDecisionLineIngestor,
+};
 
 #[derive(Clone)]
 struct LocalRuntime {
@@ -19,7 +22,8 @@ struct LocalRuntime {
 #[derive(Clone)]
 pub struct LocalSubstrate {
     runtimes: Arc<RwLock<HashMap<Uuid, LocalRuntime>>>,
-    output_sink: Arc<dyn SubstrateOutput>,
+    output_sink: Arc<dyn Fn(Uuid, &str) + Send + Sync>,
+    decision_sink: Arc<dyn Fn(Uuid, DecisionProtocolRequest) + Send + Sync>,
 }
 
 impl LocalSubstrate {
@@ -30,6 +34,19 @@ impl LocalSubstrate {
         Self {
             runtimes: Arc::new(RwLock::new(HashMap::new())),
             output_sink: Arc::new(output_sink),
+            decision_sink: Arc::new(|_, _| {}),
+        }
+    }
+
+    pub fn new_with_decision_sink<F, D>(output_sink: F, decision_sink: D) -> Self
+    where
+        F: Fn(Uuid, &str) + Send + Sync + 'static,
+        D: Fn(Uuid, DecisionProtocolRequest) + Send + Sync + 'static,
+    {
+        Self {
+            runtimes: Arc::new(RwLock::new(HashMap::new())),
+            output_sink: Arc::new(output_sink),
+            decision_sink: Arc::new(decision_sink),
         }
     }
 
@@ -59,6 +76,7 @@ impl LocalSubstrate {
 
         let node_id = ctx.node_id;
         let sink = self.output_sink.clone();
+        let decision_sink = self.decision_sink.clone();
         let writer_arc: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(writer));
         let (output_tx, _) = broadcast::channel(1024);
         let output_tx_for_reader = output_tx.clone();
@@ -76,16 +94,37 @@ impl LocalSubstrate {
 
         tokio::task::spawn_blocking(move || {
             let mut local_child = child;
+            let mut ingester = StdoutDecisionLineIngestor::default();
             let mut buffer = [0_u8; 1024];
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(size) => {
                         let chunk = String::from_utf8_lossy(&buffer[..size]).to_string();
-                        sink(node_id, &chunk);
-                        let _ = output_tx_for_reader.send(chunk.clone());
+                        for event in ingester.ingest(&chunk) {
+                            match event {
+                                StdoutDecisionIngestionEvent::OutputText(text) => {
+                                    sink(node_id, &text);
+                                    let _ = output_tx_for_reader.send(text);
+                                }
+                                StdoutDecisionIngestionEvent::DecisionRequest(request) => {
+                                    (decision_sink)(node_id, request);
+                                }
+                            }
+                        }
                     }
                     Err(_) => break,
+                }
+            }
+            for event in ingester.finalize() {
+                match event {
+                    StdoutDecisionIngestionEvent::OutputText(text) => {
+                        sink(node_id, &text);
+                        let _ = output_tx_for_reader.send(text);
+                    }
+                    StdoutDecisionIngestionEvent::DecisionRequest(request) => {
+                        (decision_sink)(node_id, request);
+                    }
                 }
             }
             let _ = local_child.wait();

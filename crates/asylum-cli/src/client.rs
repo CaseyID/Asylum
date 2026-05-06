@@ -8,10 +8,18 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use asylum_types::api::{
-    CreateNodeRequest, GraphGetResponse, HealthResponse, NativeAttachResponse, NodeCreateResponse,
-    NodeEventsResponse, NodeInspectResponse, NodeListResponse, SendInputRequest,
-    TokenIssueResponse,
+    ChannelCreateRequest, ChannelDescriptor, ChannelInboundRequest, ChannelListResponse,
+    ChannelMessagesResponse, ChannelTestRequest, ChannelTestResponse, ChannelUpdateRequest,
+    CreateNodeRequest, DecisionCreateRequest, DecisionListResponse, DecisionRecord,
+    DecisionResolveRequest, ForkNodeRequest, GraphGetResponse, HealthResponse, HookCreateRequest,
+    HookEventCatalogResponse, HookFiringsResponse, HookListResponse, HookRule, HookTestResponse,
+    LaunchPacketResponse, NativeAttachResponse, NodeCreateResponse, NodeEventsResponse,
+    NodeInspectResponse, NodeListResponse, NotificationsResponse, RecipeListResponse,
+    RecipeSpawnRequest, RecipeSpawnResponse, RelationshipCreateRequest, RelationshipResponse,
+    RemoteCommandRequest, RemoteCommandResponse, SendInputRequest, TokenIssueResponse,
 };
+use asylum_types::node::NodeRecord;
+use asylum_types::relationship::RelationshipRecord;
 use asylum_types::security::TokenRequest;
 
 pub struct AsylumClient {
@@ -150,6 +158,12 @@ impl AsylumClient {
             .await
     }
 
+    pub async fn fork_node(&self, id: Uuid, request: ForkNodeRequest) -> Result<NodeRecord> {
+        let path = format!("/api/nodes/{id}/fork");
+        self.send_request(reqwest::Method::POST, &path, Some(&request))
+            .await
+    }
+
     pub async fn inspect_node(&self, id: Uuid) -> Result<NodeInspectResponse> {
         let path = format!("/api/nodes/{id}");
         self.send_request(reqwest::Method::GET, &path, Option::<&str>::None)
@@ -158,6 +172,207 @@ impl AsylumClient {
 
     pub async fn graph(&self) -> Result<GraphGetResponse> {
         self.send_request(reqwest::Method::GET, "/api/graph", Option::<&str>::None)
+            .await
+    }
+
+    pub async fn recent_workspaces(&self) -> Result<Vec<String>> {
+        self.send_request(
+            reqwest::Method::GET,
+            "/api/workspaces/recent",
+            Option::<&str>::None,
+        )
+        .await
+    }
+
+    pub async fn system_map(&self) -> Result<GraphGetResponse> {
+        self.send_request(
+            reqwest::Method::GET,
+            "/api/context/system-map",
+            Option::<&str>::None,
+        )
+        .await
+    }
+
+    pub async fn launch_packet(&self, id: Uuid) -> Result<LaunchPacketResponse> {
+        let path = format!("/api/context/launch-packet/{id}");
+        self.send_request(reqwest::Method::GET, &path, Option::<&str>::None)
+            .await
+    }
+
+    pub async fn create_relationship(
+        &self,
+        request: RelationshipCreateRequest,
+    ) -> Result<RelationshipRecord> {
+        self.send_request(reqwest::Method::POST, "/api/relationships", Some(&request))
+            .await
+    }
+
+    pub async fn list_relationships(&self) -> Result<RelationshipResponse> {
+        self.send_request(
+            reqwest::Method::GET,
+            "/api/relationships",
+            Option::<&str>::None,
+        )
+        .await
+    }
+
+    pub async fn remove_relationship(&self, id: Uuid) -> Result<()> {
+        let path = format!("/api/relationships/{id}");
+        self.send_request_no_content(reqwest::Method::DELETE, &path, Option::<&str>::None)
+            .await
+    }
+
+    pub async fn list_channels(&self) -> Result<ChannelListResponse> {
+        self.send_request(reqwest::Method::GET, "/api/channels", Option::<&str>::None)
+            .await
+    }
+
+    pub async fn create_channel(&self, request: ChannelCreateRequest) -> Result<ChannelDescriptor> {
+        self.send_request(reqwest::Method::POST, "/api/channels", Some(&request))
+            .await
+    }
+
+    pub async fn inspect_channel(&self, id: &str) -> Result<ChannelDescriptor> {
+        let path = format!("/api/channels/{id}");
+        self.send_request(reqwest::Method::GET, &path, Option::<&str>::None)
+            .await
+    }
+
+    pub async fn update_channel(
+        &self,
+        id: &str,
+        request: ChannelUpdateRequest,
+    ) -> Result<ChannelDescriptor> {
+        let path = format!("/api/channels/{id}");
+        self.send_request(reqwest::Method::PATCH, &path, Some(&request))
+            .await
+    }
+
+    pub async fn delete_channel(&self, id: &str) -> Result<()> {
+        let path = format!("/api/channels/{id}");
+        self.send_request_no_content(reqwest::Method::DELETE, &path, Option::<&str>::None)
+            .await
+    }
+
+    pub async fn channel_messages(
+        &self,
+        id: &str,
+        limit: Option<u32>,
+    ) -> Result<ChannelMessagesResponse> {
+        let path = match limit {
+            Some(limit) => format!("/api/channels/{id}/messages?limit={limit}"),
+            None => format!("/api/channels/{id}/messages"),
+        };
+        self.send_request(reqwest::Method::GET, &path, Option::<&str>::None)
+            .await
+    }
+
+    pub async fn test_channel(
+        &self,
+        id: &str,
+        request: ChannelTestRequest,
+    ) -> Result<ChannelTestResponse> {
+        let path = format!("/api/channels/{id}/test");
+        self.send_request(reqwest::Method::POST, &path, Some(&request))
+            .await
+    }
+
+    pub async fn inbound_channel(&self, id: &str, request: ChannelInboundRequest) -> Result<()> {
+        let path = format!("/api/channels/{id}/inbound");
+        self.send_request_no_content(reqwest::Method::POST, &path, Some(&request))
+            .await
+    }
+
+    pub async fn list_hooks(&self) -> Result<HookListResponse> {
+        self.send_request(reqwest::Method::GET, "/api/hooks", Option::<&str>::None)
+            .await
+    }
+
+    pub async fn create_hook(&self, request: HookCreateRequest) -> Result<HookRule> {
+        self.send_request(reqwest::Method::POST, "/api/hooks", Some(&request))
+            .await
+    }
+
+    pub async fn delete_hook(&self, id: &str) -> Result<()> {
+        let path = format!("/api/hooks/{id}");
+        self.send_request_no_content(reqwest::Method::DELETE, &path, Option::<&str>::None)
+            .await
+    }
+
+    pub async fn list_hook_firings(&self, limit: Option<u32>) -> Result<HookFiringsResponse> {
+        let path = match limit {
+            Some(limit) => format!("/api/hooks/firings?limit={limit}"),
+            None => "/api/hooks/firings".to_string(),
+        };
+        self.send_request(reqwest::Method::GET, &path, Option::<&str>::None)
+            .await
+    }
+
+    pub async fn hook_event_catalog(&self) -> Result<HookEventCatalogResponse> {
+        self.send_request(
+            reqwest::Method::GET,
+            "/api/hooks/events",
+            Option::<&str>::None,
+        )
+        .await
+    }
+
+    pub async fn test_hook(&self, id: &str) -> Result<HookTestResponse> {
+        let path = format!("/api/hooks/{id}/test");
+        self.send_request(reqwest::Method::POST, &path, Option::<&str>::None)
+            .await
+    }
+
+    pub async fn list_recipes(&self) -> Result<RecipeListResponse> {
+        self.send_request(reqwest::Method::GET, "/api/recipes", Option::<&str>::None)
+            .await
+    }
+
+    pub async fn spawn_recipe(
+        &self,
+        id: &str,
+        request: RecipeSpawnRequest,
+    ) -> Result<RecipeSpawnResponse> {
+        let path = format!("/api/recipes/{id}/spawn");
+        self.send_request(reqwest::Method::POST, &path, Some(&request))
+            .await
+    }
+
+    pub async fn send_remote_command(
+        &self,
+        request: RemoteCommandRequest,
+    ) -> Result<RemoteCommandResponse> {
+        self.send_request(
+            reqwest::Method::POST,
+            "/api/remote-commands",
+            Some(&request),
+        )
+        .await
+    }
+
+    pub async fn create_decision(&self, request: DecisionCreateRequest) -> Result<DecisionRecord> {
+        self.send_request(reqwest::Method::POST, "/api/decisions", Some(&request))
+            .await
+    }
+
+    pub async fn list_decisions(&self) -> Result<DecisionListResponse> {
+        self.send_request(reqwest::Method::GET, "/api/decisions", Option::<&str>::None)
+            .await
+    }
+
+    pub async fn get_decision(&self, id: &str) -> Result<DecisionRecord> {
+        let path = format!("/api/decisions/{id}");
+        self.send_request(reqwest::Method::GET, &path, Option::<&str>::None)
+            .await
+    }
+
+    pub async fn resolve_decision(
+        &self,
+        id: &str,
+        request: DecisionResolveRequest,
+    ) -> Result<DecisionRecord> {
+        let path = format!("/api/decisions/{id}/resolve");
+        self.send_request(reqwest::Method::POST, &path, Some(&request))
             .await
     }
 
@@ -257,6 +472,21 @@ impl AsylumClient {
             .get("sent")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false))
+    }
+
+    pub async fn list_notifications(&self) -> Result<NotificationsResponse> {
+        self.send_request(
+            reqwest::Method::GET,
+            "/api/notifications",
+            Option::<&str>::None,
+        )
+        .await
+    }
+
+    pub async fn mark_notification_read(&self, id: i64) -> Result<()> {
+        let path = format!("/api/notifications/{id}/read");
+        self.send_request_no_content(reqwest::Method::POST, &path, Option::<&str>::None)
+            .await
     }
 }
 

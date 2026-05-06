@@ -1,9 +1,8 @@
 // asylum cockpit — node detail screen.
-// ports NodeScreen / EventsView / ToolsView / CapsView / RelView from the prototype.
+// ports NodeSession / EventsView / ActivityView / CapsView / RelView from the prototype.
 
-import { Fragment, useEffect, useRef, useState, type JSX } from "react";
+import { Fragment, useEffect, useRef, useState, type FormEvent, type JSX } from "react";
 import { Btn, Empty, KV, Pill, Tag } from "../lib/ui";
-import { Icon } from "../lib/icons";
 import { NodeSession } from "../components/NodeSession";
 import {
   ROLE_GLYPH,
@@ -15,7 +14,7 @@ import {
   uiStateOf,
   uptimeLabel,
 } from "../lib/glyphs";
-import { fetchHarnessDescriptors, fetchNodeEvents } from "../api";
+import { createRelationship, fetchHarnessDescriptors, fetchNodeEvents, removeRelationship } from "../api";
 import type { AsylumNode, GraphRelationship, HarnessDescriptor } from "../types";
 
 interface NodeEventRecord {
@@ -32,7 +31,7 @@ export type NodeScreenAction =
   | "send"
   | "interrupt"
   | "fork"
-  | "restart"
+  | "stop"
   | "terminate"
   | "archive";
 
@@ -43,11 +42,20 @@ export interface NodeScreenProps {
   onBack: () => void;
   onOpen: (node: AsylumNode) => void;
   onAction: (action: NodeScreenAction, payload?: string) => void;
+  onGraphRefresh: () => void;
 }
 
-type Tab = "session" | "events" | "tools" | "capabilities" | "relationships";
+type Tab = "session" | "events" | "activity" | "capabilities" | "relationships";
 
-export function NodeScreen({ node, nodes, relationships, onBack, onOpen, onAction }: NodeScreenProps): JSX.Element {
+export function NodeScreen({
+  node,
+  nodes,
+  relationships,
+  onBack,
+  onOpen,
+  onAction,
+  onGraphRefresh,
+}: NodeScreenProps): JSX.Element {
   const [tab, setTab] = useState<Tab>("session");
   const [flash, setFlash] = useState<{ action: string; label: string; t: number } | null>(null);
   const [harnesses, setHarnesses] = useState<HarnessDescriptor[]>([]);
@@ -94,6 +102,7 @@ export function NodeScreen({ node, nodes, relationships, onBack, onOpen, onActio
   const parent = parentRel ? nodes.find((n) => n.id === parentRel.source_node_id) : undefined;
 
   function fire(action: NodeScreenAction, label: string) {
+    if (action === "send") setTab("session");
     onAction(action);
     const t = Date.now();
     setFlash({ action, label, t });
@@ -141,11 +150,11 @@ export function NodeScreen({ node, nodes, relationships, onBack, onOpen, onActio
               uptime: <b>{uptimeLabel(node)}</b>
             </span>
             <span>
-              ctx: <b>{Math.round(tel.ctx * 100)}%</b>
+              ctx est.: <b>{Math.round(tel.ctx * 100)}%</b>
             </span>
           </div>
           <div className="node-tabs">
-            {(["session", "events", "tools", "capabilities", "relationships"] as Tab[]).map((t) => (
+            {(["session", "events", "activity", "capabilities", "relationships"] as Tab[]).map((t) => (
               <div key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
                 {t}
               </div>
@@ -154,23 +163,40 @@ export function NodeScreen({ node, nodes, relationships, onBack, onOpen, onActio
         </div>
 
         {tab === "session" && (
-          <NodeSession key={node.id} node={node} mode="fullscreen" />
+          <NodeSession
+            key={node.id}
+            node={node}
+            mode="fullscreen"
+            onAttach={() => fire("attach", "attach url issued")}
+            onNativeAttach={() => fire("native-attach", "native attach prepared")}
+            onInterrupt={() => fire("interrupt", "sigint sent · paused")}
+          />
         )}
         {tab === "events" && <EventsView node={node} />}
-        {tab === "tools" && <ToolsView />}
+        {tab === "activity" && <ActivityView node={node} />}
         {tab === "capabilities" && <CapsView node={node} harnesses={harnesses} />}
-        {tab === "relationships" && <RelView node={node} parent={parent} children={children} />}
+        {tab === "relationships" && (
+          <RelView
+            node={node}
+            nodes={nodes}
+            relationships={relationships}
+            parent={parent}
+            children={children}
+            onOpen={onOpen}
+            onGraphRefresh={onGraphRefresh}
+          />
+        )}
       </div>
 
       <div className="node-side">
         <div className="sect">
-          <div className="h">telemetry</div>
+          <div className="h">telemetry estimates</div>
           <KV
             items={[
-              ["tokens in", tel.tokensIn.toLocaleString()],
-              ["tokens out", tel.tokensOut.toLocaleString()],
-              ["ctx", `${Math.round(tel.ctx * 100)}%`],
-              ["tool calls", tel.tools],
+              ["tokens in est.", tel.tokensIn.toLocaleString()],
+              ["tokens out est.", tel.tokensOut.toLocaleString()],
+              ["ctx est.", `${Math.round(tel.ctx * 100)}%`],
+              ["tool calls est.", tel.tools],
               ["uptime", uptimeLabel(node)],
             ]}
           />
@@ -218,8 +244,8 @@ export function NodeScreen({ node, nodes, relationships, onBack, onOpen, onActio
             <Btn size="sm" icon="square" onClick={() => fire("interrupt", "sigint sent · paused")}>
               interrupt
             </Btn>
-            <Btn size="sm" icon="rotate-ccw" onClick={() => fire("restart", "restart issued · ctx reset")}>
-              restart
+            <Btn size="sm" icon="stop-circle" onClick={() => fire("stop", "stop issued")}>
+              stop
             </Btn>
             <Btn size="sm" icon="git-branch" onClick={() => fire("fork", "forked → see graph")}>
               fork
@@ -307,6 +333,12 @@ function summarizeEventBody(body: unknown): string {
   if (typeof body === "string") return body;
   if (typeof body === "object") {
     const obj = body as Record<string, unknown>;
+    if (typeof obj.reason === "string") return `reason: ${obj.reason}`.slice(0, 240);
+    if (typeof obj.command === "string") return `command: ${obj.command}`.slice(0, 240);
+    if (typeof obj.title === "string" && typeof obj.body === "string") {
+      return `${obj.title}: ${obj.body}`.slice(0, 240);
+    }
+    if (typeof obj.error === "string") return `error: ${obj.error}`.slice(0, 240);
     if (typeof obj.text === "string") return obj.text.slice(0, 240);
     if (typeof obj.message === "string") return obj.message.slice(0, 240);
     try {
@@ -318,10 +350,64 @@ function summarizeEventBody(body: unknown): string {
   return String(body);
 }
 
-function ToolsView(): JSX.Element {
+function ActivityView({ node }: { node: AsylumNode }): JSX.Element {
+  const [events, setEvents] = useState<NodeEventRecord[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = () => {
+      fetchNodeEvents(node.id)
+        .then((items) => {
+          if (cancelled) return;
+          setEvents(items as NodeEventRecord[]);
+          setError(null);
+          timer = setTimeout(tick, 3000);
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return;
+          setError(err instanceof Error ? err.message : String(err));
+          timer = setTimeout(tick, 5000);
+        });
+    };
+    tick();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [node.id]);
+
+  if (error && events.length === 0) {
+    return (
+      <div className="log">
+        <Empty glyph="[!]" lead="failed to load activity" sub={error} />
+      </div>
+    );
+  }
+
+  const relevantEvents = events.filter((ev) => String(ev.kind).includes("tool")).sort((a, b) => b.sequence - a.sequence);
+  if (relevantEvents.length === 0) {
+    return (
+      <div className="log">
+        <Empty
+          glyph="[ ]"
+          lead="no dedicated tool-events yet"
+          sub="activity panel is event-backed and currently only shows explicit tool-like events."
+        />
+      </div>
+    );
+  }
   return (
-    <div style={{ padding: 24, overflow: "auto", borderTop: "1px solid var(--border)" }}>
-      <Empty glyph="[ ]" lead="no recent tool calls" sub="tool-call telemetry surfaces here as the harness streams output" />
+    <div className="log" style={{ overflow: "auto", padding: "8px 12px", fontFamily: "var(--font-mono, monospace)" }}>
+      {relevantEvents.map((ev) => (
+        <div key={ev.id} style={{ padding: "4px 0", borderBottom: "1px solid var(--border)" }}>
+          <span style={{ color: "var(--text-muted)" }}>#{ev.sequence}</span>{" "}
+          <span style={{ color: "var(--text-muted)" }}>{ev.created_at}</span>{" "}
+          <Tag>{ev.kind}</Tag>{" "}
+          <span>{summarizeEventBody(ev.body)}</span>
+        </div>
+      ))}
     </div>
   );
 }
@@ -358,13 +444,77 @@ function CapsView({ node, harnesses }: { node: AsylumNode; harnesses: HarnessDes
 
 function RelView({
   node,
+  nodes,
+  relationships,
   parent,
   children,
+  onOpen,
+  onGraphRefresh,
 }: {
   node: AsylumNode;
+  nodes: AsylumNode[];
+  relationships: GraphRelationship[];
   parent: AsylumNode | undefined;
   children: AsylumNode[];
+  onOpen: (node: AsylumNode) => void;
+  onGraphRefresh: () => void;
 }): JSX.Element {
+  const [direction, setDirection] = useState<"out" | "in">("out");
+  const [targetId, setTargetId] = useState("");
+  const [kind, setKind] = useState("user_created");
+  const [label, setLabel] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const related = relationships.filter((r) => r.source_node_id === node.id || r.target_node_id === node.id);
+  const candidates = nodes.filter((n) => n.id !== node.id);
+  const chosenTargetId = targetId || candidates[0]?.id || "";
+
+  async function createEdge(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!chosenTargetId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await createRelationship({
+        source_node_id: direction === "out" ? node.id : chosenTargetId,
+        target_node_id: direction === "out" ? chosenTargetId : node.id,
+        kind,
+        label: label.trim() || null,
+      });
+      setLabel("");
+      setTargetId("");
+      onGraphRefresh();
+    } catch (err) {
+      setError(`create failed: ${String(err instanceof Error ? err.message : err)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteEdge(id: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      await removeRelationship(id);
+      onGraphRefresh();
+    } catch (err) {
+      setError(`remove failed: ${String(err instanceof Error ? err.message : err)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function nodeLink(id: string): JSX.Element {
+    const relatedNode = nodes.find((n) => n.id === id);
+    if (!relatedNode) return <span className="muted">{shortNodeId(id)}</span>;
+    return (
+      <a style={{ color: "var(--fg)", cursor: "pointer" }} onClick={() => onOpen(relatedNode)}>
+        {shortNodeId(id)}
+      </a>
+    );
+  }
+
   return (
     <div
       style={{
@@ -381,7 +531,9 @@ function RelView({
       {parent && (
         <div style={{ marginBottom: 14 }}>
           <span className="muted">parent · </span>
-          <span style={{ color: "var(--fg)" }}>{shortNodeId(parent.id)}</span>
+          <a style={{ color: "var(--fg)", cursor: "pointer" }} onClick={() => onOpen(parent)}>
+            {shortNodeId(parent.id)}
+          </a>
         </div>
       )}
       {children.length > 0 && (
@@ -397,7 +549,89 @@ function RelView({
           ))}
         </>
       )}
-      {!parent && children.length === 0 && <div className="muted">no explicit relationships</div>}
+      {related.length > 0 && (
+        <>
+          <div className="hr" />
+          <div className="muted" style={{ marginBottom: 8 }}>
+            edge records:
+          </div>
+          <div className="rel-table-wrap">
+            <table className="table" style={{ fontFamily: "var(--font-mono)", fontSize: 12 }}>
+              <thead>
+                <tr>
+                  <th>source</th>
+                  <th>kind</th>
+                  <th>target</th>
+                  <th>label</th>
+                  <th className="right">action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {related.map((rel) => (
+                  <tr key={rel.id}>
+                    <td className="mono">{nodeLink(rel.source_node_id)}</td>
+                    <td className="mono">{rel.kind}</td>
+                    <td className="mono">{nodeLink(rel.target_node_id)}</td>
+                    <td className="mono muted">{rel.label || "—"}</td>
+                    <td className="right">
+                      <Btn
+                        size="sm"
+                        kind="danger"
+                        icon="trash"
+                        disabled={busy}
+                        onClick={() => void deleteEdge(rel.id)}
+                      >
+                        remove
+                      </Btn>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+      {related.length === 0 && <div className="muted">no explicit relationships</div>}
+      <div className="hr" />
+      <form onSubmit={(e) => void createEdge(e)} style={{ display: "grid", gap: 10, maxWidth: 720 }}>
+        <div className="muted" style={{ fontSize: 11, marginBottom: 2 }}>
+          create explicit edge
+        </div>
+        <div className="rel-create-grid">
+          <select className="input mono" value={direction} onChange={(e) => setDirection(e.target.value as "out" | "in")}>
+            <option value="out">from node</option>
+            <option value="in">to node</option>
+          </select>
+          <select
+            className="input mono"
+            value={chosenTargetId}
+            onChange={(e) => setTargetId(e.target.value)}
+            disabled={candidates.length === 0}
+          >
+            {candidates.map((candidate) => (
+              <option key={candidate.id} value={candidate.id}>
+                {shortNodeId(candidate.id)} · {candidate.role_hint}
+              </option>
+            ))}
+          </select>
+          <select className="input mono" value={kind} onChange={(e) => setKind(e.target.value)}>
+            <option value="user_created">user_created</option>
+            <option value="supervises">supervises</option>
+            <option value="spawned_for">spawned_for</option>
+            <option value="platform_responsibility">platform_responsibility</option>
+          </select>
+          <input
+            className="input mono"
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            placeholder="label"
+          />
+          <Btn kind="primary" icon="plus" disabled={busy || !chosenTargetId} type="submit">
+            create
+          </Btn>
+        </div>
+        {error && <div style={{ color: "var(--status-errored)", fontFamily: "var(--font-mono)", fontSize: 11 }}>{error}</div>}
+      </form>
       <div className="hr" />
       <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
         correlations (not edges)

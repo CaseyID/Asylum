@@ -6,9 +6,9 @@ Architecture note: crate layout and daemon-entry details are superseded by [the 
 
 ## Release status
 
-- **v0.1.2** (tag `922e951`) — Published with full platform parity: `darwin-arm64`, `darwin-x86_64`, `linux-arm64`, `linux-x86_64` archives + signed `checksums.txt.minisig`. End-to-end signature verification confirmed against the embedded pubkey.
-- **`main` is 4 commits ahead of v0.1.2** (`05a9882`, `b2ff5ec`, `49ef71f`, `86f8bc3`). All are release-tooling improvements only — no user-facing functionality changes — so a v0.1.3 cut is **not** warranted on its own. They will fold naturally into the next user-facing release.
-- Ledger: [RELEASES.md](../../RELEASES.md). No open release-side action items.
+Doc-only / internal — no release needed for this handoff at the time.
+
+The later release state is tracked in [RELEASES.md](../../RELEASES.md). Latest release at the time of the 2026-05-05 audit: v0.1.6.
 
 ## What shipped since the previous handoff (cockpit-deliverability)
 

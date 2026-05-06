@@ -7,7 +7,10 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::client::AsylumClient;
-use asylum_types::api::CreateNodeRequest;
+use asylum_types::api::{
+    ChannelCreateRequest, ChannelInboundRequest, ChannelTestRequest, ChannelUpdateRequest,
+    CreateNodeRequest,
+};
 
 #[derive(Deserialize)]
 struct RpcRequest {
@@ -225,6 +228,15 @@ fn tool_definitions() -> Vec<ToolSpec> {
             description: "List all relationships in the graph",
             input_schema: json!({"type":"object","properties":{}}),
         },
+        ToolSpec {
+            name: "relationship.remove",
+            description: "Delete an explicit graph relationship by id",
+            input_schema: json!({
+                "type":"object",
+                "properties":{"relationship_id":{"type":"string"}},
+                "required":["relationship_id"]
+            }),
+        },
         // — hooks —
         ToolSpec {
             name: "hook.list",
@@ -260,15 +272,80 @@ fn tool_definitions() -> Vec<ToolSpec> {
             description: "List recent hook firing records",
             input_schema: json!({"type":"object","properties":{}}),
         },
-        // — channels —
+        // — channels / notifications —
         ToolSpec {
             name: "channel.list",
             description: "List notification channels",
             input_schema: json!({"type":"object","properties":{}}),
         },
         ToolSpec {
-            name: "channel.send",
-            description: "Send a notification via a channel",
+            name: "channel.inspect",
+            description: "Inspect a notification channel",
+            input_schema: json!({
+                "type":"object",
+                "properties":{"channel_id":{"type":"string"}},
+                "required":["channel_id"]
+            }),
+        },
+        ToolSpec {
+            name: "channel.create",
+            description: "Create a notification channel",
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "kind":{"type":"string"},
+                    "name":{"type":"string"},
+                    "label":{"type":"string"},
+                    "direction":{"type":"string"},
+                    "detail":{"type":"string"},
+                    "config":{"type":"object"},
+                    "live":{"type":"boolean"},
+                },
+                "required":["kind","name","direction"]
+            }),
+        },
+        ToolSpec {
+            name: "channel.update",
+            description: "Update a notification channel",
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "channel_id":{"type":"string"},
+                    "name":{"type":"string"},
+                    "label":{"type":"string"},
+                    "detail":{"type":"string"},
+                    "direction":{"type":"string"},
+                    "status":{"type":"string"},
+                    "config":{"type":"object"},
+                    "live":{"type":"boolean"},
+                },
+                "required":["channel_id"]
+            }),
+        },
+        ToolSpec {
+            name: "channel.delete",
+            description: "Delete a notification channel",
+            input_schema: json!({
+                "type":"object",
+                "properties":{"channel_id":{"type":"string"}},
+                "required":["channel_id"]
+            }),
+        },
+        ToolSpec {
+            name: "channel.messages",
+            description: "List messages for a notification channel",
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "channel_id":{"type":"string"},
+                    "limit":{"type":"integer","minimum":1},
+                },
+                "required":["channel_id"]
+            }),
+        },
+        ToolSpec {
+            name: "channel.test",
+            description: "Send a test message through a channel",
             input_schema: json!({
                 "type":"object",
                 "properties":{
@@ -277,6 +354,137 @@ fn tool_definitions() -> Vec<ToolSpec> {
                     "body":{"type":"string"},
                 },
                 "required":["channel_id","title","body"]
+            }),
+        },
+        ToolSpec {
+            name: "channel.inbound",
+            description: "Ingest an inbound message through a channel",
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "channel_id":{"type":"string"},
+                    "sender":{"type":"string"},
+                    "subject":{"type":"string"},
+                    "body":{"type":"string"},
+                    "replies":{"type":"array","items":{"type":"string"}},
+                    "node_id":{"type":"string"},
+                    "correlation_token":{"type":"string"},
+                },
+                "required":["channel_id","sender","subject","body"]
+            }),
+        },
+        ToolSpec {
+            name: "notify.send",
+            description: "Send a notification through the daemon notification capability",
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "topic":{"type":"string"},
+                    "title":{"type":"string"},
+                    "body":{"type":"string"},
+                },
+                "required":["title","body"]
+            }),
+        },
+        ToolSpec {
+            name: "notify.list",
+            description: "List recent notifications",
+            input_schema: json!({"type":"object","properties":{}}),
+        },
+        ToolSpec {
+            name: "notify.read",
+            description: "Mark one notification as read",
+            input_schema: json!({
+                "type":"object",
+                "properties":{"id":{"type":"integer"}},
+                "required":["id"]
+            }),
+        },
+        ToolSpec {
+            name: "workspace.recent",
+            description: "List recently used workspaces",
+            input_schema: json!({"type":"object","properties":{}}),
+        },
+        ToolSpec {
+            name: "context.system_map",
+            description: "Fetch the current context system map",
+            input_schema: json!({"type":"object","properties":{}}),
+        },
+        ToolSpec {
+            name: "context.launch_packet",
+            description: "Generate a launch packet for a node",
+            input_schema: json!({
+                "type":"object",
+                "properties":{"node_id":{"type":"string"}},
+                "required":["node_id"]
+            }),
+        },
+        ToolSpec {
+            name: "recipe.list",
+            description: "List starter recipes available for launch",
+            input_schema: json!({"type":"object","properties":{}}),
+        },
+        ToolSpec {
+            name: "recipe.spawn",
+            description: "Spawn nodes from a recipe",
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "recipe_id":{"type":"string"},
+                    "harness":{"type":"string"},
+                    "substrate":{"type":"string"},
+                    "workspace":{"type":"string"},
+                    "description":{"type":"string"},
+                    "role_hint":{"type":"string"},
+                },
+                "required":["recipe_id","harness","substrate"]
+            }),
+        },
+        ToolSpec {
+            name: "remote_command.send",
+            description: "Execute a remote command against the daemon",
+            input_schema: json!({
+                "type":"object",
+                "properties":{"command":{"type":"string"}},
+                "required":["command"]
+            }),
+        },
+        ToolSpec {
+            name: "decision.create",
+            description: "Create an operator decision request",
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "text":{"type":"string"},
+                    "node_id":{"type":"string"},
+                },
+                "required":["text"]
+            }),
+        },
+        ToolSpec {
+            name: "decision.list",
+            description: "List operator decisions",
+            input_schema: json!({"type":"object","properties":{}}),
+        },
+        ToolSpec {
+            name: "decision.inspect",
+            description: "Inspect one operator decision",
+            input_schema: json!({
+                "type":"object",
+                "properties":{"decision_id":{"type":"string"}},
+                "required":["decision_id"]
+            }),
+        },
+        ToolSpec {
+            name: "decision.resolve",
+            description: "Resolve an operator decision",
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "decision_id":{"type":"string"},
+                    "status":{"type":"string","enum":["approved","denied"]},
+                },
+                "required":["decision_id","status"]
             }),
         },
         // — system —
@@ -295,8 +503,7 @@ fn tool_definitions() -> Vec<ToolSpec> {
             }),
         },
         // Skipped (out of scope for v1 MCP): token management (security-sensitive),
-        // substrate/harness descriptors (static metadata), recipe spawning,
-        // workspace operations, artifact refs, decision request/resolve.
+        // substrate/harness descriptors (static metadata), artifact refs.
     ]
 }
 
@@ -491,9 +698,12 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
                 Err(err) => return rpc_error(-32602, &err),
             };
             match client.browser_attach_url(node_id).await {
-                Ok(response) => content_result(
-                    json!({"url": response.url, "expires_in_seconds": response.expires_in_seconds}),
-                ),
+                Ok(response) => content_result(json!({
+                    "url": response.url,
+                    "expires_in_seconds": response.expires_in_seconds,
+                    "transport": response.transport,
+                    "note": response.note,
+                })),
                 Err(err) => rpc_error(-32000, &format!("attach_url.issue failed: {err}")),
             }
         }
@@ -540,6 +750,26 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
             {
                 Ok(v) => content_result(v),
                 Err(err) => rpc_error(-32000, &format!("relationship.list failed: {err}")),
+            }
+        }
+        "relationship.remove" => {
+            let relationship_id = extract_arg_string(&params.arguments, "relationship_id")
+                .or_else(|| extract_arg_string(&params.arguments, "id"))
+                .ok_or_else(|| "missing relationship_id".to_string());
+            match relationship_id {
+                Err(err) => rpc_error(-32602, &err),
+                Ok(id) => {
+                    let path = format!("/api/relationships/{id}");
+                    match client
+                        .send_request_no_content_pub(reqwest::Method::DELETE, &path, None::<&()>)
+                        .await
+                    {
+                        Ok(()) => content_result(json!({"ok":true})),
+                        Err(err) => {
+                            rpc_error(-32000, &format!("relationship.remove failed: {err}"))
+                        }
+                    }
+                }
             }
         }
         "hook.list" => {
@@ -599,17 +829,312 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
                 Err(err) => rpc_error(-32000, &format!("channel.list failed: {err}")),
             }
         }
-        "channel.send" => {
+        "channel.inspect" => {
+            let channel_id = match parse_channel_id(&params.arguments) {
+                Ok(channel_id) => channel_id,
+                Err(err) => return rpc_error(-32602, &err),
+            };
+            match client.inspect_channel(&channel_id).await {
+                Ok(response) => content_result(json!({ "channel": response })),
+                Err(err) => rpc_error(-32000, &format!("channel.inspect failed: {err}")),
+            }
+        }
+        "channel.create" => {
+            let args: ChannelCreateRequest = match serde_json::from_value(params.arguments) {
+                Ok(args) => args,
+                Err(err) => {
+                    return rpc_error(-32602, &format!("channel.create: invalid args: {err}"));
+                }
+            };
+            match client.create_channel(args).await {
+                Ok(response) => content_result(json!({ "channel": response })),
+                Err(err) => rpc_error(-32000, &format!("channel.create failed: {err}")),
+            }
+        }
+        "channel.update" => {
+            #[derive(Deserialize)]
+            struct ChannelUpdateArgs {
+                channel_id: String,
+                name: Option<String>,
+                label: Option<String>,
+                detail: Option<String>,
+                direction: Option<String>,
+                status: Option<String>,
+                #[serde(default)]
+                config: Option<Value>,
+                live: Option<bool>,
+            }
+
+            let ChannelUpdateArgs {
+                channel_id,
+                name,
+                label,
+                detail,
+                direction,
+                status,
+                config,
+                live,
+            } = match serde_json::from_value(params.arguments) {
+                Ok(args) => args,
+                Err(err) => {
+                    return rpc_error(-32602, &format!("channel.update: invalid args: {err}"));
+                }
+            };
+            let request = ChannelUpdateRequest {
+                name,
+                label,
+                detail,
+                direction,
+                status,
+                config,
+                live,
+            };
+            match client.update_channel(&channel_id, request).await {
+                Ok(response) => content_result(json!({ "channel": response })),
+                Err(err) => rpc_error(-32000, &format!("channel.update failed: {err}")),
+            }
+        }
+        "channel.delete" => {
+            let channel_id = match parse_channel_id(&params.arguments) {
+                Ok(channel_id) => channel_id,
+                Err(err) => return rpc_error(-32602, &err),
+            };
+            match client.delete_channel(&channel_id).await {
+                Ok(()) => content_result(json!({"ok":true})),
+                Err(err) => rpc_error(-32000, &format!("channel.delete failed: {err}")),
+            }
+        }
+        "channel.messages" => {
+            #[derive(Deserialize)]
+            struct ChannelMessagesArgs {
+                channel_id: String,
+                limit: Option<u32>,
+            }
+            let args: ChannelMessagesArgs = match serde_json::from_value(params.arguments) {
+                Ok(args) => args,
+                Err(err) => {
+                    return rpc_error(-32602, &format!("channel.messages: invalid args: {err}"));
+                }
+            };
+            match client.channel_messages(&args.channel_id, args.limit).await {
+                Ok(response) => content_result(json!({ "messages": response.messages })),
+                Err(err) => rpc_error(-32000, &format!("channel.messages failed: {err}")),
+            }
+        }
+        "channel.test" => {
+            #[derive(Deserialize)]
+            struct ChannelTestArgs {
+                channel_id: String,
+                title: String,
+                body: String,
+            }
+            let args: ChannelTestArgs = match serde_json::from_value(params.arguments) {
+                Ok(args) => args,
+                Err(err) => {
+                    return rpc_error(-32602, &format!("channel.test: invalid args: {err}"));
+                }
+            };
+            let request = ChannelTestRequest {
+                title: args.title,
+                body: args.body,
+            };
+            match client.test_channel(&args.channel_id, request).await {
+                Ok(response) => content_result(json!({ "sent": response.sent })),
+                Err(err) => rpc_error(-32000, &format!("channel.test failed: {err}")),
+            }
+        }
+        "channel.inbound" => {
+            #[derive(Deserialize)]
+            struct ChannelInboundArgs {
+                channel_id: String,
+                sender: String,
+                subject: String,
+                body: String,
+                #[serde(default)]
+                replies: Vec<String>,
+                node_id: Option<String>,
+                correlation_token: Option<String>,
+            }
+            let args: ChannelInboundArgs = match serde_json::from_value(params.arguments) {
+                Ok(args) => args,
+                Err(err) => {
+                    return rpc_error(-32602, &format!("channel.inbound: invalid args: {err}"));
+                }
+            };
+            let request = ChannelInboundRequest {
+                sender: args.sender,
+                subject: args.subject,
+                body: args.body,
+                replies: args.replies,
+                node_id: args.node_id,
+                correlation_token: args.correlation_token,
+            };
+            match client.inbound_channel(&args.channel_id, request).await {
+                Ok(()) => content_result(json!({"ok":true})),
+                Err(err) => rpc_error(-32000, &format!("channel.inbound failed: {err}")),
+            }
+        }
+        "notify.send" => {
             match client
                 .send_request_json::<Value, _>(
                     reqwest::Method::POST,
-                    "/api/channels/inbound",
+                    "/api/notify/send",
                     Some(&params.arguments),
                 )
                 .await
             {
                 Ok(v) => content_result(v),
-                Err(err) => rpc_error(-32000, &format!("channel.send failed: {err}")),
+                Err(err) => rpc_error(-32000, &format!("notify.send failed: {err}")),
+            }
+        }
+        "notify.list" => match client.list_notifications().await {
+            Ok(response) => content_result(json!({ "notifications": response.notifications })),
+            Err(err) => rpc_error(-32000, &format!("notify.list failed: {err}")),
+        },
+        "notify.read" => {
+            let notification_id = extract_arg_i64(&params.arguments, "id")
+                .or_else(|| extract_arg_i64(&params.arguments, "notification_id"))
+                .ok_or_else(|| "missing id".to_string());
+            match notification_id {
+                Err(err) => rpc_error(-32602, &err),
+                Ok(id) => match client.mark_notification_read(id).await {
+                    Ok(()) => content_result(json!({"ok":true})),
+                    Err(err) => rpc_error(-32000, &format!("notify.read failed: {err}")),
+                },
+            }
+        }
+        "workspace.recent" => match client.recent_workspaces().await {
+            Ok(response) => content_result(json!({ "workspaces": response })),
+            Err(err) => rpc_error(-32000, &format!("workspace.recent failed: {err}")),
+        },
+        "context.system_map" => match client.system_map().await {
+            Ok(response) => content_result(json!({ "system_map": response.graph })),
+            Err(err) => rpc_error(-32000, &format!("context.system_map failed: {err}")),
+        },
+        "context.launch_packet" => {
+            let node_id = match parse_node_id(&params.arguments) {
+                Ok(node_id) => node_id,
+                Err(err) => return rpc_error(-32602, &err),
+            };
+            match client.launch_packet(node_id).await {
+                Ok(response) => content_result(json!({
+                    "markdown": response.markdown,
+                    "artifact_id": response.artifact_id
+                })),
+                Err(err) => rpc_error(-32000, &format!("context.launch_packet failed: {err}")),
+            }
+        }
+        "recipe.list" => match client.list_recipes().await {
+            Ok(response) => content_result(json!({ "recipes": response.recipes })),
+            Err(err) => rpc_error(-32000, &format!("recipe.list failed: {err}")),
+        },
+        "recipe.spawn" => {
+            #[derive(Deserialize)]
+            struct SpawnArgs {
+                recipe_id: String,
+                harness: String,
+                substrate: String,
+                workspace: Option<String>,
+                description: Option<String>,
+                role_hint: Option<String>,
+            }
+            let args: SpawnArgs = match serde_json::from_value(params.arguments) {
+                Ok(args) => args,
+                Err(err) => {
+                    return rpc_error(-32602, &format!("recipe.spawn: invalid args: {err}"));
+                }
+            };
+            let request = asylum_types::api::RecipeSpawnRequest {
+                harness: args.harness,
+                substrate: args.substrate,
+                workspace: args.workspace,
+                description: args.description,
+                role_hint: args.role_hint,
+            };
+            match client.spawn_recipe(&args.recipe_id, request).await {
+                Ok(response) => content_result(json!({ "node_ids": response.node_ids })),
+                Err(err) => rpc_error(-32000, &format!("recipe.spawn failed: {err}")),
+            }
+        }
+        "remote_command.send" => {
+            #[derive(Deserialize)]
+            struct RemoteCommandArgs {
+                command: String,
+            }
+            let args: RemoteCommandArgs = match serde_json::from_value(params.arguments) {
+                Ok(args) => args,
+                Err(err) => {
+                    return rpc_error(-32602, &format!("remote_command.send: invalid args: {err}"));
+                }
+            };
+            let request = asylum_types::api::RemoteCommandRequest {
+                command: args.command,
+            };
+            match client.send_remote_command(request).await {
+                Ok(response) => content_result(json!({
+                    "kind": response.kind,
+                    "status": response.status,
+                    "node_id": response.node_id,
+                    "result": response.result,
+                })),
+                Err(err) => rpc_error(-32000, &format!("remote_command.send failed: {err}")),
+            }
+        }
+        "decision.create" => {
+            #[derive(Deserialize)]
+            struct DecisionCreateArgs {
+                text: String,
+                node_id: Option<String>,
+            }
+            let args: DecisionCreateArgs = match serde_json::from_value(params.arguments) {
+                Ok(args) => args,
+                Err(err) => {
+                    return rpc_error(-32602, &format!("decision.create: invalid args: {err}"));
+                }
+            };
+            let request = asylum_types::api::DecisionCreateRequest {
+                text: args.text,
+                node_id: args.node_id,
+            };
+            match client.create_decision(request).await {
+                Ok(decision) => content_result(json!({ "decision": decision })),
+                Err(err) => rpc_error(-32000, &format!("decision.create failed: {err}")),
+            }
+        }
+        "decision.list" => match client.list_decisions().await {
+            Ok(response) => content_result(json!({ "decisions": response.decisions })),
+            Err(err) => rpc_error(-32000, &format!("decision.list failed: {err}")),
+        },
+        "decision.inspect" => {
+            let decision_id = extract_arg_string(&params.arguments, "decision_id")
+                .or_else(|| extract_arg_string(&params.arguments, "id"))
+                .ok_or_else(|| "missing decision_id".to_string());
+            match decision_id {
+                Err(err) => rpc_error(-32602, &err),
+                Ok(id) => match client.get_decision(&id).await {
+                    Ok(decision) => content_result(json!({ "decision": decision })),
+                    Err(err) => rpc_error(-32000, &format!("decision.inspect failed: {err}")),
+                },
+            }
+        }
+        "decision.resolve" => {
+            #[derive(Deserialize)]
+            struct DecisionResolveArgs {
+                decision_id: String,
+                status: String,
+            }
+            let args: DecisionResolveArgs = match serde_json::from_value(params.arguments) {
+                Ok(args) => args,
+                Err(err) => {
+                    return rpc_error(-32602, &format!("decision.resolve: invalid args: {err}"));
+                }
+            };
+            let request = asylum_types::api::DecisionResolveRequest {
+                status: args.status,
+            };
+            match client.resolve_decision(&args.decision_id, request).await {
+                Ok(decision) => content_result(json!({ "decision": decision })),
+                Err(err) => rpc_error(-32000, &format!("decision.resolve failed: {err}")),
             }
         }
         "health.get" => match client.health().await {
@@ -662,11 +1187,26 @@ fn parse_node_id_str(node_id: &str) -> Result<Uuid, String> {
     Uuid::parse_str(node_id).map_err(|err| format!("invalid node_id: {err}"))
 }
 
+fn parse_channel_id(input: &Value) -> Result<String, String> {
+    extract_arg_string(input, "channel_id")
+        .or_else(|| extract_arg_string(input, "id"))
+        .ok_or_else(|| "missing channel_id".to_string())
+}
+
 fn extract_arg_string(value: &Value, key: &str) -> Option<String> {
     value
         .get(key)
         .and_then(Value::as_str)
         .map(ToString::to_string)
+}
+
+fn extract_arg_i64(value: &Value, key: &str) -> Option<i64> {
+    value.get(key).and_then(Value::as_i64).or_else(|| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<i64>().ok())
+    })
 }
 
 fn content_result(payload: Value) -> RpcResponse {
@@ -712,9 +1252,28 @@ mod tests {
         assert!(names.contains(&"attach_url.issue"));
         assert!(names.contains(&"node.fork"));
         assert!(names.contains(&"hook.list"));
+        assert!(names.contains(&"channel.inspect"));
+        assert!(names.contains(&"channel.create"));
+        assert!(names.contains(&"channel.update"));
+        assert!(names.contains(&"channel.delete"));
+        assert!(names.contains(&"channel.messages"));
+        assert!(names.contains(&"channel.test"));
+        assert!(names.contains(&"channel.inbound"));
         assert!(names.contains(&"channel.list"));
         assert!(names.contains(&"relationship.create"));
+        assert!(names.contains(&"relationship.remove"));
         assert!(names.contains(&"health.get"));
+        assert!(names.contains(&"notify.list"));
+        assert!(names.contains(&"workspace.recent"));
+        assert!(names.contains(&"context.system_map"));
+        assert!(names.contains(&"context.launch_packet"));
+        assert!(names.contains(&"recipe.list"));
+        assert!(names.contains(&"recipe.spawn"));
+        assert!(names.contains(&"remote_command.send"));
+        assert!(names.contains(&"decision.create"));
+        assert!(names.contains(&"decision.list"));
+        assert!(names.contains(&"decision.inspect"));
+        assert!(names.contains(&"decision.resolve"));
     }
 
     #[test]

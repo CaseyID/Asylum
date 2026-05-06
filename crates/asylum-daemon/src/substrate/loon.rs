@@ -64,7 +64,7 @@ pub fn capability_flags_from_health(
         interrupt: true,
         stop: true,
         resume: false,
-        structured_events: true,
+        structured_events: false,
         transcript_export: false,
     }
 }
@@ -278,5 +278,20 @@ mod tests {
             parse_instances_running("loon-daemon version 0.1.0 (status=ok, instances_running=3)"),
             Some(3)
         );
+    }
+
+    #[test]
+    fn loon_capabilities_do_not_advertise_structured_events_without_event_stream() {
+        let health = LoonHealth {
+            status: "ok".to_string(),
+            running_instances: 1,
+            harness_profiles: vec!["codex".to_string()],
+        };
+
+        let snapshot = capability_flags_from_health(&health, &HarnessKind::Codex);
+
+        assert!(snapshot.browser_attach);
+        assert!(snapshot.send_input);
+        assert!(!snapshot.structured_events);
     }
 }

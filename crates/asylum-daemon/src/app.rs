@@ -6,8 +6,9 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use asylum_types::api::{
     ChannelCreateRequest, ChannelInboundRequest, ChannelTestRequest, ChannelUpdateRequest,
-    CreateNodeRequest, ErrorPayload, ForkNodeRequest, HookCreateRequest, HookUpdateRequest,
-    LaunchPacketResponse, RecipeSpawnRequest, SendInputRequest,
+    CreateNodeRequest, DecisionCreateRequest, DecisionResolveRequest, ErrorPayload,
+    ForkNodeRequest, HookCreateRequest, HookUpdateRequest, LaunchPacketResponse,
+    RecipeSpawnRequest, SendInputRequest,
 };
 use asylum_types::config::AsylumConfig;
 use asylum_types::node::SubstrateKind;
@@ -252,6 +253,12 @@ pub fn build_router_for_transport(state: Arc<AppState>, require_auth: bool) -> R
         .route("/api/relationships/{id}", delete(api_delete_relationship))
         .route("/api/notifications", get(api_notifications))
         .route("/api/notifications/{id}/read", post(api_notification_read))
+        .route(
+            "/api/decisions",
+            get(api_decisions_list).post(api_decision_create),
+        )
+        .route("/api/decisions/{id}", get(api_decision_get))
+        .route("/api/decisions/{id}/resolve", post(api_decision_resolve))
         .route("/api/remote-commands", post(api_remote_commands))
         .route("/api/notify/send", post(api_notify_send))
         .route(
@@ -692,6 +699,54 @@ pub async fn api_notification_read(
     } else {
         StatusCode::NOT_FOUND
     }
+}
+
+pub async fn api_decision_create(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(request): Json<DecisionCreateRequest>,
+) -> Result<Json<asylum_types::api::DecisionRecord>, AppError> {
+    let response = state
+        .service
+        .create_decision(request)
+        .await
+        .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(response))
+}
+
+pub async fn api_decisions_list(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<asylum_types::api::DecisionListResponse>, AppError> {
+    let response = state
+        .service
+        .list_decisions()
+        .await
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(response))
+}
+
+pub async fn api_decision_get(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<asylum_types::api::DecisionRecord>, AppError> {
+    let response = state
+        .service
+        .get_decision(&id)
+        .await
+        .map_err(|error| AppError::new(StatusCode::NOT_FOUND, error.to_string()))?;
+    Ok(Json(response))
+}
+
+pub async fn api_decision_resolve(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(request): Json<DecisionResolveRequest>,
+) -> Result<Json<asylum_types::api::DecisionRecord>, AppError> {
+    let response = state
+        .service
+        .resolve_decision(&id, request)
+        .await
+        .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(response))
 }
 
 pub async fn api_remote_commands(
@@ -1212,7 +1267,7 @@ pub async fn api_node_fork(
 async fn api_notify_send(
     Extension(state): Extension<Arc<AppState>>,
     Json(payload): Json<NotifySendRequest>,
-) -> Json<NotifySendResponse> {
+) -> Result<Json<NotifySendResponse>, AppError> {
     let sent = state
         .service
         .notify_send(
@@ -1223,8 +1278,8 @@ async fn api_notify_send(
             payload.token,
         )
         .await
-        .unwrap_or(false);
-    Json(NotifySendResponse { sent })
+        .map_err(|err| AppError::new(StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
+    Ok(Json(NotifySendResponse { sent }))
 }
 
 #[cfg(debug_assertions)]
