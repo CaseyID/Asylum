@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.8 — 2026-05-06
+
+### Fixed
+
+- Fixed a Cockpit attach replay loop where historical `attach_issued` events were treated like fresh user attach clicks, causing Firefox to block a flood of popup windows.
+- Renamed operator-facing attach labels from implementation terms like "browser attach" and "native attach" to clearer attach-tab / terminal wording.
+
 ## 0.1.7 — 2026-05-06
 
 ### Added
