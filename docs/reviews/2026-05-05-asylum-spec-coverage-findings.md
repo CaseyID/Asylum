@@ -6,6 +6,43 @@
 **Controlling goal:** [2026-05-05-asylum-spec-audit-goal.md](../context/2026-05-05-asylum-spec-audit-goal.md)
 **Release status:** Doc-only / internal — no release needed. Last release: [v0.1.6](../../RELEASES.md) (2026-05-05).
 
+## PR Review Summary
+
+This is the single canonical record of the 2026-05-05 spec audit and fix pass.
+If you only read one doc for PR #9, read this section plus the Follow-On Fix
+Queue at the bottom.
+
+What changed in this PR:
+
+- Completed a repo-vs-[current product spec](../specs/asylum-current-product-spec.md) audit and recorded the evidence matrix below.
+- Added/filled practical root capability gaps across CLI, MCP, daemon API, and Cockpit:
+  decisions, graph relationships, channel CRUD/inbound, hooks, recipes, notifications, workspace/context, remote commands, and node fork.
+- Made Cockpit materially more real and operator-facing:
+  daemon-backed Decisions screen, relationship create/remove, notification read/open-node workflow, manual channel inbound, improved terminal/session input, event-backed Activity, honest settings errors, responsive fixes, and populated-state regression tests.
+- Added daemon-side behavior that was missing or misleading:
+  local stdout-line decision ingestion, inbound channel remote-command execution with token validation, ntfy reply correlation, Loon unavailable-operation failures before mutation, Loon attach/observe honesty, exposure warnings, status JSON cache shape, and unsupported hook-tool honesty.
+- Updated docs/release tracking:
+  README known limits/service examples, old handoff release-status normalization, and this completed findings record.
+
+Final verification passed:
+
+- `cargo fmt --check`
+- `cargo test --workspace`
+- `npm --prefix cockpit run test -- --run`
+- `npm --prefix cockpit run build`
+
+Remaining product gap:
+
+- Loon/substrate-native decision ingestion is still not implemented because there is no real Loon event stream in this repo to consume. The PR stops over-advertising that capability instead of pretending it works.
+
+How to use the rest of this doc:
+
+- Requirement Coverage: full spec-by-spec matrix.
+- Fixes Completed During This Audit: human-readable change log for the work.
+- Browser Validation Log and Runtime Smoke Evidence: proof of what was actually run.
+- Commands Run: reproducibility trail.
+- Completion Audit Checkpoint: why the audit goal was marked complete.
+
 ## Start Check
 
 - Branch/checkpoint: `main`, `HEAD=f14a7c4`, `origin/main=f14a7c4`.
