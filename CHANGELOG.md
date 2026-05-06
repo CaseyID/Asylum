@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.7 — 2026-05-06
+
+### Added
+
+- Completed the current-spec coverage audit and added a docs map plus a single findings record for the audit/fix pass.
+- Added first-class decision workflows across daemon API, CLI, MCP, and Cockpit, including create/list/inspect/approve/deny and node-linked resolution feedback.
+- Added CLI/MCP coverage for graph relationships, channels, hooks, recipes, notifications, workspace/context, remote commands, and node fork.
+- Added Cockpit workflows for Decisions, graph relationship create/remove, notification read/open-node, and manual channel inbound.
+- Added local stdout-line decision ingestion for harnesses via `@@asylum:decision.request` control lines.
+
+### Changed
+
+- Improved Cockpit terminal/session UX with multiline input, shared attach/native/interrupt controls, event-backed Activity, clearer telemetry labels, responsive layout fixes, and populated-state/responsive regression coverage.
+- Added inbound channel remote-command execution with token validation and durable ntfy reply correlation.
+- Made Loon unsupported paths more honest: unavailable operations fail before mutating state, attach/observe copy discloses limitations, and Loon no longer advertises structured events without a real event stream.
+- `status`, `status --json`, and `doctor` now surface effective non-loopback/all-interface HTTP exposure warnings.
+
+### Fixed
+
+- Unconfigured notify send now returns an explicit service-unavailable error.
+- Hook `tool transcript.checkpoint` now reports unsupported instead of a successful no-op.
+- Cockpit Settings now surfaces daemon API failures instead of silently rendering empty panels.
+- `status --json` reports an explicit empty Cockpit cache list when no separate cache paths exist.
+
 ## 0.1.6 — 2026-05-05
 
 ### Fixed

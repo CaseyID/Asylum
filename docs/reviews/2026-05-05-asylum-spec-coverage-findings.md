@@ -4,7 +4,7 @@
 **Date:** 2026-05-05
 **Primary source of truth:** [asylum-current-product-spec.md](../specs/asylum-current-product-spec.md)
 **Controlling goal:** [2026-05-05-asylum-spec-audit-goal.md](../context/2026-05-05-asylum-spec-audit-goal.md)
-**Release status:** Doc-only / internal — no release needed. Last release: [v0.1.6](../../RELEASES.md) (2026-05-05).
+**Release status:** Released as v0.1.7. See [RELEASES.md](../../RELEASES.md).
 
 ## PR Review Summary
 
