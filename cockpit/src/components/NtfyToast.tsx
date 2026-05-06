@@ -5,8 +5,7 @@ export interface ToastPayload {
   id: string;
   /** free-form display string (e.g. "ntfy:user@host") */
   from: string;
-  /** node id to target for replies; null when the inbound message record
-   *  carries no node id (ChannelMessageRecord has no node_id field). */
+  /** node id to target for replies; null when the inbound message is not routed. */
   nodeId: string | null;
   channel: string;
   subject?: string;

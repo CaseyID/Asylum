@@ -37,18 +37,28 @@ function isTokenActive(t: TokenSummary): boolean {
 
 function NtfySettings() {
   const [channels, setChannels] = useState<ChannelDescriptor[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     fetchChannels()
       .then((all) => {
-        if (!cancelled) setChannels(all.filter((c) => c.kind === "ntfy"));
+        if (!cancelled) {
+          setChannels(all.filter((c) => c.kind === "ntfy"));
+          setError(null);
+        }
       })
-      .catch(() => {});
+      .catch((err: unknown) => {
+        if (!cancelled) setError(errorText(err));
+      });
     return () => {
       cancelled = true;
     };
   }, []);
+
+  if (error) {
+    return <ErrorPanel eyebrow="ntfy channels" error={error} />;
+  }
 
   if (channels.length === 0) {
     return (
@@ -82,6 +92,7 @@ function NtfySettings() {
 
 function AuthSettings() {
   const [tokens, setTokens] = useState<TokenSummary[] | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [copyNotice, setCopyNotice] = useState(false);
   const [rotating, setRotating] = useState(false);
   const [rotateError, setRotateError] = useState<string | null>(null);
@@ -93,10 +104,16 @@ function AuthSettings() {
     let cancelled = false;
     fetchTokens()
       .then((res) => {
-        if (!cancelled) setTokens(res.tokens);
+        if (!cancelled) {
+          setTokens(res.tokens);
+          setLoadError(null);
+        }
       })
-      .catch(() => {
-        if (!cancelled) setTokens([]);
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setTokens([]);
+          setLoadError(errorText(err));
+        }
       });
     return () => {
       cancelled = true;
@@ -158,10 +175,14 @@ function AuthSettings() {
         </span>
         <span className="k">issued tokens</span>
         <span className="v">
-          {tokens === null
+          {loadError
+            ? `unavailable · ${loadError}`
+            : tokens === null
             ? "loading…"
             : `${activeCount} active · ${revokedCount} revoked`}
         </span>
+        <span className="k">scopes</span>
+        <span className="v">advisory labels; route enforcement is owner-token level</span>
       </div>
       {newTokenNotice && (
         <div
@@ -260,24 +281,40 @@ export function SettingsScreen(): JSX.Element {
   const [harnesses, setHarnesses] = useState<HarnessDescriptor[]>([]);
   const [substrates, setSubstrates] = useState<SubstrateDescriptor[]>([]);
   const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [errors, setErrors] = useState<Partial<Record<"harnesses" | "substrates" | "health", string>>>({});
 
   useEffect(() => {
     let cancelled = false;
     fetchHarnessDescriptors()
       .then((items) => {
-        if (!cancelled) setHarnesses(items);
+        if (!cancelled) {
+          setHarnesses(items);
+          setErrors((prev) => ({ ...prev, harnesses: undefined }));
+        }
       })
-      .catch(() => {});
+      .catch((err: unknown) => {
+        if (!cancelled) setErrors((prev) => ({ ...prev, harnesses: errorText(err) }));
+      });
     fetchSubstrateDescriptors()
       .then((items) => {
-        if (!cancelled) setSubstrates(items);
+        if (!cancelled) {
+          setSubstrates(items);
+          setErrors((prev) => ({ ...prev, substrates: undefined }));
+        }
       })
-      .catch(() => {});
+      .catch((err: unknown) => {
+        if (!cancelled) setErrors((prev) => ({ ...prev, substrates: errorText(err) }));
+      });
     fetchHealth()
       .then((h) => {
-        if (!cancelled) setHealth(h);
+        if (!cancelled) {
+          setHealth(h);
+          setErrors((prev) => ({ ...prev, health: undefined }));
+        }
       })
-      .catch(() => {});
+      .catch((err: unknown) => {
+        if (!cancelled) setErrors((prev) => ({ ...prev, health: errorText(err) }));
+      });
     return () => {
       cancelled = true;
     };
@@ -332,7 +369,9 @@ export function SettingsScreen(): JSX.Element {
         <div>
           {section === "substrates" && (
             <Panel eyebrow="substrates" flush>
-              {substrates.map((s) => (
+              {errors.substrates ? (
+                <PanelError error={errors.substrates} />
+              ) : substrates.map((s) => (
                 <div key={s.id} className="connection-row">
                   <div className="ico">{s.id === "local" ? "∎" : "L"}</div>
                   <div>
@@ -355,7 +394,9 @@ export function SettingsScreen(): JSX.Element {
           )}
           {section === "harnesses" && (
             <Panel eyebrow="harnesses" flush>
-              {harnesses.map((h) => (
+              {errors.harnesses ? (
+                <PanelError error={errors.harnesses} />
+              ) : harnesses.map((h) => (
                 <div key={h.id} className="connection-row" style={{ opacity: h.available ? 1 : 0.55 }}>
                   <div className="ico">{h.name[0].toLowerCase()}</div>
                   <div>
@@ -373,10 +414,30 @@ export function SettingsScreen(): JSX.Element {
           )}
           {section === "ntfy" && <NtfySettings />}
           {section === "auth" && <AuthSettings />}
-          {section === "network" && <NetSettings health={health} />}
-          {section === "storage" && <StorageSettings health={health} />}
+          {section === "network" && (errors.health ? <ErrorPanel eyebrow="network exposure" error={errors.health} /> : <NetSettings health={health} />)}
+          {section === "storage" && (errors.health ? <ErrorPanel eyebrow="storage" error={errors.health} /> : <StorageSettings health={health} />)}
         </div>
       </div>
     </div>
   );
+}
+
+function ErrorPanel({ eyebrow, error }: { eyebrow: string; error: string }): JSX.Element {
+  return (
+    <Panel eyebrow={eyebrow}>
+      <PanelError error={error} />
+    </Panel>
+  );
+}
+
+function PanelError({ error }: { error: string }): JSX.Element {
+  return (
+    <div className="muted" style={{ padding: "12px 0", color: "var(--status-errored)" }}>
+      failed to load: {error}
+    </div>
+  );
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }

@@ -16,6 +16,9 @@ export interface ChatScreenProps {
   nodes: AsylumNode[];
   chatNodeId?: string;
   onSelectChat: (id: string) => void;
+  onAttach?: (node: AsylumNode) => void;
+  onNativeAttach?: (node: AsylumNode) => void;
+  onInterrupt?: (node: AsylumNode) => void;
   onLaunch: () => void;
 }
 
@@ -23,6 +26,9 @@ export function ChatScreen({
   nodes,
   chatNodeId,
   onSelectChat,
+  onAttach,
+  onNativeAttach,
+  onInterrupt,
   onLaunch,
 }: ChatScreenProps): JSX.Element {
   const cc = nodes.find((n) => isCommandCenter(n));
@@ -80,6 +86,9 @@ export function ChatScreen({
             key={active.id}
             node={active}
             mode="fullscreen"
+            onAttach={onAttach ? () => onAttach(active) : undefined}
+            onNativeAttach={onNativeAttach ? () => onNativeAttach(active) : undefined}
+            onInterrupt={onInterrupt ? () => onInterrupt(active) : undefined}
           />
         ) : (
           <Empty glyph="⌬" lead="no nodes" sub="launch a command center to start" />
@@ -122,4 +131,3 @@ function RailItem({
     </div>
   );
 }
-

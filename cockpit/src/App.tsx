@@ -7,9 +7,12 @@ import {
   fetchChannelMessages,
   fetchChannels,
   fetchGraph,
+  fetchHarnessDescriptors,
+  fetchHealth,
   fetchHooks,
   fetchNotifications,
   fetchSubstrateDescriptors,
+  markNotificationRead,
   forkNode,
   hydrateOwnerTokenFromLocation,
   interruptNode,
@@ -27,6 +30,7 @@ import { CmdK } from "./components/CmdK";
 import { NtfyToast, type ToastPayload } from "./components/NtfyToast";
 import { CockpitScreen } from "./screens/CockpitScreen";
 import { FleetScreen } from "./screens/FleetScreen";
+import { DecisionsScreen } from "./screens/DecisionsScreen";
 import { NodeScreen } from "./screens/NodeScreen";
 import { CreateScreen } from "./screens/CreateScreen";
 import { ChannelsScreen } from "./screens/ChannelsScreen";
@@ -43,6 +47,7 @@ import type {
   AsylumNode,
   ChannelDescriptor,
   HookRule,
+  HealthResponse,
   NotificationRecord,
   ScreenId,
   SubstrateDescriptor,
@@ -69,6 +74,8 @@ export function App() {
   const [channels, setChannels] = useState<ChannelDescriptor[]>([]);
   const channelsRef = useRef<ChannelDescriptor[]>([]);
   const [hooks, setHooks] = useState<HookRule[]>([]);
+  const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [harnessCount, setHarnessCount] = useState(0);
   const [substrates, setSubstrates] = useState<SubstrateDescriptor[]>([]);
   const lastSeenMessageId = useRef<number>(0);
 
@@ -110,7 +117,7 @@ export function App() {
     if (refreshInFlight.current) return;
     refreshInFlight.current = true;
     try {
-      const [graphResp, notifs] = await Promise.all([fetchGraph(), fetchNotifications()]);
+      const [graphResp, notifs, daemonHealth] = await Promise.all([fetchGraph(), fetchNotifications(), fetchHealth()]);
       const cc = selectCommandCenter(graphResp.nodes);
       initializeGraph({
         ...graphResp,
@@ -118,16 +125,19 @@ export function App() {
         relationships: [...graphResp.relationships],
       });
       setNotifications(notifs);
+      setHealth(daemonHealth);
       setCommandCenterSelection(cc?.id);
       try {
-        const [c, h, s] = await Promise.all([
+        const [c, h, s, harnesses] = await Promise.all([
           fetchChannels(),
           fetchHooks(),
           fetchSubstrateDescriptors(),
+          fetchHarnessDescriptors(),
         ]);
         setChannels(c);
         setHooks(h);
         setSubstrates(s);
+        setHarnessCount(harnesses.filter((item) => item.available).length);
       } catch {
         /* leave previous state */
       }
@@ -198,7 +208,7 @@ export function App() {
           {
             id: "t-" + latest.id,
             from: latest.sender,
-            nodeId: null,
+            nodeId: latest.node_id ?? null,
             channel: ntfyChannel.name,
             subject: latest.subject,
             body: latest.subject ? `${latest.subject}\n${latest.body}` : latest.body,
@@ -268,12 +278,31 @@ export function App() {
     setScreen("node");
   };
 
+  const handleOpenNotificationNode = (nodeId: string) => {
+    const target = graph.nodes.find((n) => n.id === nodeId);
+    if (!target) {
+      setLocalError(`notification node no longer in graph: ${nodeId}`);
+      return;
+    }
+    handleOpenNode(target);
+  };
+
+  async function handleMarkNotificationRead(id: string): Promise<void> {
+    try {
+      await markNotificationRead(id);
+      await refreshAll();
+    } catch (err) {
+      setLocalError(`mark notification read failed: ${String(err instanceof Error ? err.message : err)}`);
+      throw err;
+    }
+  }
+
   async function handleNodeAction(target: AsylumNode | undefined, action: InspectorAction | NodeScreenAction, _payload?: string) {
     if (!target) return;
     try {
       if (action === "attach") {
         const r = await requestBrowserAttach(target.id);
-        setLocalNotice(`attach url issued · ttl ${r.expires_in_seconds ?? 3600}s`);
+        setLocalNotice(r.note ?? `attach url issued · ttl ${r.expires_in_seconds ?? 3600}s`);
         if (typeof window !== "undefined" && r.attach_url) {
           window.open(r.attach_url, "_blank", "noopener,noreferrer");
         }
@@ -286,12 +315,15 @@ export function App() {
         setLocalNotice("native attach command copied to clipboard");
       } else if (action === "send") {
         setSelectedNode(target.id);
+        setChatNodeId(target.id);
+        setScreen("chat");
+        setLocalNotice("opened session input");
       } else if (action === "interrupt") {
         await interruptNode(target.id);
         setLocalNotice("interrupt sent");
-      } else if (action === "restart") {
+      } else if (action === "stop") {
         await stopNode(target.id);
-        setLocalNotice("stop issued; node will reset on relaunch");
+        setLocalNotice("stop issued");
       } else if (action === "archive") {
         await archiveNode(target.id);
         setLocalNotice("archive issued");
@@ -311,7 +343,7 @@ export function App() {
   }
 
   const inspectorAction = useCallback(
-    (action: InspectorAction, payload?: string) => {
+    (action: InspectorAction | "native-attach", payload?: string) => {
       void handleNodeAction(selectedNode, action, payload);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -384,8 +416,8 @@ export function App() {
           fleetCount={graph.nodes.length}
           channelCount={liveChannelCount}
           hookCount={enabledHookCount}
-          daemonVersion={undefined}
-          bindAddr={typeof window !== "undefined" ? window.location.host : "localhost"}
+          daemonVersion={health?.daemon_version ? `asylum ${health.daemon_version}` : undefined}
+          bindAddr={health?.bind_addr ?? (typeof window !== "undefined" ? window.location.host : "localhost")}
           onPick={handleSelectScreen}
         />
 
@@ -396,7 +428,7 @@ export function App() {
                 onLaunch={() => setScreen("create")}
                 onOpenCli={() => setScreen("settings")}
                 onReadSpec={() => setScreen("settings")}
-                harnessCount={2}
+                harnessCount={harnessCount}
                 substrateCount={substrates.filter((s) => s.healthy).length}
                 nodeCount={graph.nodes.length}
               />
@@ -423,11 +455,13 @@ export function App() {
           {screen === "fleet" && (
             <FleetScreen nodes={graph.nodes} onLaunch={() => setScreen("create")} onOpen={handleOpenNode} />
           )}
+          {screen === "decisions" && <DecisionsScreen />}
           {screen === "node" && (
             <NodeScreen
               node={openNode ?? selectedNode}
               nodes={graph.nodes}
               relationships={graph.relationships}
+              onGraphRefresh={() => void refreshAll()}
               onBack={() => setScreen("fleet")}
               onOpen={handleOpenNode}
               onAction={(a, p) => void handleNodeAction(openNode ?? selectedNode, a, p)}
@@ -446,13 +480,22 @@ export function App() {
           )}
           {screen === "channels" && <ChannelsScreen />}
           {screen === "hooks" && <HooksScreen />}
-          {screen === "logs" && <LogsScreen notifications={notifications} />}
+          {screen === "logs" && (
+            <LogsScreen
+              notifications={notifications}
+              onMarkRead={handleMarkNotificationRead}
+              onOpenNode={handleOpenNotificationNode}
+            />
+          )}
           {screen === "settings" && <SettingsScreen />}
           {screen === "chat" && (
             <ChatScreen
               nodes={graph.nodes}
               chatNodeId={chatNodeId ?? ccNode?.id}
               onSelectChat={setChatNodeId}
+              onAttach={(node) => void handleNodeAction(node, "attach")}
+              onNativeAttach={(node) => void handleNodeAction(node, "native-attach")}
+              onInterrupt={(node) => void handleNodeAction(node, "interrupt")}
               onLaunch={() => setScreen("create")}
             />
           )}

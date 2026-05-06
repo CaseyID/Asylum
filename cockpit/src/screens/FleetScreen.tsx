@@ -111,7 +111,7 @@ export function FleetScreen({ nodes, onLaunch, onOpen }: FleetScreenProps): JSX.
             <th style={{ width: 110 }}>state</th>
             <th>preview</th>
             <th style={{ width: 80 }} className="right">
-              ctx
+              ctx est.
             </th>
             <th style={{ width: 80 }} className="right">
               uptime

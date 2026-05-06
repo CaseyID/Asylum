@@ -6,6 +6,7 @@ import {
   deleteChannel,
   fetchChannelMessages,
   fetchChannels,
+  inboundChannel,
   testChannel,
   updateChannel,
 } from "../api";
@@ -81,6 +82,7 @@ function ChannelDetail({
   onSendTest,
   onOpenSettings,
   onSubscribe,
+  onOpenInbound,
   sendStatus,
 }: {
   ch: ChannelDescriptor;
@@ -90,6 +92,7 @@ function ChannelDetail({
   onSendTest: () => void;
   onOpenSettings: () => void;
   onSubscribe: () => void;
+  onOpenInbound: () => void;
   sendStatus: { ok: boolean; text: string } | null;
 }) {
   const stat = ch.live ? "connected" : "not built";
@@ -140,6 +143,11 @@ function ChannelDetail({
           ))}
         </div>
         <div className="acts">
+          {ch.live && (ch.direction === "inbound" || ch.direction === "duplex") && (
+            <Btn size="sm" icon="message-square" onClick={onOpenInbound}>
+              record inbound
+            </Btn>
+          )}
           <Btn size="sm" icon="send" onClick={onSendTest}>
             send test
           </Btn>
@@ -181,6 +189,12 @@ function ChannelDetail({
                       <span className="subj">{m.subject}</span>
                     </div>
                     <div className="r2">{m.body}</div>
+                    {(m.node_id || m.correlation_token) && (
+                      <div className="r3">
+                        {m.node_id && <span className="reply-chip">routed: {m.node_id}</span>}
+                        {m.correlation_token && <span className="reply-chip">corr: {m.correlation_token}</span>}
+                      </div>
+                    )}
                     {m.replies && m.replies.length > 0 && (
                       <div className="r3">
                         <span className="lab">quick replies:</span>
@@ -383,6 +397,88 @@ function SubscribeModal({ ch, onClose }: { ch: ChannelDescriptor; onClose: () =>
   );
 }
 
+function InboundMessageModal({
+  ch,
+  onClose,
+  onRecorded,
+}: {
+  ch: ChannelDescriptor;
+  onClose: () => void;
+  onRecorded: (status: { ok: boolean; text: string }) => void;
+}) {
+  const [sender, setSender] = useState("operator");
+  const [subject, setSubject] = useState("manual inbound");
+  const [body, setBody] = useState("");
+  const [replies, setReplies] = useState("");
+  const [nodeId, setNodeId] = useState("");
+  const [correlationToken, setCorrelationToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const submit = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      await inboundChannel(ch.id, {
+        sender,
+        subject,
+        body,
+        replies: replies
+          .split(",")
+          .map((value) => value.trim())
+          .filter(Boolean),
+        node_id: nodeId.trim() || undefined,
+        correlation_token: correlationToken.trim() || undefined,
+      });
+      onRecorded({
+        ok: true,
+        text: nodeId.trim()
+          ? "inbound recorded · routed to node input"
+          : "inbound recorded",
+      });
+      onClose();
+    } catch (e) {
+      setErr(String((e as Error).message));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      title={`record inbound · ${ch.name}`}
+      onClose={onClose}
+      foot={
+        <>
+          <Btn onClick={onClose}>cancel</Btn>
+          <Btn kind="primary" onClick={submit} disabled={busy || !body.trim()}>
+            record
+          </Btn>
+        </>
+      }
+    >
+      <Field label="sender">
+        <input value={sender} onChange={(e) => setSender(e.target.value)} />
+      </Field>
+      <Field label="subject">
+        <input value={subject} onChange={(e) => setSubject(e.target.value)} />
+      </Field>
+      <Field label="body">
+        <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={5} />
+      </Field>
+      <Field label="quick replies" hint="comma-separated labels">
+        <input value={replies} onChange={(e) => setReplies(e.target.value)} placeholder="approve, deny, attach" />
+      </Field>
+      <Field label="correlation token" hint="optional manual correlation metadata; ntfy reply markers are correlated automatically">
+        <input value={correlationToken} onChange={(e) => setCorrelationToken(e.target.value)} />
+      </Field>
+      <Field label="route to node" hint="optional node id; body is sent to the node input stream">
+        <input value={nodeId} onChange={(e) => setNodeId(e.target.value)} placeholder="00000000-0000-0000-0000-000000000000" />
+      </Field>
+      {err && <div style={{ color: "var(--status-errored)", fontSize: 12 }}>{err}</div>}
+    </Modal>
+  );
+}
+
 export function ChannelsScreen(): JSX.Element {
   const [channels, setChannels] = useState<ChannelDescriptor[]>([]);
   const [messages, setMessages] = useState<ChannelMessageRecord[]>([]);
@@ -391,6 +487,7 @@ export function ChannelsScreen(): JSX.Element {
   const [showCreate, setShowCreate] = useState(false);
   const [showEdit, setShowEdit] = useState(false);
   const [showSubscribe, setShowSubscribe] = useState(false);
+  const [showInbound, setShowInbound] = useState(false);
   const [sendStatus, setSendStatus] = useState<{ ok: boolean; text: string } | null>(null);
 
   const refreshChannels = async () => {
@@ -510,6 +607,7 @@ export function ChannelsScreen(): JSX.Element {
               onSendTest={onSendTest}
               onOpenSettings={() => setShowEdit(true)}
               onSubscribe={() => setShowSubscribe(true)}
+              onOpenInbound={() => setShowInbound(true)}
               sendStatus={sendStatus}
             />
           )}
@@ -538,6 +636,17 @@ export function ChannelsScreen(): JSX.Element {
         />
       )}
       {showSubscribe && active && <SubscribeModal ch={active} onClose={() => setShowSubscribe(false)} />}
+      {showInbound && active && (
+        <InboundMessageModal
+          ch={active}
+          onClose={() => setShowInbound(false)}
+          onRecorded={(status) => {
+            setSendStatus(status);
+            refreshMessages(active.id);
+            refreshChannels();
+          }}
+        />
+      )}
     </div>
   );
 }

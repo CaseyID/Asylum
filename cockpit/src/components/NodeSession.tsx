@@ -21,6 +21,8 @@ export interface NodeSessionProps {
   node: AsylumNode;
   mode?: SessionMode;
   onAttach?: (nodeId: string) => void;
+  onNativeAttach?: (nodeId: string) => void;
+  onInterrupt?: (nodeId: string) => void;
   onExpand?: () => void;
 }
 
@@ -68,11 +70,12 @@ export function NodeSession({
   node,
   mode = "cockpit",
   onAttach,
+  onNativeAttach,
+  onInterrupt,
   onExpand,
 }: NodeSessionProps): ReactElement {
   const [entries, setEntries] = useState<TranscriptEntry[]>(() => initialTranscript(node));
   const [input, setInput] = useState("");
-  const [streaming, setStreaming] = useState(false);
   const [view, setView] = useState<"tui" | "structured">("tui");
   const termRef = useRef<HTMLDivElement | null>(null);
   const phaseRef = useRef<"history" | "live">("history");
@@ -86,8 +89,8 @@ export function NodeSession({
   const harnessId = node.harness === "claude_code" ? "claude-code" : "codex";
 
   async function submit(): Promise<void> {
-    const v = input.trim();
-    if (!v || streaming) return;
+    const v = input.trimEnd();
+    if (!v) return;
     setInput("");
     // No optimistic push — rely on the server input_sent event to avoid duplicates.
     try {
@@ -114,7 +117,10 @@ export function NodeSession({
         }
         if (data === WS_LIVE_UNAVAILABLE) {
           liveDisabledRef.current = true;
-          setEntries(p => [...p, { kind: "sys-line", text: "live streaming not supported by this substrate" }]);
+          const message = node.substrate === "loon"
+            ? "Loon nodes do not stream local PTY-style live observe output; use attach for an interactive session"
+            : "live streaming not supported by this substrate";
+          setEntries(p => [...p, { kind: "sys-line", text: message }]);
           return;
         }
         if (phaseRef.current === "history") {
@@ -177,6 +183,26 @@ export function NodeSession({
         setEntries(p => [...p, { kind: "sys-line", text: `liveness · ${next}` }]);
         return;
       }
+      case "harness_failure": {
+        setEntries(p => [...p, { kind: "sys-line", text: summarizeEventText("harness_failure", body) }]);
+        return;
+      }
+      case "substrate_failure": {
+        setEntries(p => [...p, { kind: "sys-line", text: summarizeEventText("substrate_failure", body) }]);
+        return;
+      }
+      case "human_input_requested": {
+        setEntries(p => [...p, { kind: "sys-line", text: summarizeEventText("human_input_requested", body) }]);
+        return;
+      }
+      case "notification_sent": {
+        setEntries(p => [...p, { kind: "sys-line", text: summarizeEventText("notification_sent", body) }]);
+        return;
+      }
+      case "remote_command_received": {
+        setEntries(p => [...p, { kind: "sys-line", text: summarizeEventText("remote_command_received", body) }]);
+        return;
+      }
       case "attach_issued": {
         const url = typeof body.url === "string" ? body.url : (typeof body.attach_url === "string" ? body.attach_url : "");
         const targetNode = typeof body.node_id === "string" ? body.node_id : (evt.node_id ?? node.id);
@@ -216,7 +242,17 @@ export function NodeSession({
 
   return (
     <div className={`session session-${mode} harness-${harnessId}`} data-screen-label={`session-${node.id}`}>
-      <SessionHeader node={node} harnessId={harnessId} mode={mode} view={view} setView={setView} onExpand={onExpand} />
+      <SessionHeader
+        node={node}
+        harnessId={harnessId}
+        mode={mode}
+        view={view}
+        setView={setView}
+        onAttach={onAttach}
+        onNativeAttach={onNativeAttach}
+        onInterrupt={onInterrupt}
+        onExpand={onExpand}
+      />
       <SessionBanner node={node} harnessId={harnessId} />
       <div className="session-body" ref={termRef}>
         {entries.map((e, i) => (
@@ -225,16 +261,14 @@ export function NodeSession({
             e={e}
             harness={harnessId}
             view={view}
-            streaming={streaming && i === entries.length - 1}
           />
         ))}
-        {!streaming && last?.kind === "prompt" && <PromptLine harness={harnessId} />}
+        {last?.kind === "prompt" && <PromptLine harness={harnessId} />}
       </div>
       <SessionInput
         node={node}
         harnessId={harnessId}
         value={input}
-        streaming={streaming}
         onChange={setInput}
         onSubmit={() => { void submit(); }}
       />
@@ -249,6 +283,9 @@ function SessionHeader({
   mode,
   view,
   setView,
+  onAttach,
+  onNativeAttach,
+  onInterrupt,
   onExpand,
 }: {
   node: AsylumNode;
@@ -256,6 +293,9 @@ function SessionHeader({
   mode: SessionMode;
   view: "tui" | "structured";
   setView: (v: "tui" | "structured") => void;
+  onAttach?: (nodeId: string) => void;
+  onNativeAttach?: (nodeId: string) => void;
+  onInterrupt?: (nodeId: string) => void;
   onExpand?: () => void;
 }): ReactElement {
   const isCC = isCommandCenter(node);
@@ -279,6 +319,22 @@ function SessionHeader({
       </span>
 
       <span className="hright">
+        {onAttach && (
+          <Btn
+            kind="ghost"
+            size="sm"
+            icon="external-link"
+            iconOnly
+            title={node.substrate === "loon" ? "browser attach via loon attach" : "browser attach"}
+            onClick={() => onAttach(node.id)}
+          />
+        )}
+        {onNativeAttach && (
+          <Btn kind="ghost" size="sm" icon="terminal" iconOnly title="native attach" onClick={() => onNativeAttach(node.id)} />
+        )}
+        {onInterrupt && (
+          <Btn kind="ghost" size="sm" icon="square" iconOnly title="interrupt" onClick={() => onInterrupt(node.id)} />
+        )}
         <div className="view-toggle" role="tablist" title="transcript rendering">
           <button className={view === "tui" ? "on" : ""} onClick={() => setView("tui")} title="raw tui replay">tui</button>
           <button className={view === "structured" ? "on" : ""} onClick={() => setView("structured")} title="structured / semantic">struct</button>
@@ -296,7 +352,7 @@ function SessionHeader({
 function SessionBanner({ node, harnessId }: { node: AsylumNode; harnessId: string }): ReactElement {
   const ctxPct = Math.round((node.ctx_pct ?? 0) * 100);
   const uptime = uptimeLabel(node);
-  const subline = `${node.workspace ?? "~/"} · ctx ${ctxPct}% · uptime ${uptime}`;
+  const subline = `${node.workspace ?? "~/"} · ctx est. ${ctxPct}% · uptime ${uptime}`;
   const dashes = "─".repeat(46);
 
   if (harnessId === "claude-code") {
@@ -328,12 +384,10 @@ function TermEntry({
   e,
   harness,
   view,
-  streaming,
 }: {
   e: TranscriptEntry;
   harness: string;
   view: "tui" | "structured";
-  streaming: boolean;
 }): ReactElement | null {
   if (e.kind === "user") {
     return (
@@ -351,12 +405,7 @@ function TermEntry({
     return <div className="line line-thought codex">{"·"} <i>{e.text}</i></div>;
   }
   if (e.kind === "text") {
-    return (
-      <div className="line line-text">
-        {e.text}
-        {streaming && <span className="caret" />}
-      </div>
-    );
+    return <div className="line line-text">{e.text}</div>;
   }
   if (e.kind === "list") {
     return (
@@ -383,18 +432,15 @@ function TermEntry({
         <div className="h">
           <Icon name="external-link" size={11} />
           <span>browser attach: <span style={{ color: "var(--fg)" }}>{e.node}</span></span>
-          <span className="right" style={{ marginLeft: "auto", color: "var(--fg-subtle)" }}>token ttl 3600s</span>
+          <span className="right" style={{ marginLeft: "auto", color: "var(--fg-subtle)" }}>time-limited url</span>
         </div>
         <div className="body">
-          <span className="muted">{">"}</span> <span className="b">refactor:router</span> $ <span className="x">npm test</span>{"\n"}
-          <span className="muted">PASS</span> src/router/match.test.ts (4 tests, 12ms){"\n"}
-          <span className="muted">PASS</span> src/router/parse.test.ts (8 tests, 22ms){"\n"}
-          <span className="muted">$</span> <span className="b">applying patch</span>: src/router/match.ts +114 -0{"\n"}
-          <span className="muted">$</span> <span className="b">streaming output</span>… 412 tokens at ctx 41%{"\n"}
+          <span className="muted">{">"}</span> <span className="b">open an authenticated browser attach session for this node</span>{"\n"}
+          <span className="muted">url</span> {e.url}
         </div>
         <div className="foot">
-          <Btn size="sm" kind="primary">open ↗</Btn>
-          <Btn size="sm" kind="secondary" icon="copy">copy url</Btn>
+          <Btn size="sm" kind="primary" onClick={() => window.open(e.url, "_blank", "noopener,noreferrer")}>open</Btn>
+          <Btn size="sm" kind="secondary" icon="copy" onClick={() => void navigator.clipboard.writeText(e.url)}>copy url</Btn>
           <span className="muted mono" style={{ fontSize: 10, marginLeft: "auto" }}>{e.url}</span>
         </div>
       </div>
@@ -458,38 +504,77 @@ function SessionInput({
   node,
   harnessId,
   value,
-  streaming,
   onChange,
   onSubmit,
 }: {
   node: AsylumNode;
   harnessId: string;
   value: string;
-  streaming: boolean;
   onChange: (v: string) => void;
   onSubmit: () => void;
 }): ReactElement {
   const isCC = isCommandCenter(node);
-  const placeholder = streaming
-    ? "streaming… (esc to interrupt)"
-    : isCC
+  const placeholder = isCC
       ? `send to ${node.id} · try: spawn 2 workers, status, attach to w-9a4f1`
       : `send input to ${node.id} · this writes directly to its harness stdin`;
 
   return (
     <div className={`session-input harness-${harnessId}`}>
       <span className="g">{harnessId === "claude-code" ? ">" : "›"}</span>
-      <input
+      <textarea
         placeholder={placeholder}
         value={value}
         onChange={e => onChange(e.target.value)}
-        onKeyDown={e => { if (e.key === "Enter") onSubmit(); }}
-        disabled={streaming}
+        onKeyDown={e => {
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            onSubmit();
+          }
+        }}
+        rows={3}
       />
       <span className="r">
-        {/* ⏎ send label is design typography */}
         <span className="kbd">{"⏎"} send</span>
+        <span className="kbd">shift+{"⏎"} newline</span>
       </span>
     </div>
   );
+}
+
+function summarizeEventText(kind: string, body: Record<string, unknown>): string {
+  const normalizedReason = pickTextBody(body, [
+    "reason",
+    "message",
+    "text",
+    "error",
+    "payload",
+    "title",
+  ]);
+  if (kind === "notification_sent") {
+    const title = typeof body.title === "string" ? body.title : "notification";
+    const message = typeof body.body === "string" ? body.body : normalizedReason;
+    return `${title}: ${message}`.trim();
+  }
+  if (kind === "human_input_requested") {
+    return normalizedReason
+      ? `human input requested · ${normalizedReason}`
+      : "human input requested";
+  }
+  if (kind === "remote_command_received") {
+    const command = typeof body.command === "string" ? body.command : "command";
+    const error = typeof body.error === "string" ? ` · ${body.error}` : "";
+    return `remote command ${command}${error}`;
+  }
+  const pretty = kind.replace(/_/g, " ");
+  return `${pretty} · ${normalizedReason || "details pending"}`;
+}
+
+function pickTextBody(body: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = body[key];
+    if (typeof value === "string") return value;
+  }
+  const fallback = body["arguments"];
+  if (typeof fallback === "string") return fallback;
+  return "";
 }

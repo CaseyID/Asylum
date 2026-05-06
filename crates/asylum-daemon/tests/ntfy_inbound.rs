@@ -10,11 +10,15 @@ use asylum_daemon::auth::AuthMode;
 use asylum_daemon::capability_service::{AppConfig, CapabilityService};
 use asylum_daemon::storage::Store;
 use asylum_types::config::AsylumConfig;
+use asylum_types::node::CapabilitySnapshot;
+use asylum_types::node::{HarnessKind, SubstrateKind};
 use axum::body::Body;
 use axum::extract::Path;
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
+use serde_json::json;
+use time::OffsetDateTime;
 use tokio::net::TcpListener;
 
 fn make_config(ntfy_server: String, ntfy_topic: String) -> AppConfig {
@@ -119,4 +123,90 @@ async fn ntfy_inbound_message_is_recorded() {
         found_event,
         "expected a channel.inbound hook event to be posted"
     );
+}
+
+#[tokio::test]
+async fn ntfy_inbound_correlated_message_does_not_record_when_routing_fails() {
+    // Start mock ntfy server on an OS-assigned port.
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr");
+    let marked = "must not persist\n\n[asylum-reply:abcde]".to_string();
+    let app = Router::new().route(
+        "/{topic}/json",
+        get(move |_path: Path<String>| async move {
+            let line1 =
+                format!("{{\"id\":\"a\",\"time\":1000,\"event\":\"open\",\"topic\":\"topic\"}}\n");
+            let line2 = format!(
+                "{}\n",
+                json!({
+                    "id": "b",
+                    "time": 1001,
+                    "event": "message",
+                    "topic": "topic",
+                    "message": marked,
+                    "title": "route",
+                    "tags": [],
+                })
+            );
+            let body_bytes = format!("{line1}{line2}");
+            Response::builder()
+                .status(200)
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(body_bytes))
+                .unwrap()
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let server_url = format!("http://{addr}");
+    let topic = "asylum-test".to_string();
+
+    let store = Store::open_in_memory().expect("open in-memory store");
+    let node = store
+        .insert_node(
+            HarnessKind::Codex,
+            SubstrateKind::Local,
+            "worker",
+            Some("/tmp"),
+            Some("reply-test"),
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )
+        .expect("insert node");
+    let config = make_config(server_url, topic);
+    let service = Arc::new(CapabilityService::new(
+        store.clone(),
+        AuthMode::Disabled,
+        config,
+    ));
+    store
+        .insert_channel_reply_correlation(
+            "abcde",
+            "ntfy-default",
+            node.id,
+            OffsetDateTime::now_utc().unix_timestamp() + 60,
+        )
+        .expect("insert correlation");
+
+    service.start_background_tasks();
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        if store
+            .list_channel_messages("ntfy-default", 10)
+            .expect("list messages")
+            .into_iter()
+            .any(|message| message.body.contains("must not persist"))
+        {
+            panic!("failed: correlated inbound message was recorded despite routing failure");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }

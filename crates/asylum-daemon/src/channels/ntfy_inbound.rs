@@ -7,6 +7,10 @@ use tokio::time::sleep;
 
 use crate::capability_service::CapabilityService;
 
+const NTFY_REPLY_MARKER_PREFIX: &str = "\n\n[asylum-reply:";
+const NTFY_REPLY_MARKER_SUFFIX: &str = "]";
+const NTFY_REPLY_TOKEN_LENGTH: usize = 5;
+
 #[derive(Debug, Deserialize)]
 struct NtfyMessage {
     #[allow(dead_code)]
@@ -120,22 +124,81 @@ async fn run_subscription(service: &Arc<CapabilityService>, cfg: &NtfyInboundCon
                 continue;
             }
             let sender = format!("ntfy:{}", cfg.topic);
-            if let Err(e) = service.record_channel_inbound(
-                &cfg.channel_id,
-                &sender,
-                &msg.title,
-                &msg.message,
-                &msg.tags,
-            ) {
+            let (body, correlation_token) = parse_ntfy_reply_marker(&msg.message);
+            let mut node_id = None;
+            if let Some(token) = correlation_token.as_deref() {
+                match service
+                    .store
+                    .resolve_channel_reply_correlation(&cfg.channel_id, token)
+                {
+                    Ok(Some(resolved)) => node_id = Some(resolved),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "ntfy_inbound",
+                            channel_id = %cfg.channel_id,
+                            token = %token,
+                            "failed to resolve ntfy reply token: {error}"
+                        );
+                    }
+                }
+            }
+            if let Err(e) = service
+                .route_channel_inbound_from_subscriber(
+                    &cfg.channel_id,
+                    sender,
+                    msg.title,
+                    body,
+                    msg.tags,
+                    node_id,
+                    correlation_token,
+                )
+                .await
+            {
                 tracing::warn!(
                     target: "ntfy_inbound",
-                    "failed to record inbound message: {e}"
+                    "failed to route/record inbound message: {e}"
                 );
             }
         }
     }
 
     Ok(())
+}
+
+pub(crate) fn append_reply_marker(body: &str, correlation_token: &str) -> String {
+    format!("{body}{NTFY_REPLY_MARKER_PREFIX}{correlation_token}{NTFY_REPLY_MARKER_SUFFIX}")
+}
+
+fn parse_ntfy_reply_marker(message: &str) -> (String, Option<String>) {
+    let marker_prefix = NTFY_REPLY_MARKER_PREFIX;
+    let marker_suffix = NTFY_REPLY_MARKER_SUFFIX;
+    if !message.ends_with(marker_suffix) {
+        return (message.to_string(), None);
+    }
+
+    let Some(marker_start) = message.rfind(marker_prefix) else {
+        return (message.to_string(), None);
+    };
+
+    let token_start = marker_start + marker_prefix.len();
+    let token_end = message.len() - marker_suffix.len();
+    if token_start >= token_end {
+        return (message.to_string(), None);
+    }
+
+    let token = &message[token_start..token_end];
+    if token.len() != NTFY_REPLY_TOKEN_LENGTH {
+        return (message.to_string(), None);
+    }
+
+    let is_token_like = token.chars().all(|ch| ch.is_ascii_alphanumeric());
+    if !is_token_like {
+        return (message.to_string(), None);
+    }
+
+    let body = message[..marker_start].to_string();
+    (body, Some(token.to_string()))
 }
 
 #[cfg(test)]
@@ -180,5 +243,21 @@ mod tests {
         assert_eq!(msg.message, "ping");
         assert_eq!(msg.title, "");
         assert!(msg.tags.is_empty());
+    }
+
+    #[test]
+    fn parse_ntfy_reply_marker_round_trip() {
+        let marked = append_reply_marker("hello", "abcde");
+        let (body, token) = parse_ntfy_reply_marker(&marked);
+        assert_eq!(body, "hello");
+        assert_eq!(token, Some("abcde".to_string()));
+    }
+
+    #[test]
+    fn parse_ntfy_reply_marker_ignores_malformed_input() {
+        let message = "hello [asylum-reply:bad]".to_string();
+        let (body, token) = parse_ntfy_reply_marker(&message);
+        assert_eq!(body, message);
+        assert!(token.is_none());
     }
 }

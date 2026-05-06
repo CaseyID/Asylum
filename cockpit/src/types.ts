@@ -60,6 +60,17 @@ export interface GraphRelationship {
   label?: string | null;
 }
 
+export interface RelationshipCreateRequest {
+  source_node_id: string;
+  target_node_id: string;
+  kind: string;
+  label?: string | null;
+}
+
+export interface RelationshipListResponse {
+  relationships: GraphRelationship[];
+}
+
 export interface GraphResponse {
   nodes: AsylumNode[];
   relationships: GraphRelationship[];
@@ -87,6 +98,8 @@ export interface AttachBrowserResponse {
   token?: string;
   attach_url: string;
   expires_in_seconds?: number;
+  transport?: string | null;
+  note?: string | null;
 }
 
 export interface NativeTargetResponse {
@@ -122,6 +135,8 @@ export interface ChannelMessageRecord {
   subject: string;
   body: string;
   replies: string[];
+  node_id?: string | null;
+  correlation_token?: string | null;
 }
 
 export interface ChannelCreateRequest {
@@ -154,6 +169,8 @@ export interface ChannelInboundRequest {
   subject: string;
   body: string;
   replies?: string[];
+  node_id?: string;
+  correlation_token?: string;
 }
 
 // ─── hooks ────────────────────────────────────────────────────────
@@ -208,6 +225,30 @@ export interface HookFiringRecord {
 export interface HookEventCatalogEntry {
   id: string;
   label: string;
+}
+
+// ─── decisions ────────────────────────────────────────────────────
+
+export interface DecisionRecord {
+  id: string;
+  node_id: string | null;
+  text: string;
+  status: string;
+  created_at_epoch_secs: number;
+  decided_at_epoch_secs: number | null;
+}
+
+export interface DecisionListResponse {
+  decisions: DecisionRecord[];
+}
+
+export interface DecisionCreateRequest {
+  node_id?: string;
+  text: string;
+}
+
+export interface DecisionResolveRequest {
+  status: "approved" | "denied";
 }
 
 // ─── recipes ──────────────────────────────────────────────────────
@@ -297,6 +338,7 @@ export type ScreenId =
   | "fleet"
   | "node"
   | "create"
+  | "decisions"
   | "channels"
   | "hooks"
   | "logs"

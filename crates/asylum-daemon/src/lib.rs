@@ -3,6 +3,7 @@ pub mod attach;
 pub mod auth;
 pub mod capability_service;
 pub mod channels;
+pub mod decision_ingester;
 pub mod harness;
 pub mod hooks;
 pub mod notifications;

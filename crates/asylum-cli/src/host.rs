@@ -695,10 +695,10 @@ pub struct ServiceUnitInfo {
 
 /// Cockpit-owned caches we'd remove on uninstall. v0.1.x has no on-disk
 /// cockpit cache outside the runtime dir we already own; keep this as a
-/// placeholder so the JSON shape is stable.
+/// explicit empty list so the JSON shape is stable and machine-readable.
 #[derive(Clone, Debug, Serialize)]
 pub struct CockpitInfo {
-    pub caches: Option<Vec<PathBuf>>,
+    pub caches: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -706,6 +706,7 @@ pub struct NetworkInfo {
     pub bind: Option<String>,
     pub port: Option<u16>,
     pub port_in_use: PortInUse,
+    pub exposure_warning: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -745,11 +746,12 @@ impl HostState {
         let bind = read_configured_bind(paths);
         let port = bind.as_deref().and_then(parse_port);
         let (daemon, service_unit) = collect_daemon_and_unit(paths, bind.clone());
-        let cockpit = CockpitInfo { caches: None };
+        let cockpit = CockpitInfo { caches: Vec::new() };
         let network = NetworkInfo {
             bind: bind.clone(),
             port,
             port_in_use: probe_port(port, daemon.pid),
+            exposure_warning: exposure_warning(bind.as_deref()),
         };
 
         Self {
@@ -762,6 +764,32 @@ impl HostState {
             cockpit,
             network,
         }
+    }
+
+    pub fn apply_daemon_health(
+        &mut self,
+        bind_addr: impl Into<String>,
+        base_url: impl Into<String>,
+        daemon_version: impl Into<String>,
+    ) {
+        let bind_addr = bind_addr.into();
+        self.daemon.healthy = true;
+        self.daemon.state = ServiceState::Running;
+        self.daemon.daemon_version = Some(daemon_version.into());
+        self.daemon.base_url = base_url.into();
+        self.daemon.bind = Some(bind_addr.clone());
+
+        self.network.bind = Some(bind_addr.clone());
+        self.network.port = parse_port(&bind_addr);
+        self.network.exposure_warning = exposure_warning(Some(&bind_addr));
+        let probed = probe_port(self.network.port, self.daemon.pid);
+        self.network.port_in_use = match (self.network.port, probed) {
+            (Some(_), PortInUse::Free | PortInUse::Unknown { .. }) => PortInUse::InUse {
+                pid: self.daemon.pid,
+                command: Some("asylum".to_string()),
+            },
+            (_, probed) => probed,
+        };
     }
 }
 
@@ -948,6 +976,22 @@ fn parse_port(bind: &str) -> Option<u16> {
     bind.parse::<std::net::SocketAddr>()
         .ok()
         .map(|addr| addr.port())
+}
+
+fn exposure_warning(bind: Option<&str>) -> Option<String> {
+    let bind = bind?;
+    let addr = bind.parse::<std::net::SocketAddr>().ok()?;
+    if addr.ip().is_loopback() {
+        return None;
+    }
+    if addr.ip().is_unspecified() {
+        return Some(format!(
+            "HTTP bind {bind} listens on all interfaces; keep owner-token auth enabled and firewall the port unless intentionally exposed"
+        ));
+    }
+    Some(format!(
+        "HTTP bind {bind} is not loopback-only; keep owner-token auth enabled and firewall the port unless intentionally exposed"
+    ))
 }
 
 fn probe_port(port: Option<u16>, expected_pid: Option<u32>) -> PortInUse {
@@ -1261,6 +1305,47 @@ mod tests {
             service_state_from_health(false, ServiceState::Stopped),
             ServiceState::Stopped
         );
+    }
+
+    #[test]
+    fn host_state_health_updates_effective_network_bind() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let home = tempdir.path().join("runtime");
+        fs::create_dir_all(&home).expect("runtime dir");
+        fs::write(home.join("config.toml"), "listen = \"127.0.0.1:7717\"\n").expect("config");
+        let paths =
+            RuntimePaths::from_values(Some(home), None, None, Some(tempdir.path().to_path_buf()));
+        let mut state = HostState::collect(&paths);
+
+        state.apply_daemon_health("127.0.0.1:7787", "http://127.0.0.1:7787", "0.1.6");
+
+        assert_eq!(state.daemon.bind.as_deref(), Some("127.0.0.1:7787"));
+        assert_eq!(state.daemon.base_url, "http://127.0.0.1:7787");
+        assert_eq!(state.network.bind.as_deref(), Some("127.0.0.1:7787"));
+        assert_eq!(state.network.port, Some(7787));
+        assert!(matches!(state.network.port_in_use, PortInUse::InUse { .. }));
+    }
+
+    #[test]
+    fn host_state_reports_non_loopback_exposure_warning() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let home = tempdir.path().join("runtime");
+        fs::create_dir_all(&home).expect("runtime dir");
+        fs::write(home.join("config.toml"), "listen = \"127.0.0.1:7717\"\n").expect("config");
+        let paths =
+            RuntimePaths::from_values(Some(home), None, None, Some(tempdir.path().to_path_buf()));
+        let mut state = HostState::collect(&paths);
+
+        assert!(state.network.exposure_warning.is_none());
+
+        state.apply_daemon_health("0.0.0.0:7787", "http://127.0.0.1:7787", "0.1.6");
+
+        assert_eq!(state.network.bind.as_deref(), Some("0.0.0.0:7787"));
+        assert!(state
+            .network
+            .exposure_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("all interfaces")));
     }
 
     #[test]

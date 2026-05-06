@@ -43,6 +43,8 @@ pub fn message_record_from_row(row: ChannelMessageRow) -> ChannelMessageRecord {
         subject: row.subject,
         body: row.body,
         replies,
+        node_id: row.node_id,
+        correlation_token: row.correlation_token,
     }
 }
 

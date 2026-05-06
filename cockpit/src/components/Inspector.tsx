@@ -17,7 +17,7 @@ export type InspectorAction =
   | "send"
   | "interrupt"
   | "fork"
-  | "restart"
+  | "stop"
   | "terminate"
   | "archive";
 
@@ -111,13 +111,13 @@ export function Inspector({ node, onAction, onOpen, relationships }: InspectorPr
         </div>
 
         <div className="inspector-section">
-          <div className="h">telemetry</div>
+          <div className="h">telemetry estimates</div>
           <KV
             items={[
-              ["ctx usage", `${Math.round(telemetry.ctx * 100)}%`],
-              ["tokens in", telemetry.tokensIn.toLocaleString()],
-              ["tokens out", telemetry.tokensOut.toLocaleString()],
-              ["tool calls", telemetry.tools],
+              ["ctx usage est.", `${Math.round(telemetry.ctx * 100)}%`],
+              ["tokens in est.", telemetry.tokensIn.toLocaleString()],
+              ["tokens out est.", telemetry.tokensOut.toLocaleString()],
+              ["tool calls est.", telemetry.tools],
             ]}
           />
         </div>
@@ -171,10 +171,10 @@ export function Inspector({ node, onAction, onOpen, relationships }: InspectorPr
             </Btn>
             <Btn
               size="sm"
-              icon="rotate-ccw"
-              onClick={() => onAction("restart")}
+              icon="stop-circle"
+              onClick={() => onAction("stop")}
             >
-              restart
+              stop
             </Btn>
             <Btn
               size="sm"
@@ -200,4 +200,3 @@ export function Inspector({ node, onAction, onOpen, relationships }: InspectorPr
     </div>
   );
 }
-

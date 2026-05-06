@@ -64,6 +64,8 @@ pub struct AttachRequest {
 pub struct AttachResponse {
     pub url: String,
     pub expires_in_seconds: u64,
+    pub transport: Option<String>,
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -252,6 +254,38 @@ pub struct RemoteCommandResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RemoteCommandRequest {
+    pub command: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DecisionRecord {
+    pub id: String,
+    pub node_id: Option<String>,
+    pub text: String,
+    pub status: String,
+    pub created_at_epoch_secs: i64,
+    pub decided_at_epoch_secs: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DecisionListResponse {
+    pub decisions: Vec<DecisionRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DecisionCreateRequest {
+    #[serde(default)]
+    pub node_id: Option<String>,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DecisionResolveRequest {
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChannelDescriptor {
     pub id: String,
     pub kind: String,
@@ -277,6 +311,8 @@ pub struct ChannelMessageRecord {
     pub subject: String,
     pub body: String,
     pub replies: Vec<String>,
+    pub node_id: Option<String>,
+    pub correlation_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -339,6 +375,10 @@ pub struct ChannelInboundRequest {
     pub body: String,
     #[serde(default)]
     pub replies: Vec<String>,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    #[serde(default)]
+    pub correlation_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

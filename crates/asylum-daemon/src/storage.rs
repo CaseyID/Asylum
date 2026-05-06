@@ -28,6 +28,7 @@ type NotificationRecord = (
     i64,
     Option<i64>,
 );
+pub type DecisionStorageRecord = (String, Option<String>, String, String, i64, Option<i64>);
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -189,10 +190,23 @@ impl Store {
                 subject TEXT NOT NULL,
                 body TEXT NOT NULL,
                 replies_json TEXT,
+                node_id TEXT,
+                correlation_token TEXT,
+                FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS channel_reply_correlations (
+                token TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
                 FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
             );
 
             CREATE INDEX IF NOT EXISTS idx_channel_messages_channel_ts ON channel_messages(channel_id, ts);
+            CREATE INDEX IF NOT EXISTS idx_channel_reply_correlations_channel_expires
+                ON channel_reply_correlations(channel_id, expires_at);
 
             CREATE TABLE IF NOT EXISTS hooks (
                 id TEXT PRIMARY KEY,
@@ -225,6 +239,8 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_hook_firings_hook_ts ON hook_firings(hook_id, ts);
             ",
         )?;
+        ensure_column(&conn, "channel_messages", "node_id", "TEXT")?;
+        ensure_column(&conn, "channel_messages", "correlation_token", "TEXT")?;
         Ok(())
     }
 
@@ -767,6 +783,78 @@ impl Store {
         Ok(affected > 0)
     }
 
+    pub fn insert_decision(
+        &self,
+        node_id: Option<Uuid>,
+        text: &str,
+    ) -> Result<DecisionStorageRecord> {
+        let id = Uuid::new_v4().to_string();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let node_id = node_id.map(|id| id.to_string());
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO decisions(id,node_id,text,status,created_at,decided_at)
+             VALUES(?1,?2,?3,'pending',?4,NULL)",
+            params![id, node_id, text, now],
+        )?;
+        Ok((
+            id,
+            node_id,
+            text.to_string(),
+            "pending".to_string(),
+            now,
+            None,
+        ))
+    }
+
+    pub fn list_decisions(&self) -> Result<Vec<DecisionStorageRecord>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "
+            SELECT id,node_id,text,status,created_at,decided_at
+            FROM decisions
+            ORDER BY created_at DESC
+            ",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ));
+        }
+        Ok(out)
+    }
+
+    pub fn get_decision(&self, id: &str) -> Result<Option<DecisionStorageRecord>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "
+            SELECT id,node_id,text,status,created_at,decided_at
+            FROM decisions
+            WHERE id = ?1
+            ",
+            params![id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .context("get decision")
+    }
+
     pub fn mark_notification_read(&self, id: i64) -> Result<()> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let conn = self.conn()?;
@@ -968,7 +1056,7 @@ impl Store {
     pub fn list_channel_messages(&self, id: &str, limit: usize) -> Result<Vec<ChannelMessageRow>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id,channel_id,direction,ts,sender,subject,body,replies_json
+            "SELECT id,channel_id,direction,ts,sender,subject,body,replies_json,node_id,correlation_token
              FROM channel_messages WHERE channel_id = ?1 ORDER BY ts DESC LIMIT ?2",
         )?;
         let mut rows = stmt.query(params![id, limit as i64])?;
@@ -988,13 +1076,15 @@ impl Store {
         subject: &str,
         body: &str,
         replies: &[String],
+        node_id: Option<Uuid>,
+        correlation_token: Option<&str>,
     ) -> Result<i64> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let conn = self.conn()?;
         let replies_json = serde_json::to_string(&replies.to_vec())?;
         conn.execute(
-            "INSERT INTO channel_messages(channel_id,direction,ts,sender,subject,body,replies_json)
-             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            "INSERT INTO channel_messages(channel_id,direction,ts,sender,subject,body,replies_json,node_id,correlation_token)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 channel_id,
                 direction,
@@ -1002,10 +1092,58 @@ impl Store {
                 sender,
                 subject,
                 body,
-                replies_json
+                replies_json,
+                node_id.map(|id| id.to_string()),
+                correlation_token
             ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    pub fn insert_channel_reply_correlation(
+        &self,
+        token: &str,
+        channel_id: &str,
+        node_id: Uuid,
+        expires_at: i64,
+    ) -> Result<()> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO channel_reply_correlations(token,channel_id,node_id,created_at,expires_at)
+             VALUES(?1,?2,?3,?4,?5)",
+            params![
+                token,
+                channel_id,
+                node_id.to_string(),
+                now,
+                expires_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn resolve_channel_reply_correlation(
+        &self,
+        channel_id: &str,
+        token: &str,
+    ) -> Result<Option<Uuid>> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let conn = self.conn()?;
+        let node_id = conn
+            .query_row(
+                "
+            SELECT node_id
+            FROM channel_reply_correlations
+            WHERE token = ?1
+              AND channel_id = ?2
+              AND expires_at >= ?3
+            LIMIT 1",
+                params![token, channel_id, now],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(node_id.map(|value| Uuid::parse_str(&value)).transpose()?)
     }
 
     pub fn count_channel_messages_24h(&self, channel_id: &str) -> Result<u64> {
@@ -1379,6 +1517,8 @@ pub struct ChannelMessageRow {
     pub subject: String,
     pub body: String,
     pub replies_json: Option<String>,
+    pub node_id: Option<String>,
+    pub correlation_token: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1431,7 +1571,25 @@ fn row_to_channel_message(row: &rusqlite::Row<'_>) -> Result<ChannelMessageRow> 
         subject: row.get(5)?,
         body: row.get(6)?,
         replies_json: row.get(7)?,
+        node_id: row.get(8)?,
+        correlation_token: row.get(9)?,
     })
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(());
+        }
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    )?;
+    Ok(())
 }
 
 fn row_to_hook_row(row: &rusqlite::Row<'_>) -> Result<HookRow> {
@@ -1572,7 +1730,16 @@ mod tests {
             )
             .unwrap();
         store
-            .insert_channel_message("ntfy-default", "out", "asylum", "subject", "body", &[])
+            .insert_channel_message(
+                "ntfy-default",
+                "out",
+                "asylum",
+                "subject",
+                "body",
+                &[],
+                None,
+                None,
+            )
             .unwrap();
         let messages = store.list_channel_messages("ntfy-default", 10).unwrap();
         assert_eq!(messages.len(), 1);
@@ -1581,6 +1748,71 @@ mod tests {
         assert_eq!(count, 1);
         let err = store.delete_channel("ntfy-default");
         assert!(err.is_err(), "builtin channel delete should fail");
+    }
+
+    #[test]
+    fn channel_reply_correlation_round_trip() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_channel(
+                "ntfy-default",
+                "ntfy",
+                "ntfy default",
+                "ntfy default",
+                "duplex",
+                "live",
+                "detail",
+                "{}",
+                true,
+                true,
+            )
+            .unwrap();
+        let node = store.insert_test_node("worker").unwrap();
+        store
+            .insert_channel_reply_correlation(
+                "token",
+                "ntfy-default",
+                node.id,
+                OffsetDateTime::now_utc().unix_timestamp() + 60,
+            )
+            .unwrap();
+        let resolved = store
+            .resolve_channel_reply_correlation("ntfy-default", "token")
+            .unwrap()
+            .expect("expected active correlation to resolve");
+        assert_eq!(resolved, node.id);
+    }
+
+    #[test]
+    fn channel_reply_correlation_expires() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_channel(
+                "ntfy-default",
+                "ntfy",
+                "ntfy default",
+                "ntfy default",
+                "duplex",
+                "live",
+                "detail",
+                "{}",
+                true,
+                true,
+            )
+            .unwrap();
+        let node = store.insert_test_node("worker").unwrap();
+        store
+            .insert_channel_reply_correlation(
+                "token-2",
+                "ntfy-default",
+                node.id,
+                OffsetDateTime::now_utc().unix_timestamp() - 1,
+            )
+            .unwrap();
+        assert!(store
+            .resolve_channel_reply_correlation("ntfy-default", "token-2")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

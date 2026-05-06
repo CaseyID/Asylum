@@ -10,8 +10,15 @@ import type {
   ChannelTestRequest,
   ChannelUpdateRequest,
   CreateNodeRequest,
+  DecisionCreateRequest,
+  DecisionListResponse,
+  DecisionRecord,
+  DecisionResolveRequest,
   ForkNodeRequest,
   GraphResponse,
+  GraphRelationship,
+  RelationshipCreateRequest,
+  RelationshipListResponse,
   HarnessDescriptor,
   HarnessKind,
   HealthResponse,
@@ -114,6 +121,24 @@ export async function fetchNode(id: string): Promise<AsylumNode> {
   return "node" in (data as object) ? (data as { node: AsylumNode }).node : (data as AsylumNode);
 }
 
+export async function listRelationships(): Promise<GraphRelationship[]> {
+  const data = await request<RelationshipListResponse | GraphRelationship[]>("/relationships");
+  return Array.isArray(data) ? data : data.relationships;
+}
+
+export async function createRelationship(req: RelationshipCreateRequest): Promise<GraphRelationship> {
+  return request<GraphRelationship>("/relationships", {
+    method: "POST",
+    body: JSON.stringify(req),
+  });
+}
+
+export async function removeRelationship(id: string): Promise<void> {
+  await request<void>(`/relationships/${id}`, {
+    method: "DELETE",
+  });
+}
+
 export async function fetchNotifications(): Promise<NotificationRecord[]> {
   const data = await request<NotificationRecord[] | { notifications: unknown[] }>("/notifications");
   const records = Array.isArray(data) ? data : data.notifications;
@@ -204,13 +229,21 @@ export const stopNode = (id: string) => fallbackPostNodeAction(id, "stop");
 export const archiveNode = (id: string) => fallbackPostNodeAction(id, "archive");
 
 export async function requestBrowserAttach(nodeId: string): Promise<AttachBrowserResponse> {
-  const data = await request<AttachBrowserResponse | { url: string; expires_in_seconds: number }>(
+  const data = await request<
+    AttachBrowserResponse | { url: string; expires_in_seconds: number; transport?: string | null; note?: string | null }
+  >(
     `/nodes/${nodeId}/attach/browser`,
     { method: "POST" },
   );
   if ("url" in data) {
     const token = data.url.split("/attach/")[1]?.split(/[/?#]/)[0];
-    return { attach_url: data.url, token, expires_in_seconds: data.expires_in_seconds };
+    return {
+      attach_url: data.url,
+      token,
+      expires_in_seconds: data.expires_in_seconds,
+      transport: data.transport ?? null,
+      note: data.note ?? null,
+    };
   }
   return data;
 }
@@ -331,6 +364,27 @@ export async function dryRunHook(id: string): Promise<HookFiringRecord> {
   return "firing" in (data as object)
     ? (data as { firing: HookFiringRecord }).firing
     : (data as HookFiringRecord);
+}
+
+// — decisions —
+
+export async function fetchDecisions(): Promise<DecisionRecord[]> {
+  const data = await request<DecisionListResponse | DecisionRecord[]>("/decisions");
+  return Array.isArray(data) ? data : data.decisions ?? [];
+}
+
+export async function createDecision(req: DecisionCreateRequest): Promise<DecisionRecord> {
+  return request<DecisionRecord>("/decisions", {
+    method: "POST",
+    body: JSON.stringify(req),
+  });
+}
+
+export async function resolveDecision(id: string, req: DecisionResolveRequest): Promise<DecisionRecord> {
+  return request<DecisionRecord>(`/decisions/${id}/resolve`, {
+    method: "POST",
+    body: JSON.stringify(req),
+  });
 }
 
 // — recipes —
