@@ -50,7 +50,7 @@ Test fixtures and unit-test mocks are fine. The principle applies to behavior de
 
 - **Commit style:** lowercase, terse, action verb first. Match recent history (`Fix H1: <one-line>`, `cockpit: drop simSpeed and Tweaks`, etc.).
 - **No AI attribution** in commits, PRs, issues, or code unless explicitly asked.
-- **TDD where testable:** write the failing test first, implement, verify, commit. Existing patterns: `cargo test --workspace` for Rust; `npm --prefix cockpit run test` (Vitest) for cockpit.
+- **TDD where testable:** write the failing test first, implement, verify, commit. Existing patterns: `cargo test --workspace` for Rust-only changes; `cargo test-stack` for full-stack Rust + Cockpit verification.
 - **Each PR ships working software.** No land-broken-fix-later patterns.
 - **Branch per PR.** Use the branch names listed in the plan (`cockpit-strip-prototype-scaffolding`, `daemon-ntfy-inbound`, etc.).
 - **Update progress.** When you complete a checkbox task in the plan, mark `- [x]` and commit the file change with the code change.
@@ -58,20 +58,31 @@ Test fixtures and unit-test mocks are fine. The principle applies to behavior de
 ## Build & run
 
 ```bash
-# build everything (cockpit assets must exist for release builds)
-npm --prefix cockpit run build
-cargo build --release
+# source dev: daemon + Cockpit hot reload
+cargo dev
 
-# dev daemon
+# source build/test/run for the whole stack
+cargo build-stack
+cargo test-stack
+cargo run-stack
+
+# source dev for one side of the stack
+cargo dev-daemon
+cargo dev-cockpit
+
+# installed product lifecycle through the installed `asylum` on PATH
+cargo start-stack
+cargo stop-stack
+cargo restart-stack
+cargo status-stack
+
+# lower-level Rust-only escape hatch
 cargo run -p asylum -- daemon run
-
-# dev cockpit (alongside the daemon)
-npm --prefix cockpit run dev
-
-# tests
-cargo test --workspace
-npm --prefix cockpit run test
 ```
+
+Source dev commands default to repo-local state in `.asylum-dev/` and bind
+`127.0.0.1:7788`, so they do not collide with the installed `~/.asylum`
+daemon unless explicitly overridden.
 
 ## Release tracking — read this when finishing a delivery
 

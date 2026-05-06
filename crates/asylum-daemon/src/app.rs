@@ -59,7 +59,7 @@ pub struct AppState {
 #[derive(RustEmbed)]
 // In release builds, cockpit assets must be built before compiling this crate.
 // Ensure `cockpit/dist` exists by running:
-// `npm --prefix cockpit run build`
+// `cargo build-stack`
 #[folder = "../../cockpit/dist/"]
 struct CockpitAssets;
 
@@ -67,7 +67,7 @@ struct CockpitAssets;
 const ASSETS_ROUTE: &str = "/assets/{*path}";
 
 const MISSING_COCKPIT_ASSETS_MESSAGE: &str =
-    "cockpit assets not present; run `npm --prefix cockpit run build` and serve `cockpit/dist`";
+    "cockpit assets not present; run `cargo build-stack` or `cargo run-stack` from the source checkout";
 
 pub async fn serve(bind: SocketAddr, database: String, config: AsylumConfig) -> Result<()> {
     serve_with_socket(bind, database, None, config).await

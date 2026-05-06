@@ -1,0 +1,13 @@
+[alias]
+dev = "run -p xtask -- dev"
+dev-daemon = "run -p xtask -- dev-daemon"
+dev-cockpit = "run -p xtask -- dev-cockpit"
+build-stack = "run -p xtask -- build-stack"
+test-stack = "run -p xtask -- test-stack"
+run-stack = "run -p xtask -- run-stack"
+start-stack = "run -p xtask -- start-stack"
+stop-stack = "run -p xtask -- stop-stack"
+restart-stack = "run -p xtask -- restart-stack"
+status-stack = "run -p xtask -- status-stack"
+doctor-stack = "run -p xtask -- doctor-stack"
+logs-stack = "run -p xtask -- logs-stack"
