@@ -4,6 +4,7 @@ members = [
     "crates/asylum-daemon",
     "crates/asylum-cli",
     "crates/asylum",
+    "xtask",
 ]
 resolver = "2"
 

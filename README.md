@@ -137,29 +137,50 @@ installer falls back to `<archive>.sha256`. If neither artifact is reachable,
 verification fails the same way as the missing-tool path (use
 `ASYLUM_SKIP_CHECKSUM=1` to override).
 
-For release binaries, ensure `npm --prefix cockpit run build` is run before `cargo build --release` so embedded Cockpit assets are present.
+For release binaries, use the release scripts. For source builds, prefer the
+Cargo stack commands below; they run the Cockpit build behind the scenes before
+building Rust when needed.
 
 ## Source and Advanced CLI (below product path)
 
 ### Source Build
 
 ```bash
-cargo build --workspace
-npm --prefix cockpit run build
+cargo build-stack
 ```
 
 ### Source Run
 
 ```bash
-./target/debug/asylum daemon run --database ./.asylum/asylum.sqlite3
+cargo run-stack
 ```
+
+For hot-reload development:
+
+```bash
+cargo dev          # daemon + Cockpit Vite dev server
+cargo dev-daemon   # daemon only; rebuilds/restarts on Rust changes
+cargo dev-cockpit  # Cockpit only; proxies /api to the daemon
+cargo test-stack   # Rust tests + Cockpit tests
+```
+
+These are Cargo aliases defined in `.cargo/config.toml`. They run the repo-local
+`xtask` tooling crate; they are not `asylum` product CLI subcommands.
+The frontend still uses Node/Vite internally, but normal source work should not
+require typing `npm --prefix cockpit ...` directly.
+Source dev/runtime commands default to `.asylum-dev/` under the checkout and
+`127.0.0.1:7788`, which keeps them separate from an installed daemon using
+`~/.asylum` and `127.0.0.1:7717`.
+
+Useful overrides: `ASYLUM_DEV_BIND=127.0.0.1:7790` changes the daemon bind,
+and `ASYLUM_COCKPIT_DEV_PORT=5174` changes the Vite dev-server port.
 
 For protected mode, bootstrap with an owner token and point CLI/Cockpit at it:
 
 ```bash
 # terminal A
 export ASYLUM_OWNER_TOKEN="$(uuidgen)"
-./target/debug/asylum daemon run --owner-tokens-enabled
+cargo run -p asylum -- daemon run --owner-tokens-enabled
 
 # terminal B
 ASYLUM_TOKEN="$ASYLUM_OWNER_TOKEN" ./target/debug/asylum graph get
