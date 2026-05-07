@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.9 — 2026-05-07
+
+### Added
+
+- Added repo-local `cargo dev`, `cargo build-stack`, `cargo test-stack`, and `cargo run-stack` workflows backed by an `xtask` crate.
+- Added Cargo aliases for installed product lifecycle checks (`cargo status-stack`, `cargo doctor-stack`, and related commands) that delegate to the installed `asylum` binary.
+- Added Vite API/WebSocket proxying for Cockpit source development.
+
+### Fixed
+
+- Source dev/runtime commands now default to `.asylum-dev/` and `127.0.0.1:7788` so they do not collide with the installed `~/.asylum` daemon on `127.0.0.1:7717`.
+- `cargo dev-daemon` now respects Cargo's target directory instead of assuming `target/debug/asylum`.
+
 ## 0.1.8 — 2026-05-06
 
 ### Fixed
