@@ -36,7 +36,7 @@ use uuid::Uuid;
 
 use crate::auth::hash_token;
 use crate::auth::AuthMode;
-use crate::capability_service::{AppConfig, CapabilityService};
+use crate::capability_service::{init_login_shell_path, AppConfig, CapabilityService};
 use crate::remote_commands::{parse_remote_command, RemoteCommandKind};
 use crate::storage::Store;
 #[cfg(debug_assertions)]
@@ -158,6 +158,12 @@ fn build_state(
                 .map(|h| format!("{h}/.asylum/transcripts"))
                 .unwrap_or_else(|_| ".asylum/transcripts".to_string())
         });
+    // Probe the user's login-shell PATH once before constructing the service.
+    // This must happen before any command_available() calls so that binaries
+    // in ~/.local/bin or nvm-managed paths are found even when the daemon is
+    // started by systemd (which provides a minimal sanitized PATH).
+    init_login_shell_path();
+
     let service = CapabilityService::new(
         store,
         auth_mode,
@@ -800,12 +806,101 @@ pub async fn api_attach_page(
     Path(token): Path<String>,
 ) -> Response {
     match state.service.verify_attach_token(&token) {
-        Ok(record) => {
-            let body = serde_json::json!({ "node_id": record.node_id }).to_string();
-            (StatusCode::OK, body).into_response()
+        Ok(_record) => {
+            let html = attach_page_html(&token);
+            (
+                StatusCode::OK,
+                [("content-type", "text/html; charset=utf-8")],
+                html,
+            )
+                .into_response()
         }
         Err(error) => (StatusCode::UNAUTHORIZED, error.to_string()).into_response(),
     }
+}
+
+fn attach_page_html(token: &str) -> String {
+    // The WS handler sends terminal output as Text frames (raw UTF-8, may contain ANSI
+    // escape codes).  It accepts input as either Text or Binary frames — raw bytes that
+    // are forwarded directly to the pty / subprocess stdin.  There is no server-side
+    // resize protocol, so we only call fit() locally on window resize.
+    const TEMPLATE: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Asylum terminal</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; height: 100%; background: #1e1e1e; overflow: hidden; }
+    #terminal { width: 100%; height: 100%; }
+  </style>
+</head>
+<body>
+  <div id="terminal"></div>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
+  <script>
+    (function () {
+      var token = "__TOKEN__";
+      var wsScheme = location.protocol === "https:" ? "wss" : "ws";
+      var wsUrl = wsScheme + "://" + location.host + "/api/attach/" + token + "/ws";
+
+      var term = new Terminal({
+        cursorBlink: true,
+        scrollback: 5000,
+        fontFamily: "monospace",
+      });
+      var fitAddon = new FitAddon.FitAddon();
+      term.loadAddon(fitAddon);
+      term.open(document.getElementById("terminal"));
+      fitAddon.fit();
+
+      var ws = new WebSocket(wsUrl);
+      ws.binaryType = "arraybuffer";
+
+      ws.addEventListener("open", function () {
+        term.focus();
+      });
+
+      // Server sends output as UTF-8 text frames (may include ANSI escape sequences).
+      ws.addEventListener("message", function (event) {
+        if (typeof event.data === "string") {
+          term.write(event.data);
+        } else {
+          // Binary frame — decode as UTF-8 and write.
+          var bytes = new Uint8Array(event.data);
+          var text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+          term.write(text);
+        }
+      });
+
+      ws.addEventListener("close", function () {
+        term.writeln("\r\n[connection closed]");
+      });
+
+      ws.addEventListener("error", function () {
+        term.writeln("\r\n[connection error]");
+      });
+
+      // Forward keystrokes to the server as text frames.
+      term.onData(function (data) {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(data);
+        }
+      });
+
+      // Resize: fit locally; no server-side resize protocol is implemented.
+      window.addEventListener("resize", function () {
+        fitAddon.fit();
+      });
+    })();
+  </script>
+</body>
+</html>
+"#;
+    TEMPLATE.replace("__TOKEN__", token)
 }
 
 pub async fn api_attach_ws(

@@ -36,7 +36,7 @@ export function Nav({
     { id: "fleet", label: "nodes", icon: "list", count: fleetCount },
     { id: "chat", label: "chat", icon: "terminal" },
     { id: "decisions", label: "decisions", icon: "git-pull-request" },
-    { id: "logs", label: "logs", icon: "activity" },
+    { id: "logs", label: "notifications", icon: "activity" },
   ];
 
   const messagingItems: NavItem[] = [

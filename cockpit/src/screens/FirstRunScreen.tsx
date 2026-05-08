@@ -1,5 +1,5 @@
-import type { JSX } from "react";
-import { Btn, Wordmark } from "../lib/ui";
+import { useState, type JSX } from "react";
+import { Btn, Modal, Wordmark } from "../lib/ui";
 
 export interface FirstRunScreenProps {
   onLaunch: () => void;
@@ -22,16 +22,125 @@ const STEPS: [string, string][] = [
   ["hand off to loon", "workers boot in firecracker vms — same capability surface"],
 ];
 
+const SPEC_PATH = "docs/specs/asylum-current-product-spec.md";
+
+const CLI_COMMANDS: [string, string][] = [
+  ["asylum status", "show daemon status and connected nodes"],
+  ["asylum start", "start the daemon (systemd user service)"],
+  ["asylum stop", "stop the daemon"],
+  ["asylum cockpit", "open the cockpit in your browser"],
+  ["asylum doctor", "diagnose PATH, harness binaries, and config issues"],
+  ["asylum logs", "tail the daemon log"],
+  ["asylum node list", "list all nodes"],
+  ["asylum node stop <id>", "stop a running node"],
+];
+
 export function FirstRunScreen({
   onLaunch,
-  onOpenCli,
-  onReadSpec,
+  onOpenCli: _onOpenCli,
+  onReadSpec: _onReadSpec,
   harnessCount,
   substrateCount,
   nodeCount,
 }: FirstRunScreenProps): JSX.Element {
+  const [cliOpen, setCliOpen] = useState(false);
+  const [specOpen, setSpecOpen] = useState(false);
+  const [specCopied, setSpecCopied] = useState(false);
+
+  function handleOpenCli() {
+    setCliOpen(true);
+  }
+
+  function handleReadSpec() {
+    setSpecOpen(true);
+    setSpecCopied(false);
+    if (typeof navigator !== "undefined" && navigator.clipboard) {
+      navigator.clipboard
+        .writeText(SPEC_PATH)
+        .then(() => setSpecCopied(true))
+        .catch(() => {});
+    }
+  }
+
   return (
     <div className="firstrun">
+      {cliOpen && (
+        <Modal title="asylum cli" onClose={() => setCliOpen(false)} width={560}>
+          <div
+            style={{
+              fontFamily: "var(--font-mono)",
+              fontSize: 12,
+              display: "flex",
+              flexDirection: "column",
+              gap: 0,
+            }}
+          >
+            {CLI_COMMANDS.map(([cmd, desc]) => (
+              <div
+                key={cmd}
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr 1fr",
+                  gap: 12,
+                  padding: "7px 0",
+                  borderBottom: "1px solid var(--border-subtle)",
+                }}
+              >
+                <code style={{ color: "var(--fg)" }}>{cmd}</code>
+                <span style={{ color: "var(--fg-muted)", fontSize: 11 }}>{desc}</span>
+              </div>
+            ))}
+          </div>
+          <div
+            style={{
+              marginTop: 14,
+              padding: "8px 12px",
+              background: "var(--bg-sunken)",
+              border: "1px solid var(--border-subtle)",
+              fontFamily: "var(--font-mono)",
+              fontSize: 11,
+              color: "var(--fg-muted)",
+            }}
+          >
+            run <code style={{ color: "var(--fg)" }}>asylum --help</code> for the full command reference
+          </div>
+        </Modal>
+      )}
+
+      {specOpen && (
+        <Modal title="asylum spec" onClose={() => setSpecOpen(false)} width={520}>
+          <div
+            style={{
+              fontFamily: "var(--font-mono)",
+              fontSize: 12,
+              display: "flex",
+              flexDirection: "column",
+              gap: 12,
+            }}
+          >
+            <div style={{ color: "var(--fg-muted)" }}>
+              the current product spec lives at:
+            </div>
+            <code
+              style={{
+                color: "var(--fg)",
+                background: "var(--bg-sunken)",
+                border: "1px solid var(--border-subtle)",
+                padding: "10px 12px",
+                userSelect: "all",
+              }}
+            >
+              {SPEC_PATH}
+            </code>
+            <div style={{ color: "var(--fg-muted)", fontSize: 11 }}>
+              {specCopied
+                ? "path copied to your clipboard."
+                : "open it in your editor (the path above is selectable)."}
+            </div>
+          </div>
+        </Modal>
+      )}
+
       <div className="left">
         <div style={{ position: "relative" }}>
           <Wordmark size={20} />
@@ -52,10 +161,10 @@ export function FirstRunScreen({
           <Btn kind="primary" icon="play" onClick={onLaunch}>
             start a command center
           </Btn>
-          <Btn icon="terminal" onClick={onOpenCli}>
+          <Btn icon="terminal" onClick={handleOpenCli}>
             open cli
           </Btn>
-          <Btn kind="ghost" icon="book-open" onClick={onReadSpec}>
+          <Btn kind="ghost" icon="book-open" onClick={handleReadSpec}>
             read the spec
           </Btn>
         </div>

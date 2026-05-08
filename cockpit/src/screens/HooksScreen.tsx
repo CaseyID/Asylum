@@ -1,6 +1,6 @@
 // ports prototype HooksScreen, HookCard, HookEditor — backed by daemon /hooks api
 import { useEffect, useMemo, useState, type JSX } from "react";
-import { Btn, Field, Modal, Pill } from "../lib/ui";
+import { Btn, Empty, Field, Modal, Pill } from "../lib/ui";
 import {
   createHook,
   deleteHook,
@@ -437,46 +437,65 @@ export function HooksScreen(): JSX.Element {
       </div>
 
       {tab === "rules" && (
-        <div className="hooks-grid">
-          {hooks.map((h) => (
-            <HookCard
-              key={h.id}
-              hook={h}
-              stats={statsFor(h.id, firings)}
-              onToggle={() => toggle(h)}
-              onEdit={() => setDrawer({ id: h.id })}
-              onDryRun={() => onDryRun(h)}
-            />
-          ))}
-        </div>
+        hooks.length === 0 ? (
+          <Empty
+            lead="no rules yet"
+            sub="rules show up here when you create one"
+            action={
+              <Btn kind="primary" icon="plus" onClick={() => setDrawer({ id: "__new" })}>
+                new hook
+              </Btn>
+            }
+          />
+        ) : (
+          <div className="hooks-grid">
+            {hooks.map((h) => (
+              <HookCard
+                key={h.id}
+                hook={h}
+                stats={statsFor(h.id, firings)}
+                onToggle={() => toggle(h)}
+                onEdit={() => setDrawer({ id: h.id })}
+                onDryRun={() => onDryRun(h)}
+              />
+            ))}
+          </div>
+        )
       )}
 
       {tab === "firings" && (
-        <div className="firings-list">
-          <div className="firings-head">
-            <span>time</span>
-            <span>hook</span>
-            <span>trigger</span>
-            <span>outcome</span>
-            <span></span>
+        firings.length === 0 ? (
+          <Empty
+            lead="no firings yet"
+            sub="firings show up here when a rule triggers"
+          />
+        ) : (
+          <div className="firings-list">
+            <div className="firings-head">
+              <span>time</span>
+              <span>hook</span>
+              <span>trigger</span>
+              <span>outcome</span>
+              <span></span>
+            </div>
+            {firings.map((f) => {
+              const hk = hooks.find((h) => h.id === f.hook_id);
+              return (
+                <div key={f.id} className="firing-row">
+                  <span className="ts">{fmtTs(f.ts_epoch_secs)}</span>
+                  <span className="hk">{hk?.name ?? f.hook_id}</span>
+                  <span className="tr">
+                    <code>{f.trigger}</code>
+                  </span>
+                  <span className="oc">{f.outcome}</span>
+                  <span className="st">
+                    {f.ok ? <Pill status="running">ok</Pill> : <Pill status="errored">err</Pill>}
+                  </span>
+                </div>
+              );
+            })}
           </div>
-          {firings.map((f) => {
-            const hk = hooks.find((h) => h.id === f.hook_id);
-            return (
-              <div key={f.id} className="firing-row">
-                <span className="ts">{fmtTs(f.ts_epoch_secs)}</span>
-                <span className="hk">{hk?.name ?? f.hook_id}</span>
-                <span className="tr">
-                  <code>{f.trigger}</code>
-                </span>
-                <span className="oc">{f.outcome}</span>
-                <span className="st">
-                  {f.ok ? <Pill status="running">ok</Pill> : <Pill status="errored">err</Pill>}
-                </span>
-              </div>
-            );
-          })}
-        </div>
+        )
       )}
 
       {tab === "catalog" && (

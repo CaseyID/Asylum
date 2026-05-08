@@ -927,7 +927,18 @@ select.input {
 .banner.cc-claude .row.mid b { color: var(--status-info); font-weight: 500; }
 .banner.cc-claude .row.mid .m { color: var(--fg-muted); }
 
-/* body — same scrollable transcript area, harness adjusts inner styles */
+/* xterm.js terminal surface (tui view) */
+.session-terminal {
+  flex: 1; min-height: 0;
+  overflow: hidden;
+  padding: 8px 4px 4px 8px;
+  background: var(--bg-sunken);
+}
+/* let xterm own its own scrollbar inside the container */
+.session-terminal .xterm { height: 100%; }
+.session-terminal .xterm-viewport { overflow-y: auto !important; }
+
+/* body — structured/semantic transcript (struct view) */
 .session-body {
   flex: 1; min-height: 0;
   overflow-y: auto;

@@ -176,7 +176,9 @@ export function CreateScreen({ onCreated, onCancel }: CreateScreenProps): JSX.El
                     </span>
                   </div>
                   <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, opacity: 0.7 }}>
-                    {h.available ? `${h.caps.length} caps advertised` : "future · adapter not built"}
+                    {h.available
+                      ? `${h.caps.length} caps advertised`
+                      : `binary \`${h.command}\` not found on daemon PATH — run \`asylum doctor\``}
                   </span>
                 </button>
               ))}

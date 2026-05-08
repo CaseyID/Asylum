@@ -57,6 +57,23 @@ impl StdoutDecisionLineIngestor {
         events
     }
 
+    /// Emit any buffered carry bytes as OutputText without waiting for a newline.
+    /// Use this after each raw read to avoid losing TUI output that never terminates
+    /// with a newline (e.g. ANSI cursor-positioning sequences from full-screen TUIs).
+    /// Only flushes if the carry does not look like a partial decision-protocol marker;
+    /// in that case the bytes stay buffered until finalize.
+    pub fn flush_partial(&mut self) -> Vec<StdoutDecisionIngestionEvent> {
+        if self.carry.is_empty() {
+            return Vec::new();
+        }
+        if self.carry.contains(ASYLUM_DECISION_PROTOCOL_MARKER) {
+            // Might be a partial marker — leave in carry.
+            return Vec::new();
+        }
+        let text = std::mem::take(&mut self.carry);
+        vec![StdoutDecisionIngestionEvent::OutputText(text)]
+    }
+
     pub fn finalize(&mut self) -> Vec<StdoutDecisionIngestionEvent> {
         let mut events = Vec::new();
         if self.carry.is_empty() {
@@ -198,5 +215,38 @@ mod tests {
                 }
             )]
         );
+    }
+
+    #[test]
+    fn flush_partial_emits_tui_bytes_without_newline() {
+        let mut ingester = StdoutDecisionLineIngestor::default();
+        // Simulate a TUI frame: ANSI escape sequences with no trailing newline.
+        let events = ingester.ingest("\x1b[1;1H\x1b[0mwelcome");
+        // ingest buffers the whole chunk because there is no newline.
+        assert_eq!(events, Vec::<StdoutDecisionIngestionEvent>::new());
+        // flush_partial drains carry as OutputText.
+        let flushed = ingester.flush_partial();
+        assert_eq!(
+            flushed,
+            vec![StdoutDecisionIngestionEvent::OutputText(
+                "\x1b[1;1H\x1b[0mwelcome".to_string()
+            )]
+        );
+        // carry is now empty; subsequent flush returns nothing.
+        assert_eq!(
+            ingester.flush_partial(),
+            Vec::<StdoutDecisionIngestionEvent>::new()
+        );
+    }
+
+    #[test]
+    fn flush_partial_preserves_partial_decision_marker() {
+        let mut ingester = StdoutDecisionLineIngestor::default();
+        // Partial decision marker — must not be flushed prematurely.
+        let events = ingester.ingest("@@asylum:decision.request {\"text\":\"half");
+        assert_eq!(events, Vec::<StdoutDecisionIngestionEvent>::new());
+        let flushed = ingester.flush_partial();
+        // Marker is in carry, so flush_partial returns nothing.
+        assert_eq!(flushed, Vec::<StdoutDecisionIngestionEvent>::new());
     }
 }
