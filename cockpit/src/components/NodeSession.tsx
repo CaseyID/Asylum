@@ -3,9 +3,12 @@
 // the chrome (compact vs full); the harness-authentic TUI inside is the same.
 //
 // all input goes to the daemon via postNodeInput; all output arrives over the
-// observe websocket and streams into entries. no canned simulation.
+// observe websocket and streams into the xterm.js terminal. no canned simulation.
 
-import { useEffect, useRef, useState, type ReactElement } from "react";
+import { useEffect, useRef, useState, useCallback, type ReactElement } from "react";
+import "@xterm/xterm/css/xterm.css";
+import { Terminal } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
 import { Btn } from "../lib/ui";
 import { ToolCall } from "../lib/ui";
 import { Icon } from "../lib/icons";
@@ -26,7 +29,7 @@ export interface NodeSessionProps {
   onExpand?: () => void;
 }
 
-// ─── internal transcript entry types ────────────────────────────────────────
+// ─── internal transcript entry types (structured view only) ─────────────────
 
 type TranscriptEntry =
   | { kind: "user"; text: string }
@@ -53,7 +56,32 @@ interface NodeEvent {
 const WS_INIT_FRAME = "asylum.observe.ws.initialized";
 const WS_LIVE_UNAVAILABLE = "asylum.observe.ws.live_stream_unavailable";
 
-// ─── initial transcript ───────────────────────────────────────────────────────
+// ─── xterm theme matching cockpit dark palette ────────────────────────────────
+const XTERM_THEME = {
+  background: "#0d0d0d",
+  foreground: "#e2e2e2",
+  black: "#1a1a1a",
+  red: "#e06c75",
+  green: "#7dbb87",
+  yellow: "#e5c07b",
+  blue: "#61afef",
+  magenta: "#c678dd",
+  cyan: "#56b6c2",
+  white: "#abb2bf",
+  brightBlack: "#4b5263",
+  brightRed: "#e06c75",
+  brightGreen: "#98c379",
+  brightYellow: "#e5c07b",
+  brightBlue: "#61afef",
+  brightMagenta: "#c678dd",
+  brightCyan: "#56b6c2",
+  brightWhite: "#ffffff",
+  cursor: "#e2e2e2",
+  cursorAccent: "#0d0d0d",
+  selectionBackground: "#3e4451",
+};
+
+// ─── initial transcript (structured view) ────────────────────────────────────
 function initialTranscript(node: AsylumNode): TranscriptEntry[] {
   const isCC = isCommandCenter(node);
   const harnessId = node.harness === "claude_code" ? "claude-code" : "codex";
@@ -74,73 +102,171 @@ export function NodeSession({
   onInterrupt,
   onExpand,
 }: NodeSessionProps): ReactElement {
+  // structured view fallback transcript (used when view === "structured")
   const [entries, setEntries] = useState<TranscriptEntry[]>(() => initialTranscript(node));
   const [input, setInput] = useState("");
   const [view, setView] = useState<"tui" | "structured">("tui");
-  const termRef = useRef<HTMLDivElement | null>(null);
+
+  // xterm refs
+  const termContainerRef = useRef<HTMLDivElement | null>(null);
+  const termRef = useRef<Terminal | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
+
+  // structured-view scroll container
+  const structBodyRef = useRef<HTMLDivElement | null>(null);
+
   const phaseRef = useRef<"history" | "live">("history");
   const liveDisabledRef = useRef<boolean>(false);
-  const liveEntryIdRef = useRef<string | null>(null);
 
-  useEffect(() => {
-    if (termRef.current) termRef.current.scrollTop = termRef.current.scrollHeight;
-  }, [entries]);
+  // track recently-sent input texts for structured-view dedupe (M3)
+  // keyed by text; value is expiry timestamp
+  const sentSetRef = useRef<Map<string, number>>(new Map());
 
   const harnessId = node.harness === "claude_code" ? "claude-code" : "codex";
 
-  async function submit(): Promise<void> {
+  // ─── xterm setup / teardown ───────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!termContainerRef.current) return;
+
+    const term = new Terminal({
+      theme: XTERM_THEME,
+      fontFamily: "var(--font-mono, 'JetBrains Mono', 'Fira Mono', 'Menlo', monospace)",
+      fontSize: 13,
+      lineHeight: 1.45,
+      cursorBlink: true,
+      scrollback: 5000,
+      convertEol: false,
+      allowProposedApi: false,
+    });
+
+    const fitAddon = new FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(termContainerRef.current);
+    fitAddon.fit();
+
+    termRef.current = term;
+    fitAddonRef.current = fitAddon;
+
+    // raw keystrokes from the terminal go directly to the harness
+    const dataDispose = term.onData((data: string) => {
+      void postNodeInput(node.id, data).catch(() => {
+        // swallow — the harness may not be live; errors surface via ws events
+      });
+    });
+
+    // resize observer — refit when the container changes size
+    const ro = new ResizeObserver(() => {
+      try {
+        fitAddon.fit();
+      } catch {
+        // ignore — can race with dispose
+      }
+    });
+    ro.observe(termContainerRef.current);
+
+    return () => {
+      dataDispose.dispose();
+      ro.disconnect();
+      term.dispose();
+      termRef.current = null;
+      fitAddonRef.current = null;
+    };
+  // node.id intentionally excluded — terminal lifecycle is per mount, ws handles node changes
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // refit when view switches to tui (container may have been hidden)
+  useEffect(() => {
+    if (view === "tui") {
+      requestAnimationFrame(() => {
+        try {
+          fitAddonRef.current?.fit();
+        } catch {
+          // ignore
+        }
+      });
+    }
+  }, [view]);
+
+  // scroll structured view on new entries
+  useEffect(() => {
+    if (structBodyRef.current) {
+      structBodyRef.current.scrollTop = structBodyRef.current.scrollHeight;
+    }
+  }, [entries]);
+
+  // ─── submit (textarea input) ──────────────────────────────────────────────
+
+  const submit = useCallback(async (): Promise<void> => {
     const v = input.trimEnd();
     if (!v) return;
     setInput("");
-    // No optimistic push — rely on the server input_sent event to avoid duplicates.
+
+    // optimistic echo into both surfaces
+    const withNewline = v.endsWith("\n") ? v : v + "\n";
+    // write to terminal (local echo for the tui surface)
+    termRef.current?.write(withNewline);
+    // optimistic push for structured view — track it so input_sent doesn't duplicate
+    setEntries(p => [...p, { kind: "user", text: v }]);
+    sentSetRef.current.set(v, Date.now() + 4000);
+
     try {
       await postNodeInput(node.id, v);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      termRef.current?.write(`\r\nsend-input failed: ${msg}\r\n`);
       setEntries(p => [...p, { kind: "sys-line", text: `send-input failed: ${msg}` }]);
     }
-  }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [input, node.id]);
 
-  // observe ws — opens on mount, closes on unmount. history frames arrive as
-  // NodeEvent JSON; then a literal init frame; then live raw output chunks.
+  // ─── observe websocket ────────────────────────────────────────────────────
+
   useEffect(() => {
     phaseRef.current = "history";
     liveDisabledRef.current = false;
-    liveEntryIdRef.current = null;
+
+    // clear terminal and structured transcript on new node
+    termRef.current?.clear();
+    setEntries(initialTranscript(node));
 
     const ws = openNodeObserveSocket(node.id, {
       onMessage: (data) => {
         if (typeof data !== "string") return;
+
         if (data === WS_INIT_FRAME) {
           phaseRef.current = "live";
           return;
         }
+
         if (data === WS_LIVE_UNAVAILABLE) {
           liveDisabledRef.current = true;
           const message = node.substrate === "loon"
             ? "Loon nodes do not stream local PTY-style live observe output; use attach for an interactive session"
             : "live streaming not supported by this substrate";
+          termRef.current?.write(`\r\n· ${message}\r\n`);
           setEntries(p => [...p, { kind: "sys-line", text: message }]);
           return;
         }
+
         if (phaseRef.current === "history") {
           handleHistoryFrame(data);
         } else {
-          if (liveDisabledRef.current) return;
-          handleLiveFrame(data);
+          if (!liveDisabledRef.current) {
+            handleLiveFrame(data);
+          }
         }
       },
     });
 
     return () => {
-      try {
-        ws.close();
-      } catch {
-        // ignore — already closed
-      }
+      try { ws.close(); } catch { /* already closed */ }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [node.id]);
+
+  // ─── frame handlers ───────────────────────────────────────────────────────
 
   function handleHistoryFrame(data: string): void {
     let evt: NodeEvent | null = null;
@@ -153,7 +279,8 @@ export function NodeSession({
       evt = null;
     }
     if (!evt) {
-      // unknown frame in history phase — render as raw text so it isn't lost
+      // unknown frame — write raw to terminal
+      termRef.current?.write(data);
       setEntries(p => [...p, { kind: "text", text: data }]);
       return;
     }
@@ -166,41 +293,60 @@ export function NodeSession({
       case "output_chunk": {
         const text = typeof body.text === "string" ? body.text : "";
         if (!text) return;
+        // write raw bytes to terminal — xterm decodes ANSI
+        termRef.current?.write(text);
+        // also track for structured view
         setEntries(p => [...p, { kind: "text", text }]);
         return;
       }
       case "input_sent": {
         const text = typeof body.text === "string" ? body.text : "";
+        // M3: skip rendering if this client sent it recently (optimistic echo already shown)
+        const expiry = sentSetRef.current.get(text);
+        if (expiry && Date.now() < expiry) {
+          sentSetRef.current.delete(text);
+          return;
+        }
         setEntries(p => [...p, { kind: "user", text }]);
         return;
       }
       case "node_started": {
+        termRef.current?.write("\r\n· node started\r\n");
         setEntries(p => [...p, { kind: "sys-line", text: "node started" }]);
         return;
       }
       case "liveness_changed": {
         const next = typeof body.liveness === "string" ? body.liveness : (typeof body.next === "string" ? body.next : "?");
+        termRef.current?.write(`\r\n· liveness · ${next}\r\n`);
         setEntries(p => [...p, { kind: "sys-line", text: `liveness · ${next}` }]);
         return;
       }
       case "harness_failure": {
-        setEntries(p => [...p, { kind: "sys-line", text: summarizeEventText("harness_failure", body) }]);
+        const msg = summarizeEventText("harness_failure", body);
+        termRef.current?.write(`\r\n· ${msg}\r\n`);
+        setEntries(p => [...p, { kind: "sys-line", text: msg }]);
         return;
       }
       case "substrate_failure": {
-        setEntries(p => [...p, { kind: "sys-line", text: summarizeEventText("substrate_failure", body) }]);
+        const msg = summarizeEventText("substrate_failure", body);
+        termRef.current?.write(`\r\n· ${msg}\r\n`);
+        setEntries(p => [...p, { kind: "sys-line", text: msg }]);
         return;
       }
       case "human_input_requested": {
-        setEntries(p => [...p, { kind: "sys-line", text: summarizeEventText("human_input_requested", body) }]);
+        const msg = summarizeEventText("human_input_requested", body);
+        termRef.current?.write(`\r\n· ${msg}\r\n`);
+        setEntries(p => [...p, { kind: "sys-line", text: msg }]);
         return;
       }
       case "notification_sent": {
-        setEntries(p => [...p, { kind: "sys-line", text: summarizeEventText("notification_sent", body) }]);
+        const msg = summarizeEventText("notification_sent", body);
+        setEntries(p => [...p, { kind: "sys-line", text: msg }]);
         return;
       }
       case "remote_command_received": {
-        setEntries(p => [...p, { kind: "sys-line", text: summarizeEventText("remote_command_received", body) }]);
+        const msg = summarizeEventText("remote_command_received", body);
+        setEntries(p => [...p, { kind: "sys-line", text: msg }]);
         return;
       }
       case "attach_issued": {
@@ -210,34 +356,28 @@ export function NodeSession({
         return;
       }
       default: {
-        setEntries(p => [...p, { kind: "sys-line", text: `event · ${evt.kind ?? "?"}` }]);
+        const msg = `event · ${evt.kind ?? "?"}`;
+        setEntries(p => [...p, { kind: "sys-line", text: msg }]);
         return;
       }
     }
   }
 
   function handleLiveFrame(data: string): void {
-    // append live raw output to a single rolling text entry; start a new entry
-    // each time the previous chunk ended on a newline, so completed lines are
-    // committed and styled by the caret-aware renderer.
+    // live frames are raw PTY bytes — write directly to terminal
+    termRef.current?.write(data);
+    // also append to structured view transcript
     setEntries(prev => {
       const last = prev[prev.length - 1];
-      const liveId = liveEntryIdRef.current;
-      const lastIsLive = last && last.kind === "text" && "id" in last && last.id === liveId;
-      if (lastIsLive && last.kind === "text") {
-        const merged = (last.text ?? "") + data;
-        const next = prev.slice(0, -1);
-        next.push({ kind: "text", id: liveId ?? undefined, text: merged });
-        if (data.includes("\n")) liveEntryIdRef.current = null;
-        return next;
+      if (last && last.kind === "text") {
+        const merged = last.text + data;
+        return [...prev.slice(0, -1), { kind: "text", text: merged }];
       }
-      const newId = Math.random().toString(36).slice(2, 8);
-      liveEntryIdRef.current = data.endsWith("\n") ? null : newId;
-      return [...prev, { kind: "text", id: newId, text: data }];
+      return [...prev, { kind: "text", text: data }];
     });
   }
 
-  const last = entries[entries.length - 1];
+  // ─── render ───────────────────────────────────────────────────────────────
 
   return (
     <div className={`session session-${mode} harness-${harnessId}`} data-screen-label={`session-${node.id}`}>
@@ -253,17 +393,24 @@ export function NodeSession({
         onExpand={onExpand}
       />
       <SessionBanner node={node} harnessId={harnessId} />
-      <div className="session-body" ref={termRef}>
-        {entries.map((e, i) => (
-          <TermEntry
-            key={i}
-            e={e}
-            harness={harnessId}
-            view={view}
-          />
-        ))}
-        {last?.kind === "prompt" && <PromptLine harness={harnessId} />}
-      </div>
+
+      {/* tui surface: xterm.js terminal */}
+      <div
+        ref={termContainerRef}
+        className="session-terminal"
+        style={{ display: view === "tui" ? "flex" : "none" }}
+      />
+
+      {/* structured surface: semantic transcript */}
+      {view === "structured" && (
+        <div className="session-body" ref={structBodyRef}>
+          {entries.map((e, i) => (
+            <TermEntry key={i} e={e} harness={harnessId} view={view} />
+          ))}
+          {entries[entries.length - 1]?.kind === "prompt" && <PromptLine harness={harnessId} />}
+        </div>
+      )}
+
       <SessionInput
         node={node}
         harnessId={harnessId}
@@ -335,7 +482,7 @@ function SessionHeader({
           <Btn kind="ghost" size="sm" icon="square" iconOnly title="interrupt" onClick={() => onInterrupt(node.id)} />
         )}
         <div className="view-toggle" role="tablist" title="transcript rendering">
-          <button className={view === "tui" ? "on" : ""} onClick={() => setView("tui")} title="raw tui replay">tui</button>
+          <button className={view === "tui" ? "on" : ""} onClick={() => setView("tui")} title="raw tui — xterm.js terminal">tui</button>
           <button className={view === "structured" ? "on" : ""} onClick={() => setView("structured")} title="structured / semantic">struct</button>
         </div>
         {mode === "cockpit" && onExpand && (

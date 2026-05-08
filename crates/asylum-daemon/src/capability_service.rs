@@ -1,4 +1,4 @@
-use std::{env, path::Path, sync::Arc};
+use std::{env, path::Path, sync::{Arc, OnceLock}};
 
 use anyhow::{anyhow, Context, Result};
 use asylum_types::api::{
@@ -160,7 +160,8 @@ impl CapabilityService {
             store: store.clone(),
             hook_engine: hook_engine.clone(),
         };
-        let local_substrate = LocalSubstrate::new_with_decision_sink(
+        let exit_store = store.clone();
+        let local_substrate = LocalSubstrate::new_with_sinks(
             move |node_id, chunk| {
                 if let Err(e) = sink_store.append_transcript_chunk(node_id, chunk) {
                     tracing::warn!(error = %e, "failed to persist transcript chunk");
@@ -170,6 +171,19 @@ impl CapabilityService {
                 if let Err(e) = decision_ingester.ingest_request(node_id, request) {
                     tracing::warn!(error = %e, node_id = %node_id, "failed to ingest decision request");
                 }
+            },
+            move |node_id| {
+                let store = exit_store.clone();
+                tokio::runtime::Handle::current().spawn(async move {
+                    if let Ok(Some(node)) = store.get_node(node_id) {
+                        if matches!(
+                            node.liveness,
+                            NodeLiveness::Running | NodeLiveness::Starting
+                        ) {
+                            let _ = store.set_node_liveness(node_id, NodeLiveness::Stopped);
+                        }
+                    }
+                });
             },
         );
         let loon_substrate = if config.loon.enabled {
@@ -1176,6 +1190,12 @@ impl CapabilityService {
         )?;
         let mut launch_args = adapter.launch_args().to_vec();
         launch_args.extend(request.launch_args.clone());
+        // Append the description as a positional prompt argument so the harness receives
+        // it as its first user turn without any PTY timing games. Both `codex [PROMPT]`
+        // and `claude [prompt]` support a trailing positional argument for this purpose.
+        if let Some(desc) = request.description.as_deref().filter(|v| !v.is_empty()) {
+            launch_args.push(desc.to_string());
+        }
         let env = self.local_launch_env(&node, &harness, &substrate, &capabilities)?;
         let context = SubstrateContext {
             node_id: node.id,
@@ -1187,7 +1207,26 @@ impl CapabilityService {
         };
         match substrate {
             SubstrateKind::Local => {
-                self.local_substrate.launch(context).await?;
+                // Pre-trust the workspace so harness config dialogs are bypassed before
+                // the process even spawns.
+                if let Some(ws) = request.workspace.as_deref().filter(|v| !v.is_empty()) {
+                    if let Err(e) = adapter.pre_trust_workspace(ws) {
+                        tracing::warn!(
+                            error = %e,
+                            workspace = ws,
+                            "pre_trust_workspace failed — harness may show trust dialog"
+                        );
+                    }
+                }
+                if let Err(launch_err) = self.local_substrate.launch(context).await {
+                    let _ = self.store.set_node_liveness(node.id, NodeLiveness::Failed);
+                    let _ = self.store.record_event(
+                        node.id,
+                        NodeEventKind::HarnessFailure,
+                        json!({ "error": launch_err.to_string() }),
+                    );
+                    return Err(launch_err);
+                }
                 self.store
                     .set_node_liveness(node.id, NodeLiveness::Running)?;
             }
@@ -2433,6 +2472,35 @@ pub async fn loom_support_for_harness(
     Ok(capability_flags_from_health(&health, &harness))
 }
 
+/// The login-shell PATH, probed once at daemon startup.
+/// `None` means the probe was not attempted or produced no output.
+static LOGIN_SHELL_PATH: OnceLock<Option<String>> = OnceLock::new();
+
+/// Probe the user's login-shell PATH by running `sh -lc 'echo $PATH'`.
+/// Called once at daemon startup; the result is cached for the process lifetime.
+pub fn probe_login_shell_path() -> Option<String> {
+    let output = std::process::Command::new("sh")
+        .args(["-lc", "echo $PATH"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(output.stdout).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Initialize the login-shell PATH cache.  Call once from daemon startup
+/// before any `command_available` invocations.
+pub fn init_login_shell_path() {
+    LOGIN_SHELL_PATH.get_or_init(probe_login_shell_path);
+}
+
 fn command_available(command: &str) -> bool {
     if command.trim().is_empty() {
         return false;
@@ -2441,10 +2509,21 @@ fn command_available(command: &str) -> bool {
     if command_path.components().count() > 1 {
         return is_executable_file(command_path);
     }
-    let Some(paths) = env::var_os("PATH") else {
-        return false;
-    };
-    env::split_paths(&paths).any(|dir| is_executable_file(&dir.join(command)))
+    // Search the process PATH first.
+    if let Some(paths) = env::var_os("PATH") {
+        if env::split_paths(&paths).any(|dir| is_executable_file(&dir.join(command))) {
+            return true;
+        }
+    }
+    // Fall back to the login-shell PATH cached at startup.  This handles the
+    // common case where the daemon is launched by systemd with a sanitized
+    // PATH that excludes ~/.local/bin or nvm-managed bin directories.
+    if let Some(Some(login_path)) = LOGIN_SHELL_PATH.get() {
+        if env::split_paths(login_path).any(|dir| is_executable_file(&dir.join(command))) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(unix)]

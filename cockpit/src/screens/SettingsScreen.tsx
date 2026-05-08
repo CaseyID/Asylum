@@ -401,13 +401,18 @@ export function SettingsScreen(): JSX.Element {
                   <div className="ico">{h.name[0].toLowerCase()}</div>
                   <div>
                     <div className="name">
-                      {h.name} {!h.available && <Tag future>future</Tag>}
+                      {h.name}
                     </div>
                     <div className="meta">
                       {h.kind} adapter · {h.caps.length} capabilities
+                      {!h.available && (
+                        <span style={{ display: "block", marginTop: 2, color: "var(--fg-muted)", fontSize: 11 }}>
+                          {`\`${h.command}\` not found on daemon PATH — run \`asylum doctor\``}
+                        </span>
+                      )}
                     </div>
                   </div>
-                  <Pill status={h.available ? "running" : "idle"}>{h.available ? "installed" : "not built"}</Pill>
+                  <Pill status={h.available ? "running" : "idle"}>{h.available ? "installed" : "not on PATH"}</Pill>
                 </div>
               ))}
             </Panel>

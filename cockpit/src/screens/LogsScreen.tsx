@@ -1,6 +1,6 @@
 import { useMemo, useState, type JSX } from "react";
 import { shortNodeId } from "../lib/glyphs";
-import { Btn } from "../lib/ui";
+import { Btn, Empty } from "../lib/ui";
 import type { NotificationRecord } from "../types";
 import { Icon } from "../lib/icons";
 
@@ -84,7 +84,7 @@ export function LogsScreen({ notifications, onMarkRead, onOpenNode }: LogsScreen
       <div className="page" style={{ paddingBottom: 0, flex: "none" }}>
         <div className="page-head">
           <div>
-            <h1 className="page-title">logs &amp; telemetry</h1>
+            <h1 className="page-title">notifications</h1>
             <div className="page-sub">
               daemon notification records with read-state and node context where available
             </div>
@@ -131,63 +131,72 @@ export function LogsScreen({ notifications, onMarkRead, onOpenNode }: LogsScreen
           {filtered.length} / {totalCount} events ({unreadCount} unread)
         </span>
       </div>
-      <div
-        className="log"
-        style={{ margin: "0 36px 28px", borderTop: "1px solid var(--border)", border: "1px solid var(--border)" }}
-      >
-        <div
-          className="row log-head"
-          style={{
-            background: "var(--bg-elev)",
-            borderBottom: "1px solid var(--border)",
-            fontSize: 10,
-            letterSpacing: 0.06,
-          }}
-        >
-          <span className="ts" style={{ color: "var(--fg-muted)" }}>
-            time
-          </span>
-          <span className="status-head" style={{ color: "var(--fg-muted)" }}>
-            state
-          </span>
-          <span className="lvl" style={{ color: "var(--fg-muted)" }}>
-            level
-          </span>
-          <span className="src" style={{ color: "var(--fg-muted)" }}>
-            source
-          </span>
-          <span style={{ color: "var(--fg-muted)" }}>message</span>
-          <span style={{ color: "var(--fg-muted)" }}>node</span>
-          <span style={{ color: "var(--fg-muted)", textAlign: "right" }}>actions</span>
+      {notifications.length === 0 ? (
+        <div style={{ margin: "0 36px 28px" }}>
+          <Empty
+            lead="no notifications yet"
+            sub="they show up here when something needs your attention"
+          />
         </div>
-        {filtered.map((r) => (
-          <div className="row" key={r.id}>
-            <span className="ts">{r.ts}</span>
-            <span className={`status ${r.read ? "read" : "unread"}`}>{r.read ? "read" : "unread"}</span>
-            <span className={`lvl ${r.lvl}`}>{r.lvl}</span>
-            <span className="src">{r.src}</span>
-            <span className="msg">{r.msg}</span>
-            <span className="mono">{r.nodeId ? shortNodeId(r.nodeId) : "—"}</span>
-            <span style={{ display: "flex", justifyContent: "flex-end", gap: 6 }}>
-              {r.nodeId && (
-                <Btn size="sm" icon="external-link" onClick={() => onOpenNode?.(r.nodeId!)}>
-                  open
-                </Btn>
-              )}
-              {!r.read && (
-                <Btn
-                  size="sm"
-                  onClick={() => void handleMarkRead(r.id)}
-                  disabled={markingId === r.id}
-                  title="Mark this notification as read"
-                >
-                  {markingId === r.id ? "marking..." : "mark read"}
-                </Btn>
-              )}
+      ) : (
+        <div
+          className="log"
+          style={{ margin: "0 36px 28px", borderTop: "1px solid var(--border)", border: "1px solid var(--border)" }}
+        >
+          <div
+            className="row log-head"
+            style={{
+              background: "var(--bg-elev)",
+              borderBottom: "1px solid var(--border)",
+              fontSize: 10,
+              letterSpacing: 0.06,
+            }}
+          >
+            <span className="ts" style={{ color: "var(--fg-muted)" }}>
+              time
             </span>
+            <span className="status-head" style={{ color: "var(--fg-muted)" }}>
+              state
+            </span>
+            <span className="lvl" style={{ color: "var(--fg-muted)" }}>
+              level
+            </span>
+            <span className="src" style={{ color: "var(--fg-muted)" }}>
+              source
+            </span>
+            <span style={{ color: "var(--fg-muted)" }}>message</span>
+            <span style={{ color: "var(--fg-muted)" }}>node</span>
+            <span style={{ color: "var(--fg-muted)", textAlign: "right" }}>actions</span>
           </div>
-        ))}
-      </div>
+          {filtered.map((r) => (
+            <div className="row" key={r.id}>
+              <span className="ts">{r.ts}</span>
+              <span className={`status ${r.read ? "read" : "unread"}`}>{r.read ? "read" : "unread"}</span>
+              <span className={`lvl ${r.lvl}`}>{r.lvl}</span>
+              <span className="src">{r.src}</span>
+              <span className="msg">{r.msg}</span>
+              <span className="mono">{r.nodeId ? shortNodeId(r.nodeId) : "—"}</span>
+              <span style={{ display: "flex", justifyContent: "flex-end", gap: 6 }}>
+                {r.nodeId && (
+                  <Btn size="sm" icon="external-link" onClick={() => onOpenNode?.(r.nodeId!)}>
+                    open
+                  </Btn>
+                )}
+                {!r.read && (
+                  <Btn
+                    size="sm"
+                    onClick={() => void handleMarkRead(r.id)}
+                    disabled={markingId === r.id}
+                    title="Mark this notification as read"
+                  >
+                    {markingId === r.id ? "marking..." : "mark read"}
+                  </Btn>
+                )}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

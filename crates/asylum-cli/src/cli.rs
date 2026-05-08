@@ -1660,18 +1660,53 @@ async fn doctor_checks(
     }
     checks.push(cockpit_assets_check());
     let config = load_config_file(paths).unwrap_or_else(|_| default_file_config_for_paths(paths));
-    checks.push(classify_required(
-        command_exists(&config.core.harness.codex_command),
-        "codex",
-        format!("`{}` found", config.core.harness.codex_command),
-        format!("`{}` not found", config.core.harness.codex_command),
-    ));
-    checks.push(classify_required(
-        command_exists(&config.core.harness.claude_command),
-        "claude",
-        format!("`{}` found", config.core.harness.claude_command),
-        format!("`{}` not found", config.core.harness.claude_command),
-    ));
+
+    // Fetch harness availability from the running daemon so we can detect the
+    // common PATH mismatch: the binary is on the user's interactive PATH but
+    // not on the daemon's (systemd-sanitized) PATH.
+    let daemon_harnesses = client.harness_descriptors().await.ok();
+
+    for (check_name, command) in [
+        ("codex", config.core.harness.codex_command.as_str()),
+        ("claude", config.core.harness.claude_command.as_str()),
+    ] {
+        let local_found = command_exists(command);
+        let daemon_available = daemon_harnesses
+            .as_ref()
+            .and_then(|r| r.harnesses.iter().find(|h| h.command == command))
+            .map(|h| h.available);
+        let check = match (local_found, daemon_available) {
+            // Both agree: found.
+            (true, Some(true)) | (true, None) => DoctorCheck::new(
+                CheckStatus::Ok,
+                check_name,
+                format!("`{command}` found"),
+            ),
+            // Daemon is running and can also find it (may differ from local PATH).
+            (false, Some(true)) => DoctorCheck::new(
+                CheckStatus::Ok,
+                check_name,
+                format!("`{command}` found by daemon (not on local PATH)"),
+            ),
+            // CLI sees it but daemon does not: systemd PATH mismatch.
+            (true, Some(false)) => DoctorCheck::new(
+                CheckStatus::Fail,
+                check_name,
+                format!(
+                    "`{command}` found locally but not in daemon PATH — \
+                     rerun `asylum start` to regenerate the service unit with the current PATH, \
+                     or run `asylum service generate systemd` and inspect the unit"
+                ),
+            ),
+            // Neither found the binary.
+            (false, Some(false)) | (false, None) => DoctorCheck::new(
+                CheckStatus::Fail,
+                check_name,
+                format!("`{command}` not found — install it and rerun `asylum doctor`"),
+            ),
+        };
+        checks.push(check);
+    }
     checks.push(optional_check(
         "loon",
         config.core.loon.enabled,

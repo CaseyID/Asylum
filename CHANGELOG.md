@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.10 — 2026-05-07
+
+### Added
+
+- Cockpit `NodeSession` now renders a real xterm.js terminal (via the previously-installed `@xterm/xterm` and `@xterm/addon-fit` deps), decoding ANSI/VT escape sequences and accepting raw keystroke input. The "tui / struct" toggle keeps the structured transcript available alongside.
+- Browser attach (`/attach/<token>`) now serves a self-contained xterm.js HTML page that connects to the existing attach WebSocket, replacing the prior `text/plain` JSON stub.
+- Daemon login-shell PATH fallback: at startup, the daemon probes `sh -lc 'echo $PATH'` once and uses it as a fallback when a harness binary isn't on the process PATH.
+- `asylum service generate systemd` now bakes the install-time interactive PATH into the unit's `Environment=PATH=...` so the daemon can find harness binaries installed under `~/.local/bin`, nvm, pyenv, etc.
+- `asylum doctor` now distinguishes "binary missing locally", "binary on local PATH but not in daemon PATH", and "binary found by both", with actionable guidance for each case.
+
+### Fixed
+
+- Failed local harness spawns now transition the node to `Failed` and record a `HarnessFailure` event instead of leaving phantom rows stuck at `Starting` forever.
+- Launch-packet textarea is now actually delivered to the harness as the first user turn on the local substrate (passed as the positional `[PROMPT]` argument to both codex and claude). The label is no longer a lie.
+- Codex and Claude Code workspaces are pre-trusted before launch (idempotent upserts to `~/.codex/config.toml` `[projects."<ws>"]` and `~/.claude.json` `projects[<ws>].hasTrustDialogAccepted`), including walking up to the git root for paths like `/tmp/<ws>` that share `/tmp/.git`. Combined with `--dangerously-bypass-approvals-and-sandbox` (codex) and `--dangerously-skip-permissions` (claude), fresh nodes no longer sit at trust prompts.
+- Decision-line ingester's carry buffer is now flushed on each PTY read via `flush_partial`, so TUI bytes (which never include newlines) reach `transcript_chunks`. Replay-on-connect now actually replays.
+- Daemon now detects harness self-exit: when a child process exits, the local substrate removes its runtime entry and transitions the node liveness `Running → Stopped`. Previously, send-input on a self-exited node returned "node not running" while the UI still showed `running`.
+- Cockpit "open cli" and "read the spec" first-run buttons now do something — `open cli` opens a CLI-command modal, `read the spec` opens a modal showing the spec path with optional clipboard copy.
+- Successful node launch now navigates to the new node's detail screen instead of `/fleet`.
+- Send-input from the cockpit chat box renders optimistically; the daemon's `input_sent` echo is deduped client-side.
+- Cockpit "logs & telemetry" screen renamed to "notifications" (matches what it actually shows); empty-state copy added on Notifications and on Hooks rules/firings tabs.
+- Cockpit copy for unavailable harnesses changed from "future · adapter not built" to "binary `<name>` not found on daemon PATH — run `asylum doctor`", correctly reflecting the actual condition.
+
 ## 0.1.9 — 2026-05-07
 
 ### Added

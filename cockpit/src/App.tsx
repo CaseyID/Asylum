@@ -473,7 +473,7 @@ export function App() {
                 setOpenNodeId(id);
                 setSelectedNode(id);
                 void refreshAll();
-                setScreen("fleet");
+                setScreen("node");
               }}
               onCancel={() => setScreen("cockpit")}
             />

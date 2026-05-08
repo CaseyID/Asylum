@@ -37,6 +37,12 @@ pub struct ServiceRenderConfig {
     pub binary: PathBuf,
     pub config: PathBuf,
     pub log: PathBuf,
+    /// PATH to bake into the service unit's environment.  When set, the
+    /// generated systemd unit will include `Environment=PATH=<path>` so the
+    /// daemon can find binaries (e.g. `claude`, `codex`) that live in
+    /// directories like `~/.local/bin` or nvm-managed paths that systemd
+    /// strips from the sanitized service environment.
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +127,7 @@ impl ServiceManager {
             binary: self.binary.clone(),
             config: self.paths.config.clone(),
             log: self.paths.log.clone(),
+            path: std::env::var("PATH").ok().filter(|p| !p.is_empty()),
         }
     }
 
@@ -397,6 +404,11 @@ pub fn render_launchd_plist(config: &ServiceRenderConfig) -> String {
 }
 
 pub fn render_systemd_unit(config: &ServiceRenderConfig) -> String {
+    let path_line = config
+        .path
+        .as_deref()
+        .map(|p| format!("Environment=PATH={}\n", systemd_setting_path(p)))
+        .unwrap_or_default();
     format!(
         concat!(
             "[Unit]\n",
@@ -404,6 +416,7 @@ pub fn render_systemd_unit(config: &ServiceRenderConfig) -> String {
             "After=network-online.target\n\n",
             "[Service]\n",
             "Type=simple\n",
+            "{}", // optional Environment=PATH=...
             "ExecStart={} daemon run --config {}\n",
             "Restart=on-failure\n",
             "RestartSec=3\n",
@@ -412,6 +425,7 @@ pub fn render_systemd_unit(config: &ServiceRenderConfig) -> String {
             "[Install]\n",
             "WantedBy=default.target\n",
         ),
+        path_line,
         systemd_quote_arg(&config.binary.display().to_string()),
         systemd_quote_arg(&config.config.display().to_string()),
         systemd_setting_path(&config.log.display().to_string()),
@@ -1098,6 +1112,7 @@ mod tests {
             binary: PathBuf::from("/usr/local/bin/asylum"),
             config: PathBuf::from("/tmp/asylum/config.toml"),
             log: PathBuf::from("/tmp/asylum/logs/asylum.log"),
+            path: None,
         }
     }
 
@@ -1127,12 +1142,31 @@ mod tests {
             binary: PathBuf::from("/opt/Asylum %bin/asylum"),
             config: PathBuf::from("/tmp/asylum config/config%.toml"),
             log: PathBuf::from("/tmp/asylum logs/asylum%.log"),
+            path: None,
         };
         let unit = render_systemd_unit(&config);
         assert!(unit.contains("\"/opt/Asylum %%bin/asylum\""));
         assert!(unit.contains("\"/tmp/asylum config/config%%.toml\""));
         assert!(unit.contains("StandardOutput=append:/tmp/asylum\\x20logs/asylum%%.log"));
         assert!(unit.contains("StandardError=append:/tmp/asylum\\x20logs/asylum%%.log"));
+    }
+
+    #[test]
+    fn systemd_renderer_emits_path_environment_when_set() {
+        let config = ServiceRenderConfig {
+            binary: PathBuf::from("/usr/local/bin/asylum"),
+            config: PathBuf::from("/tmp/asylum/config.toml"),
+            log: PathBuf::from("/tmp/asylum/logs/asylum.log"),
+            path: Some("/home/user/.local/bin:/usr/bin:/bin".to_string()),
+        };
+        let unit = render_systemd_unit(&config);
+        assert!(unit.contains("Environment=PATH=/home/user/.local/bin:/usr/bin:/bin\n"));
+    }
+
+    #[test]
+    fn systemd_renderer_omits_path_environment_when_none() {
+        let unit = render_systemd_unit(&render_config());
+        assert!(!unit.contains("Environment=PATH="));
     }
 
     #[test]

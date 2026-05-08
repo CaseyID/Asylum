@@ -11,12 +11,13 @@ use asylum_types::api::{
     ChannelCreateRequest, ChannelDescriptor, ChannelInboundRequest, ChannelListResponse,
     ChannelMessagesResponse, ChannelTestRequest, ChannelTestResponse, ChannelUpdateRequest,
     CreateNodeRequest, DecisionCreateRequest, DecisionListResponse, DecisionRecord,
-    DecisionResolveRequest, ForkNodeRequest, GraphGetResponse, HealthResponse, HookCreateRequest,
-    HookEventCatalogResponse, HookFiringsResponse, HookListResponse, HookRule, HookTestResponse,
-    LaunchPacketResponse, NativeAttachResponse, NodeCreateResponse, NodeEventsResponse,
-    NodeInspectResponse, NodeListResponse, NotificationsResponse, RecipeListResponse,
-    RecipeSpawnRequest, RecipeSpawnResponse, RelationshipCreateRequest, RelationshipResponse,
-    RemoteCommandRequest, RemoteCommandResponse, SendInputRequest, TokenIssueResponse,
+    DecisionResolveRequest, ForkNodeRequest, GraphGetResponse, HarnessDescriptorResponse,
+    HealthResponse, HookCreateRequest, HookEventCatalogResponse, HookFiringsResponse,
+    HookListResponse, HookRule, HookTestResponse, LaunchPacketResponse, NativeAttachResponse,
+    NodeCreateResponse, NodeEventsResponse, NodeInspectResponse, NodeListResponse,
+    NotificationsResponse, RecipeListResponse, RecipeSpawnRequest, RecipeSpawnResponse,
+    RelationshipCreateRequest, RelationshipResponse, RemoteCommandRequest, RemoteCommandResponse,
+    SendInputRequest, TokenIssueResponse,
 };
 use asylum_types::node::NodeRecord;
 use asylum_types::relationship::RelationshipRecord;
@@ -379,6 +380,15 @@ impl AsylumClient {
     pub async fn health(&self) -> Result<HealthResponse> {
         self.send_request(reqwest::Method::GET, "/api/health", Option::<&str>::None)
             .await
+    }
+
+    pub async fn harness_descriptors(&self) -> Result<HarnessDescriptorResponse> {
+        self.send_request(
+            reqwest::Method::GET,
+            "/api/harness-descriptors",
+            Option::<&str>::None,
+        )
+        .await
     }
 
     pub async fn is_healthy(&self) -> bool {

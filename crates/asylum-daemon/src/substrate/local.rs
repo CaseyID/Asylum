@@ -24,6 +24,7 @@ pub struct LocalSubstrate {
     runtimes: Arc<RwLock<HashMap<Uuid, LocalRuntime>>>,
     output_sink: Arc<dyn Fn(Uuid, &str) + Send + Sync>,
     decision_sink: Arc<dyn Fn(Uuid, DecisionProtocolRequest) + Send + Sync>,
+    exit_sink: Arc<dyn Fn(Uuid) + Send + Sync>,
 }
 
 impl LocalSubstrate {
@@ -35,6 +36,7 @@ impl LocalSubstrate {
             runtimes: Arc::new(RwLock::new(HashMap::new())),
             output_sink: Arc::new(output_sink),
             decision_sink: Arc::new(|_, _| {}),
+            exit_sink: Arc::new(|_| {}),
         }
     }
 
@@ -47,6 +49,21 @@ impl LocalSubstrate {
             runtimes: Arc::new(RwLock::new(HashMap::new())),
             output_sink: Arc::new(output_sink),
             decision_sink: Arc::new(decision_sink),
+            exit_sink: Arc::new(|_| {}),
+        }
+    }
+
+    pub fn new_with_sinks<F, D, E>(output_sink: F, decision_sink: D, exit_sink: E) -> Self
+    where
+        F: Fn(Uuid, &str) + Send + Sync + 'static,
+        D: Fn(Uuid, DecisionProtocolRequest) + Send + Sync + 'static,
+        E: Fn(Uuid) + Send + Sync + 'static,
+    {
+        Self {
+            runtimes: Arc::new(RwLock::new(HashMap::new())),
+            output_sink: Arc::new(output_sink),
+            decision_sink: Arc::new(decision_sink),
+            exit_sink: Arc::new(exit_sink),
         }
     }
 
@@ -77,6 +94,8 @@ impl LocalSubstrate {
         let node_id = ctx.node_id;
         let sink = self.output_sink.clone();
         let decision_sink = self.decision_sink.clone();
+        let exit_sink = self.exit_sink.clone();
+        let runtimes_for_exit = self.runtimes.clone();
         let writer_arc: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(writer));
         let (output_tx, _) = broadcast::channel(1024);
         let output_tx_for_reader = output_tx.clone();
@@ -101,7 +120,9 @@ impl LocalSubstrate {
                     Ok(0) => break,
                     Ok(size) => {
                         let chunk = String::from_utf8_lossy(&buffer[..size]).to_string();
-                        for event in ingester.ingest(&chunk) {
+                        let line_events = ingester.ingest(&chunk);
+                        let partial_events = ingester.flush_partial();
+                        for event in line_events.into_iter().chain(partial_events) {
                             match event {
                                 StdoutDecisionIngestionEvent::OutputText(text) => {
                                     sink(node_id, &text);
@@ -128,6 +149,14 @@ impl LocalSubstrate {
                 }
             }
             let _ = local_child.wait();
+            // Harness exited (either on its own or via stop()); drop the runtime
+            // so the daemon's view stays consistent and notify the capability
+            // service so it can transition liveness.
+            let runtimes_clone = runtimes_for_exit.clone();
+            tokio::runtime::Handle::current().spawn(async move {
+                runtimes_clone.write().await.remove(&node_id);
+            });
+            (exit_sink)(node_id);
         });
 
         Ok(())
