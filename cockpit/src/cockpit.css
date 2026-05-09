@@ -428,33 +428,6 @@ select.input {
   background: linear-gradient(to bottom, transparent, var(--bg-sunken));
 }
 
-/* attach preview card */
-.attach-preview {
-  border: 1px solid var(--border); background: var(--bg-elev);
-  margin: 6px 0; overflow: hidden;
-}
-.attach-preview .h {
-  padding: 6px 10px; border-bottom: 1px solid var(--border-subtle);
-  font-size: 11px; color: var(--fg-muted);
-  display: flex; align-items: center; gap: 8px;
-}
-.attach-preview .body {
-  padding: 12px; background: var(--bg-sunken);
-  font-size: 11px; color: var(--fg-muted); line-height: 1.5;
-  max-height: 140px; overflow: hidden; position: relative;
-}
-.attach-preview .body::after {
-  content: ""; position: absolute; bottom: 0; left: 0; right: 0; height: 40px;
-  background: linear-gradient(to bottom, transparent, var(--bg-sunken));
-  pointer-events: none;
-}
-.attach-preview .body .x { color: var(--status-running); }
-.attach-preview .body .b { color: var(--fg); }
-.attach-preview .foot {
-  padding: 6px 10px; border-top: 1px solid var(--border-subtle);
-  display: flex; gap: 6px; align-items: center;
-}
-
 .cc-input {
   display: flex; align-items: stretch;
   border-top: 1px solid var(--border);

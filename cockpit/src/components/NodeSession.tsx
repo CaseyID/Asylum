@@ -11,7 +11,6 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { Btn } from "../lib/ui";
 import { ToolCall } from "../lib/ui";
-import { Icon } from "../lib/icons";
 import { isCommandCenter, shortNodeId, uptimeLabel } from "../lib/glyphs";
 import { postNodeInput, openNodeObserveSocket } from "../api";
 import type { AsylumNode } from "../types";
@@ -23,8 +22,6 @@ export type SessionMode = "cockpit" | "fullscreen";
 export interface NodeSessionProps {
   node: AsylumNode;
   mode?: SessionMode;
-  onAttach?: (nodeId: string) => void;
-  onNativeAttach?: (nodeId: string) => void;
   onInterrupt?: (nodeId: string) => void;
   onExpand?: () => void;
 }
@@ -37,7 +34,6 @@ type TranscriptEntry =
   | { kind: "text"; text: string; id?: string }
   | { kind: "list"; items: string[] }
   | { kind: "tool"; name: string; args?: Record<string, unknown>; output?: string; state?: "ok" | "pending" | "error" }
-  | { kind: "attach"; node: string; url: string }
   | { kind: "sys-line"; text: string }
   | { kind: "prompt" };
 
@@ -86,7 +82,7 @@ function initialTranscript(node: AsylumNode): TranscriptEntry[] {
   const isCC = isCommandCenter(node);
   const harnessId = node.harness === "claude_code" ? "claude-code" : "codex";
   const role = isCC ? "command-center" : (node.role_hint || "worker");
-  const sysLine = `attached to ${shortNodeId(node.id)} · ${harnessId} · ${node.substrate} · workspace ${node.workspace ?? "~/"} · ${role}`;
+  const sysLine = `connected to ${shortNodeId(node.id)} · ${harnessId} · ${node.substrate} · workspace ${node.workspace ?? "~/"} · ${role}`;
   return [
     { kind: "sys-line", text: sysLine },
     { kind: "prompt" },
@@ -97,8 +93,6 @@ function initialTranscript(node: AsylumNode): TranscriptEntry[] {
 export function NodeSession({
   node,
   mode = "cockpit",
-  onAttach,
-  onNativeAttach,
   onInterrupt,
   onExpand,
 }: NodeSessionProps): ReactElement {
@@ -243,7 +237,7 @@ export function NodeSession({
         if (data === WS_LIVE_UNAVAILABLE) {
           liveDisabledRef.current = true;
           const message = node.substrate === "loon"
-            ? "Loon nodes do not stream local PTY-style live observe output; use attach for an interactive session"
+            ? "Loon nodes do not stream local PTY-style live observe output; open the node session for an interactive terminal"
             : "live streaming not supported by this substrate";
           termRef.current?.write(`\r\n· ${message}\r\n`);
           setEntries(p => [...p, { kind: "sys-line", text: message }]);
@@ -350,9 +344,6 @@ export function NodeSession({
         return;
       }
       case "attach_issued": {
-        const url = typeof body.url === "string" ? body.url : (typeof body.attach_url === "string" ? body.attach_url : "");
-        const targetNode = typeof body.node_id === "string" ? body.node_id : (evt.node_id ?? node.id);
-        setEntries(p => [...p, { kind: "attach", node: targetNode, url }]);
         return;
       }
       default: {
@@ -387,8 +378,6 @@ export function NodeSession({
         mode={mode}
         view={view}
         setView={setView}
-        onAttach={onAttach}
-        onNativeAttach={onNativeAttach}
         onInterrupt={onInterrupt}
         onExpand={onExpand}
       />
@@ -429,8 +418,6 @@ function SessionHeader({
   mode,
   view,
   setView,
-  onAttach,
-  onNativeAttach,
   onInterrupt,
   onExpand,
 }: {
@@ -439,8 +426,6 @@ function SessionHeader({
   mode: SessionMode;
   view: "tui" | "structured";
   setView: (v: "tui" | "structured") => void;
-  onAttach?: (nodeId: string) => void;
-  onNativeAttach?: (nodeId: string) => void;
   onInterrupt?: (nodeId: string) => void;
   onExpand?: () => void;
 }): ReactElement {
@@ -465,19 +450,6 @@ function SessionHeader({
       </span>
 
       <span className="hright">
-        {onAttach && (
-          <Btn
-            kind="ghost"
-            size="sm"
-            icon="external-link"
-            iconOnly
-            title={node.substrate === "loon" ? "open attach tab via loon attach" : "open attach tab"}
-            onClick={() => onAttach(node.id)}
-          />
-        )}
-        {onNativeAttach && (
-          <Btn kind="ghost" size="sm" icon="terminal" iconOnly title="open in terminal" onClick={() => onNativeAttach(node.id)} />
-        )}
         {onInterrupt && (
           <Btn kind="ghost" size="sm" icon="square" iconOnly title="interrupt" onClick={() => onInterrupt(node.id)} />
         )}
@@ -486,7 +458,7 @@ function SessionHeader({
           <button className={view === "structured" ? "on" : ""} onClick={() => setView("structured")} title="structured / semantic">struct</button>
         </div>
         {mode === "cockpit" && onExpand && (
-          <Btn kind="ghost" size="sm" icon="maximize-2" iconOnly title="open in chat" onClick={onExpand} />
+          <Btn kind="ghost" size="sm" icon="maximize-2" iconOnly title="open node workspace" onClick={onExpand} />
         )}
       </span>
     </div>
@@ -572,26 +544,6 @@ function TermEntry({
     }
     return <ToolCall name={e.name} args={e.args} output={e.output} state={e.state} collapsed />;
   }
-  if (e.kind === "attach") {
-    return (
-      <div className="attach-preview">
-        <div className="h">
-          <Icon name="external-link" size={11} />
-          <span>attach tab: <span style={{ color: "var(--fg)" }}>{e.node}</span></span>
-          <span className="right" style={{ marginLeft: "auto", color: "var(--fg-subtle)" }}>time-limited url</span>
-        </div>
-        <div className="body">
-          <span className="muted">{">"}</span> <span className="b">open a time-limited Cockpit attach view for this node</span>{"\n"}
-          <span className="muted">url</span> {e.url}
-        </div>
-        <div className="foot">
-          <Btn size="sm" kind="primary" onClick={() => window.open(e.url, "_blank", "noopener,noreferrer")}>open</Btn>
-          <Btn size="sm" kind="secondary" icon="copy" onClick={() => void navigator.clipboard.writeText(e.url)}>copy url</Btn>
-          <span className="muted mono" style={{ fontSize: 10, marginLeft: "auto" }}>{e.url}</span>
-        </div>
-      </div>
-    );
-  }
   if (e.kind === "sys-line") return <div className="line line-sys">{"·"} {e.text}</div>;
   if (e.kind === "prompt") return null;
   return null;
@@ -661,7 +613,7 @@ function SessionInput({
 }): ReactElement {
   const isCC = isCommandCenter(node);
   const placeholder = isCC
-      ? `send to ${node.id} · try: spawn 2 workers, status, attach to w-9a4f1`
+      ? `send to ${node.id} · try: spawn 2 workers, status, summarize progress`
       : `send input to ${node.id} · this writes directly to its harness stdin`;
 
   return (
