@@ -93,5 +93,17 @@ describe("Inspector parent display", () => {
     );
     expect(getParentValue(container)).toBe("—");
   });
-});
 
+  it("does not expose attach controls", () => {
+    const node = makeNode("worker-abc123");
+    const { queryByText } = render(
+      <Inspector
+        node={node}
+        onAction={vi.fn()}
+        onOpen={vi.fn()}
+      />,
+    );
+
+    expect(queryByText(/^attach$/i)).toBeNull();
+  });
+});

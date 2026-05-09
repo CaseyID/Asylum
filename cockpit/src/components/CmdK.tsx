@@ -8,7 +8,6 @@ export interface CmdKProps {
   onPick: (screen: ScreenId) => void;
   onLaunch: () => void;
   onPickNode: (node: AsylumNode) => void;
-  onAttachInBrowser: () => void;
   onSendRemoteCommand: () => void;
   nodes: AsylumNode[];
 }
@@ -25,7 +24,6 @@ export function CmdK({
   onPick,
   onLaunch,
   onPickNode,
-  onAttachInBrowser,
   onSendRemoteCommand,
   nodes,
 }: CmdKProps): JSX.Element {
@@ -35,12 +33,6 @@ export function CmdK({
       label: "launch new node…",
       icon: "plus",
       action: () => onLaunch(),
-    },
-    {
-      sec: "actions",
-      label: "open attach tab…",
-      icon: "external-link",
-      action: () => onAttachInBrowser(),
     },
     {
       sec: "actions",
