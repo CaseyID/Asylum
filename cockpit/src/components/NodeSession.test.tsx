@@ -68,6 +68,10 @@ describe("NodeSession session semantics", () => {
 
     const { container, queryByText, queryByTitle } = render(<NodeSession node={node()} />);
 
+    await waitFor(() => {
+      expect(onMessage).toBeTypeOf("function");
+    });
+
     onMessage?.(JSON.stringify({
       kind: "attach_issued",
       node_id: "node-session-loop",

@@ -94,8 +94,6 @@ export function CockpitScreen({
               key={panelNode.id}
               node={panelNode}
               mode="cockpit"
-              onAttach={() => onAction("attach")}
-              onNativeAttach={() => onAction("native-attach")}
               onInterrupt={() => onAction("interrupt")}
               onExpand={() => onExpandToChat(panelNode.id)}
             />

@@ -493,8 +493,6 @@ export function App() {
               nodes={graph.nodes}
               chatNodeId={chatNodeId ?? ccNode?.id}
               onSelectChat={setChatNodeId}
-              onAttach={(node) => void handleNodeAction(node, "attach")}
-              onNativeAttach={(node) => void handleNodeAction(node, "native-attach")}
               onInterrupt={(node) => void handleNodeAction(node, "interrupt")}
               onLaunch={() => setScreen("create")}
             />

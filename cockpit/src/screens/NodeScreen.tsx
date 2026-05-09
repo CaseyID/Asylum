@@ -167,8 +167,6 @@ export function NodeScreen({
             key={node.id}
             node={node}
             mode="fullscreen"
-            onAttach={() => fire("attach", "attach link issued")}
-            onNativeAttach={() => fire("native-attach", "terminal attach prepared")}
             onInterrupt={() => fire("interrupt", "sigint sent · paused")}
           />
         )}
