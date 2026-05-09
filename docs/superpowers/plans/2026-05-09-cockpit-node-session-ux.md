@@ -47,7 +47,7 @@ Backend source files should not change in this plan. Existing backend attach tes
 - Modify: `cockpit/src/components/NodeSession.tsx`
 - Modify: `cockpit/src/cockpit.css`
 
-- [ ] **Step 1: Replace NodeSession tests with session UX regression tests**
+- [x] **Step 1: Replace NodeSession tests with session UX regression tests**
 
 Edit `cockpit/src/components/NodeSession.test.tsx`.
 
@@ -142,7 +142,7 @@ describe("NodeSession session semantics", () => {
 });
 ```
 
-- [ ] **Step 2: Run the focused test and verify it fails**
+- [x] **Step 2: Run the focused test and verify it fails**
 
 Run:
 
@@ -152,7 +152,7 @@ npm --prefix cockpit run test -- cockpit/src/components/NodeSession.test.tsx
 
 Expected: FAIL because attach-issued history still renders an attach preview card and the Loon copy still says "use attach".
 
-- [ ] **Step 3: Remove attach UI from `NodeSession.tsx`**
+- [x] **Step 3: Remove attach UI from `NodeSession.tsx`**
 
 Edit `cockpit/src/components/NodeSession.tsx`.
 
@@ -233,7 +233,7 @@ to:
 ? `send to ${node.id} · try: spawn 2 workers, status, summarize progress`
 ```
 
-- [ ] **Step 4: Remove unused attach-preview CSS**
+- [x] **Step 4: Remove unused attach-preview CSS**
 
 Delete the `.attach-preview` block from `cockpit/src/cockpit.css`.
 
@@ -245,7 +245,7 @@ The block starts at the comment:
 
 and includes all `.attach-preview`, `.attach-preview .h`, `.attach-preview .body`, `.attach-preview .body::after`, `.attach-preview .body .x`, `.attach-preview .body .b`, and `.attach-preview .foot` rules.
 
-- [ ] **Step 5: Run the focused test and verify it passes**
+- [x] **Step 5: Run the focused test and verify it passes**
 
 Run:
 
@@ -255,7 +255,7 @@ npm --prefix cockpit run test -- cockpit/src/components/NodeSession.test.tsx
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit Task 1**
+- [x] **Step 6: Commit Task 1**
 
 Run:
 
@@ -276,7 +276,7 @@ git commit -m "cockpit: make node session direct"
 - Modify: `cockpit/src/screens/NodeScreen.tsx`
 - Modify: `cockpit/src/App.tsx`
 
-- [ ] **Step 1: Add Inspector regression coverage**
+- [x] **Step 1: Add Inspector regression coverage**
 
 Append this test to `cockpit/src/components/Inspector.test.tsx`:
 
@@ -300,7 +300,7 @@ describe("Inspector node session controls", () => {
 });
 ```
 
-- [ ] **Step 2: Add Cmd-K regression coverage**
+- [x] **Step 2: Add Cmd-K regression coverage**
 
 Create `cockpit/src/components/CmdK.test.tsx`:
 
@@ -356,7 +356,7 @@ describe("CmdK node session actions", () => {
 });
 ```
 
-- [ ] **Step 3: Run focused tests and verify they fail**
+- [x] **Step 3: Run focused tests and verify they fail**
 
 Run:
 
@@ -366,7 +366,7 @@ npm --prefix cockpit run test -- cockpit/src/components/Inspector.test.tsx cockp
 
 Expected: FAIL because Inspector still renders `attach`, capability grids still show `browser_attach` and `native_attach`, and `CmdK` still requires and renders `onAttachInBrowser`.
 
-- [ ] **Step 4: Remove attach from Inspector**
+- [x] **Step 4: Remove attach from Inspector**
 
 Edit `cockpit/src/components/Inspector.tsx`.
 
@@ -397,7 +397,7 @@ const CAPABILITY_KEYS: (keyof CapabilitySnapshot)[] = [
 
 Delete the primary `attach` button from the controls block. The first controls should be `send input`, `interrupt`, and `fork`.
 
-- [ ] **Step 5: Remove attach from Cmd-K**
+- [x] **Step 5: Remove attach from Cmd-K**
 
 Edit `cockpit/src/components/CmdK.tsx`.
 
@@ -427,7 +427,7 @@ Delete this base item:
 },
 ```
 
-- [ ] **Step 6: Remove attach/native props from screens**
+- [x] **Step 6: Remove attach/native props from screens**
 
 Edit `cockpit/src/screens/CockpitScreen.tsx`.
 
@@ -509,7 +509,7 @@ const rows: [string, boolean][] = [
 ];
 ```
 
-- [ ] **Step 7: Remove attach/native action handling from App**
+- [x] **Step 7: Remove attach/native action handling from App**
 
 Edit `cockpit/src/App.tsx`.
 
@@ -568,7 +568,7 @@ const raw = window.prompt(
 );
 ```
 
-- [ ] **Step 8: Run focused tests and verify they pass**
+- [x] **Step 8: Run focused tests and verify they pass**
 
 Run:
 
@@ -578,7 +578,7 @@ npm --prefix cockpit run test -- cockpit/src/components/Inspector.test.tsx cockp
 
 Expected: PASS.
 
-- [ ] **Step 9: Run typecheck/build and fix compile fallout**
+- [x] **Step 9: Run typecheck/build and fix compile fallout**
 
 Run:
 
@@ -588,7 +588,7 @@ npm --prefix cockpit run build
 
 Expected: PASS. If TypeScript reports prop or union mismatches, update the call site rather than reintroducing attach actions.
 
-- [ ] **Step 10: Commit Task 2**
+- [x] **Step 10: Commit Task 2**
 
 Run:
 
@@ -606,7 +606,7 @@ git commit -m "cockpit: remove attach actions"
 - Modify: `cockpit/src/screens/SettingsScreen.tsx`
 - Modify: `cockpit/src/App.test.tsx`
 
-- [ ] **Step 1: Add visible-copy regression test**
+- [x] **Step 1: Add visible-copy regression test**
 
 Create `cockpit/src/cockpit-copy-regression.test.ts`:
 
@@ -659,7 +659,7 @@ describe("Cockpit user-facing node session copy", () => {
 });
 ```
 
-- [ ] **Step 2: Run the copy regression test and verify it fails**
+- [x] **Step 2: Run the copy regression test and verify it fails**
 
 Run:
 
@@ -669,7 +669,7 @@ npm --prefix cockpit run test -- cockpit/src/cockpit-copy-regression.test.ts
 
 Expected: FAIL because FirstRun, Settings, Channels, App, and NodeSession/NodeScreen still contain visible attach phrases until the remaining cleanup lands.
 
-- [ ] **Step 3: Update first-run onboarding copy**
+- [x] **Step 3: Update first-run onboarding copy**
 
 Edit `cockpit/src/screens/FirstRunScreen.tsx`.
 
@@ -687,7 +687,7 @@ to:
 ["receive ntfy", "remote command channel - reply with `approve`, `status`, `retry`"],
 ```
 
-- [ ] **Step 4: Update channel reply placeholder**
+- [x] **Step 4: Update channel reply placeholder**
 
 Edit `cockpit/src/screens/ChannelsScreen.tsx`.
 
@@ -703,7 +703,7 @@ to:
 <input value={replies} onChange={(e) => setReplies(e.target.value)} placeholder="approve, deny, status" />
 ```
 
-- [ ] **Step 5: Update settings exposure warning**
+- [x] **Step 5: Update settings exposure warning**
 
 Edit `cockpit/src/screens/SettingsScreen.tsx`.
 
@@ -719,7 +719,7 @@ to:
 exposing asylum beyond localhost reveals session URLs and node transcripts. require pairing + tailscale.
 ```
 
-- [ ] **Step 6: Update App tests to stop mocking removed UI actions**
+- [x] **Step 6: Update App tests to stop mocking removed UI actions**
 
 Edit `cockpit/src/App.test.tsx`.
 
@@ -732,7 +732,7 @@ requestNativeTarget: vi.fn(),
 
 The goal is to avoid Cockpit UI tests reinforcing removed user-facing actions.
 
-- [ ] **Step 7: Run copy regression and app tests**
+- [x] **Step 7: Run copy regression and app tests**
 
 Run:
 
@@ -742,7 +742,7 @@ npm --prefix cockpit run test -- cockpit/src/cockpit-copy-regression.test.ts coc
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit Task 3**
+- [x] **Step 8: Commit Task 3**
 
 Run:
 
@@ -757,7 +757,7 @@ git commit -m "cockpit: guard session terminology"
 - Modify: `docs/specs/asylum-current-product-spec.md`
 - Modify: `docs/superpowers/plans/2026-05-09-cockpit-node-session-ux.md`
 
-- [ ] **Step 1: Update product definition and goals**
+- [x] **Step 1: Update product definition and goals**
 
 Edit `docs/specs/asylum-current-product-spec.md`.
 
@@ -773,7 +773,7 @@ Change the goals bullet:
 - Let humans open node sessions, inspect, send input, interrupt, stop, archive, fork, and relate nodes.
 ```
 
-- [ ] **Step 2: Update Cockpit requirements**
+- [x] **Step 2: Update Cockpit requirements**
 
 In the Cockpit requirements table, change `COCKPIT-006` acceptance to:
 
@@ -799,7 +799,7 @@ Change `COCKPIT-017` acceptance to:
 No Tweaks panel, `simSpeed`, canned `runResponse`, hardcoded demo nodes, fake settings, fake logs, fake attach preview output, visible attach workflow, or no-op buttons ship in `cockpit/src`.
 ```
 
-- [ ] **Step 3: Update prototype workflow intent**
+- [x] **Step 3: Update prototype workflow intent**
 
 Change `PROTO-002` acceptance to:
 
@@ -809,11 +809,11 @@ Launch command center, observe graph, inspect nodes, open node sessions, remote 
 
 Leave backend transport references such as `/api/attach/{token}/ws`, signed attach URLs, `node.attach.browser`, `node.attach.native_target`, and Loon `attach` contract names in place when the spec is describing daemon/API compatibility or security internals.
 
-- [ ] **Step 4: Mark completed plan checkboxes**
+- [x] **Step 4: Mark completed plan checkboxes**
 
 As each task lands, update this plan's checkboxes from `- [ ]` to `- [x]` for the completed steps in `docs/superpowers/plans/2026-05-09-cockpit-node-session-ux.md`.
 
-- [ ] **Step 5: Commit Task 4**
+- [x] **Step 5: Commit Task 4**
 
 Run:
 

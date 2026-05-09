@@ -32,7 +32,7 @@ Older handoffs, reviews, and plans are historical unless this spec or `AGENTS.md
 
 ## Product Definition
 
-Asylum is a single-user, always-on control plane for real agent harness sessions. It does not replace Codex, Claude Code, Pi, Hermes, Loon, or any other harness/substrate. It launches harnesses, gives them shared context and capabilities, observes them, lets humans attach or intervene, and lets harnesses coordinate with each other through a common daemon-owned capability surface.
+Asylum is a single-user, always-on control plane for real agent harness sessions. It does not replace Codex, Claude Code, Pi, Hermes, Loon, or any other harness/substrate. It launches harnesses, gives them shared context and capabilities, observes them, lets humans open live node sessions and intervene, and lets harnesses coordinate with each other through a common daemon-owned capability surface.
 
 The core product object is the **Node**: a live or resumable harness session running on a substrate. A node can have a role hint such as `command-center`, `supervisor`, `worker`, `evaluator`, or `assistant`, but role hints are not workflow states.
 
@@ -49,7 +49,7 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
 - Make the graph of nodes the primary mental model.
 - Provide Cockpit as the primary first-party UI.
 - Provide CLI, HTTP/WebSocket, MCP, hooks, notifications, and remote-command entrypoints over the same root capabilities.
-- Let humans attach, inspect, send input, interrupt, stop, archive, fork, and relate nodes.
+- Let humans open node sessions, inspect, send input, interrupt, stop, archive, fork, and relate nodes.
 - Let nodes and operators send notifications, receive inbound channel messages, and route explicit remote commands.
 - Keep Asylum single-user, localhost-first, and Loon-independent.
 
@@ -242,18 +242,18 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
 | COCKPIT-003 | Cockpit supports first-run empty state. | With zero nodes, it explains the product succinctly and offers launching a real command-center node. |
 | COCKPIT-004 | Cockpit launch flow creates real nodes. | Harness/substrate/role/workspace/prompt/recipe choices call daemon APIs and display errors honestly. |
 | COCKPIT-005 | Cockpit command-center chat is a real node session. | The inline panel sends input to the selected command-center node and observes its output/events; it is not a custom chatbot. |
-| COCKPIT-006 | Cockpit can focus any node session. | Selecting a graph/table/chat rail node can show its real session, metadata, events, capabilities, and relationships. |
+| COCKPIT-006 | Cockpit can focus any node session. | Selecting a graph/table/chat rail node focuses its real session and can show metadata, events, capabilities, and relationships without a separate attach action. |
 | COCKPIT-007 | Cockpit graph layouts are usable and truthful. | Tree/free/force/swimlane layouts are derived from real node/relationship/substrate data and support pan/zoom. |
 | COCKPIT-008 | Cockpit fleet table is a secondary dense node view. | It supports search/filtering/sorting-style inspection over real node records. |
 | COCKPIT-009 | Cockpit node detail has real tabs. | Session, events, capabilities, relationships, and telemetry tabs display daemon-backed data or honest empty/unsupported states. |
-| COCKPIT-010 | Cockpit controls call real capabilities. | Attach, native attach, send input, interrupt, stop, fork, archive, relationship actions, and recipe actions call daemon APIs and surface errors. |
+| COCKPIT-010 | Cockpit controls call real capabilities. | Send input, interrupt, stop, fork, archive, relationship actions, and recipe actions call daemon APIs and surface errors. Cockpit does not expose attach as a normal user workflow. |
 | COCKPIT-011 | Cockpit logs show real events/notifications. | Logs/telemetry view uses daemon notifications/events and does not claim a unified stream unless backed by one. |
 | COCKPIT-012 | Cockpit channels screen is real. | Channel CRUD, message history, test send, inbound webhook/manual messages, and subscribe details use daemon endpoints. |
 | COCKPIT-013 | Cockpit hooks screen is real. | Hook CRUD, enable/disable, dry run, event catalog, actions, and firing history use daemon endpoints. |
 | COCKPIT-014 | Cockpit settings are real. | Settings display daemon health, version, bind/base URL, database/storage paths and sizes, harness/substrate descriptors, ntfy channels, and token state from APIs. |
-| COCKPIT-015 | Cockpit command palette uses real navigation/actions. | Cmd-K can navigate screens, find nodes, request attach URLs, launch nodes, and send remote commands without fake action paths. |
+| COCKPIT-015 | Cockpit command palette uses real navigation/actions. | Cmd-K can navigate screens, find nodes, launch nodes, and send remote commands without fake action paths. |
 | COCKPIT-016 | Cockpit auth token handling is not persistent browser storage. | Owner token can be hydrated from URL or prompt, held in memory, and stripped from URL after hydration. |
-| COCKPIT-017 | Cockpit contains no prototype mechanics. | No Tweaks panel, `simSpeed`, canned `runResponse`, hardcoded demo nodes, fake settings, fake logs, fake attach preview output, or no-op buttons ship in `cockpit/src`. |
+| COCKPIT-017 | Cockpit contains no prototype mechanics. | No Tweaks panel, `simSpeed`, canned `runResponse`, hardcoded demo nodes, fake settings, fake logs, fake attach preview output, visible attach workflow, or no-op buttons ship in `cockpit/src`. |
 | COCKPIT-018 | Cockpit visual design follows the prototype intent without inheriting prototype data. | It preserves the graph-first layout, compact operational style, mono terminal feel, node inspector, command-center/session focus, and channels/hooks concepts using real data. |
 
 ## Channels, Notifications, Remote Commands, And Hooks
@@ -293,7 +293,7 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
 | ID | Requirement | Acceptance |
 |---|---|---|
 | PROTO-001 | Preserve prototype product intent. | Cockpit remains graph-first, dense, operational, terminal-aware, and node/session-focused. |
-| PROTO-002 | Preserve prototype workflow intent. | Launch command center, observe graph, inspect nodes, attach, remote notifications, channels, hooks, fleet table, and settings are real workflows. |
+| PROTO-002 | Preserve prototype workflow intent. | Launch command center, observe graph, inspect nodes, open node sessions, remote notifications, channels, hooks, fleet table, and settings are real workflows. |
 | PROTO-003 | Reject prototype data mechanics. | `ASYLUM_DATA`, fake nodes, fake Loon regions, fake logs, fake transcripts, fake settings, fake version strings, fake pairing codes, fake OpenAPI/SDK panels, and no-op buttons are not allowed in runtime code. |
 | PROTO-004 | Reject prototype control mechanics. | Tweaks/edit-mode panels, simulation speed, timer-generated fake toasts, canned response animations, and demo-only command parsing are not allowed in runtime code. |
 | PROTO-005 | Prototype-only visual controls must become real preferences or disappear. | Theme, nav collapse, graph layout, and similar UI state are persisted/handled as product UI preferences if retained. |
