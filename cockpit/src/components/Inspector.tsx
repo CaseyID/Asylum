@@ -139,6 +139,7 @@ export function Inspector({ node, onAction, onOpen, relationships }: InspectorPr
           <div className="inspector-actions">
             <Btn
               size="sm"
+              kind="primary"
               icon="message-square"
               onClick={() => onAction("send")}
             >

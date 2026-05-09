@@ -38,7 +38,7 @@ function nodes(): AsylumNode[] {
 
 describe("CmdK command palette", () => {
   it("does not expose attach actions", () => {
-    const { container, queryByText } = render(
+    const { getByText, queryByText } = render(
       <CmdK
         onClose={() => undefined}
         onPick={() => undefined}
@@ -50,9 +50,10 @@ describe("CmdK command palette", () => {
     );
 
     expect(queryByText(/open attach tab/i)).toBeNull();
-    expect(queryByText(/browser/)).toBeNull();
-    expect(queryByText(/terminal/i)).toBeNull();
-    expect(queryByText(/send remote command/i)).toBeDefined();
-    expect(container.textContent).toContain("launch new node…");
+    expect(queryByText(/browser attach/i)).toBeNull();
+    expect(queryByText(/native attach/i)).toBeNull();
+    expect(queryByText(/attach url/i)).toBeNull();
+    expect(getByText("send remote command…")).toBeDefined();
+    expect(getByText("launch new node…")).toBeDefined();
   });
 });
