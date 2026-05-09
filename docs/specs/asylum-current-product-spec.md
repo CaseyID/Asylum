@@ -2,7 +2,7 @@
 
 **Status:** canonical current product contract
 **Date:** 2026-05-05
-**Release context:** latest published release is tracked in [RELEASES.md](../../RELEASES.md). At the time this spec was written, the latest published release was `v0.1.6`.
+**Release context:** latest published release is tracked in [RELEASES.md](../../RELEASES.md). At the time this spec was last cleaned up, the latest published release was `v0.1.10`.
 
 ## Purpose
 
@@ -19,16 +19,17 @@ This is not an implementation plan and not a gap report. The implementation may 
 
 ## Source Authority
 
-This spec reconciles:
+This spec is the consolidated product contract. It replaces older PRDs,
+handoffs, reviews, and dated implementation plans as the live source of truth.
+Those older artifacts are not kept as live docs on this branch; recover them
+from git history only when historical reconstruction is needed.
 
-- Product intent from [docs/prd/asylum-live-v2-prd.md](../prd/asylum-live-v2-prd.md).
-- Current crate, daemon, CLI, and transport shape from [docs/reviews/2026-05-04-asylum-architecture-refactor-spec.md](../reviews/2026-05-04-asylum-architecture-refactor-spec.md).
+This spec should stay aligned with:
+
 - Current release truth from [RELEASES.md](../../RELEASES.md).
 - Current agent/product principles from [AGENTS.md](../../AGENTS.md).
-- Cockpit intent from [cockpit/prototype/README.md](../../cockpit/prototype/README.md) and the uploaded prototype source.
+- Cockpit intent from [cockpit/prototype/README.md](../../cockpit/prototype/README.md) where it describes product feel rather than prototype mechanics.
 - Current implementation surfaces in `crates/`, `cockpit/src/`, and `scripts/`.
-
-Older handoffs, reviews, and plans are historical unless this spec or `AGENTS.md` explicitly carries the rule forward.
 
 ## Product Definition
 
@@ -98,7 +99,7 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
                                        |   |   |
                                        v   v   v
                               Asylum daemon capabilities
-                       nodes / graph / attach / channels / hooks
+                       nodes / graph / session transport / channels / hooks
                                       / storage / auth
                                        |
                                        v
@@ -185,13 +186,13 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
 |---|---|---|
 | HARN-001 | Codex and Claude Code are supported harnesses. | Config exposes the command for each; descriptors show availability/capabilities; create-node can launch both when commands exist. |
 | HARN-002 | Harness adapters are real process/control adapters, not simulations. | Local launch starts the configured CLI process in a PTY; Loon launch uses Loon control contracts. |
-| HARN-003 | Launch context is Asylum-aware. | New nodes receive node ID, role hint, graph/capability context, attach/control instructions, and relevant workspace/substrate metadata in the best supported way for that harness/substrate. |
+| HARN-003 | Launch context is Asylum-aware. | New nodes receive node ID, role hint, graph/capability context, session/control instructions, and relevant workspace/substrate metadata in the best supported way for that harness/substrate. |
 | HARN-004 | Optional harness capabilities are advertised per adapter. | Structured events, tool-call telemetry, transcript export, native resume, subagent visibility, permission prompts, and context telemetry are shown only when actually supported. |
-| SUB-001 | Local substrate supports real PTY launch/control. | Local nodes can launch, stream output, receive input, interrupt, stop, and attach through browser/native paths. |
+| SUB-001 | Local substrate supports real PTY launch/control. | Local nodes can launch, stream output, receive input, interrupt, stop, and connect through browser/native compatibility paths. |
 | SUB-002 | Loon is optional and independent. | Asylum works without Loon; enabling Loon uses configured endpoint/CLI/auth/cert settings without coupling Asylum core to Loon internals. |
-| SUB-003 | Loon-backed nodes use the documented Loon CLI/control contract. | Launch/input/interrupt/stop/archive/attach use `loon` operations or return clear errors when unavailable. |
+| SUB-003 | Loon-backed nodes use the documented Loon CLI/control contract. | Launch/input/interrupt/stop/archive/session relay use `loon` operations or return clear errors when unavailable. |
 | SUB-004 | Loon health/capacity is visible. | Cockpit/API show Loon status, running count, supported harness profiles, and honest unsupported capability flags. |
-| SUB-005 | Loon-backed attach and observe semantics are honest. | If browser attach shells through `loon attach` or live observe cannot stream like local PTY output, UI/API say so rather than pretending parity. |
+| SUB-005 | Loon-backed session relay and observe semantics are honest. | If browser session relay differs from local PTY output, UI/API say so rather than pretending parity. |
 
 ## Root Capabilities And API
 
@@ -207,7 +208,7 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
 | CAP-008 | Notification/channel capabilities exist. | Clients can list/create/update/delete channels, list messages, send test messages, record inbound messages, and send notifications. |
 | CAP-009 | Hook capabilities exist. | Clients can list/create/update/delete hooks, list event catalog, dry-run hooks, and inspect firings. |
 | CAP-010 | Token capabilities exist where safe. | API/CLI can issue, list, revoke, and rotate owner tokens; MCP does not expose token management. |
-| CAP-011 | Remote command capabilities exist. | Authenticated remote commands can request status, issue attach URLs, send input, start nodes, interrupt, stop, approve, and deny decisions. |
+| CAP-011 | Remote command capabilities exist. | Authenticated remote commands can request status, issue signed session URLs, send input, start nodes, interrupt, stop, approve, and deny decisions. |
 | CAP-012 | Unsupported capabilities fail clearly. | A missing harness/substrate/channel feature returns an explicit unsupported/unavailable error and is not hidden behind a successful no-op. |
 
 ## CLI Requirements
@@ -216,7 +217,7 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
 |---|---|---|
 | CLI-001 | The CLI is the primary local operator interface. | A user can operate Asylum from `asylum` without needing Cockpit. |
 | CLI-002 | CLI lifecycle commands are complete. | `setup`, `cockpit`, `start`, `stop`, `restart`, `status`, `doctor`, `logs`, `update`, `uninstall`, `daemon run`, `config init`, `config show`, and `service generate` work and are documented in help. |
-| CLI-003 | CLI node commands cover core node operations. | Create/list/inspect/send/interrupt/stop/archive/attach work through daemon capabilities. |
+| CLI-003 | CLI node commands cover core node operations. | Create/list/inspect/send/interrupt/stop/archive and session compatibility commands work through daemon capabilities. |
 | CLI-004 | CLI graph commands expose graph state and relationship management. | `graph get` and relationship create/list/remove commands work through daemon capabilities. |
 | CLI-005 | CLI token and notification commands exist. | Operators can issue tokens and send notifications from terminal. |
 | CLI-006 | CLI can reach all root capabilities practical for a terminal. | Terminal commands exist for channels, hooks, recipes, relationships, fork, and remote commands, or the capability has a clear terminal-inapplicable rationale in this spec. |
@@ -253,7 +254,7 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
 | COCKPIT-014 | Cockpit settings are real. | Settings display daemon health, version, bind/base URL, database/storage paths and sizes, harness/substrate descriptors, ntfy channels, and token state from APIs. |
 | COCKPIT-015 | Cockpit command palette uses real navigation/actions. | Cmd-K can navigate screens, find nodes, launch nodes, and send remote commands without fake action paths. |
 | COCKPIT-016 | Cockpit auth token handling is not persistent browser storage. | Owner token can be hydrated from URL or prompt, held in memory, and stripped from URL after hydration. |
-| COCKPIT-017 | Cockpit contains no prototype mechanics. | No Tweaks panel, `simSpeed`, canned `runResponse`, hardcoded demo nodes, fake settings, fake logs, fake attach preview output, visible attach workflow, or no-op buttons ship in `cockpit/src`. |
+| COCKPIT-017 | Cockpit contains no prototype mechanics. | No Tweaks panel, `simSpeed`, canned `runResponse`, hardcoded demo nodes, fake settings, fake logs, fake session preview output, visible attach workflow, or no-op buttons ship in `cockpit/src`. |
 | COCKPIT-018 | Cockpit visual design follows the prototype intent without inheriting prototype data. | It preserves the graph-first layout, compact operational style, mono terminal feel, node inspector, command-center/session focus, and channels/hooks concepts using real data. |
 
 ## Channels, Notifications, Remote Commands, And Hooks
@@ -263,7 +264,7 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
 | CHAN-001 | ntfy is the baseline notification channel. | Configured ntfy can send outbound notifications and subscribe to inbound JSON stream messages. |
 | CHAN-002 | Inbound channel messages are durable. | Inbound ntfy/webhook/manual messages create `channel_messages` records with direction `in` and fire `channel.inbound` hook events. |
 | CHAN-003 | Channel messages can target nodes when appropriate. | Reply correlation or explicit node addressing can associate inbound messages with the intended node. |
-| CHAN-004 | Remote replies can control Asylum. | Authenticated inbound/remote commands can request status, request attach links, send input, start nodes, interrupt, stop, approve, and deny decisions. |
+| CHAN-004 | Remote replies can control Asylum. | Authenticated inbound/remote commands can request status, request signed session links, send input, start nodes, interrupt, stop, approve, and deny decisions. |
 | CHAN-005 | Raw node replies are routed without Rust-side intelligence. | When a message is correlated to a node as input, Asylum routes bytes/text to the node and lets the harness interpret meaning. |
 | CHAN-006 | Channel screens are honest about unsupported adapters. | SMS, Discord, Slack, email, or other adapters may appear only as clearly non-live/not-configured entries unless backed by real daemon behavior. |
 | NOTIFY-001 | Notifications are durable and readable. | Notifications can be listed, marked read, displayed in Cockpit, and associated with nodes when applicable. |
@@ -303,7 +304,7 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
 | ID | Requirement | Acceptance |
 |---|---|---|
 | DOC-001 | README describes current install/run behavior. | It names `asylum daemon run`, `asylum service generate`, latest command shape, socket/HTTP split, and current release/build expectations. |
-| DOC-002 | PRD-style docs point to this spec as current truth. | Older PRDs/reviews/handoffs are clearly historical or intent evidence when they conflict. |
+| DOC-002 | Current docs point to this spec as product truth. | Live docs do not require agents to reconcile stale PRDs, handoffs, reviews, or dated plans before acting. |
 | DOC-003 | User-facing docs do not preserve stale command names. | No live docs instruct users to run `asylum serve` or `asylum install systemd|launchd`. |
 | DOC-004 | Release docs distinguish main from published. | Delivery docs include release status when they represent a delivery cycle; doc-only specs state no release needed. |
 | DOC-005 | Known product limitations are explicit. | Unsupported adapters, local-vs-Loon observe differences, advisory token scopes, and auth exposure posture are not hidden. |
