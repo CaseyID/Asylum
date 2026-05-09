@@ -233,7 +233,7 @@ function NetSettings({ health }: { health: HealthResponse | null }) {
           color: "var(--status-waiting)",
         }}
       >
-        exposing asylum beyond localhost reveals attach urls and node transcripts. require pairing + tailscale.
+        exposing asylum beyond localhost reveals session URLs and node transcripts. require pairing + tailscale.
       </div>
     </Panel>
   );

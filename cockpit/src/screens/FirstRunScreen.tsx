@@ -16,8 +16,8 @@ const STEPS: [string, string][] = [
   ["ask it to spawn workers", '"refactor the router with 2 workers on loon-us-west"'],
   ["watch the graph", "spawned nodes appear as supervisor / worker cards with explicit edges"],
   ["inspect any node", "live transcript, capability matrix"],
-  ["open attach tab", "real harness ui at any time, no extra install required"],
-  ["receive ntfy", "remote command channel — reply with `approve`, `attach`, `retry`"],
+  ["open node session", "real harness ui or terminal from the node workspace"],
+  ["receive ntfy", "remote command channel - reply with `approve`, `status`, `retry`"],
   ["drive from mcp", "asylum tools available in claude desktop, cursor, anything mcp-capable"],
   ["hand off to loon", "workers boot in firecracker vms — same capability surface"],
 ];

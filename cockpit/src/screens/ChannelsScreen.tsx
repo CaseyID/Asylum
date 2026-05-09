@@ -466,7 +466,7 @@ function InboundMessageModal({
         <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={5} />
       </Field>
       <Field label="quick replies" hint="comma-separated labels">
-        <input value={replies} onChange={(e) => setReplies(e.target.value)} placeholder="approve, deny, attach" />
+        <input value={replies} onChange={(e) => setReplies(e.target.value)} placeholder="approve, deny, status" />
       </Field>
       <Field label="correlation token" hint="optional manual correlation metadata; ntfy reply markers are correlated automatically">
         <input value={correlationToken} onChange={(e) => setCorrelationToken(e.target.value)} />

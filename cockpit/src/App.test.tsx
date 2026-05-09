@@ -31,8 +31,6 @@ const apiMocks = vi.hoisted(() => {
     markNotificationRead: vi.fn(),
     openNodeObserveSocket: vi.fn(),
     postNodeInput: vi.fn(),
-    requestBrowserAttach: vi.fn(),
-    requestNativeTarget: vi.fn(),
     sendRemoteCommand: vi.fn(),
     setStoredOwnerToken: vi.fn(),
     stopNode: vi.fn(),
