@@ -827,7 +827,7 @@ git commit -m "docs: align cockpit session language"
 **Files:**
 - Modify: `docs/superpowers/plans/2026-05-09-cockpit-node-session-ux.md`
 
-- [ ] **Step 1: Run Cockpit tests**
+- [x] **Step 1: Run Cockpit tests**
 
 Run:
 
@@ -837,7 +837,7 @@ npm --prefix cockpit run test
 
 Expected: PASS.
 
-- [ ] **Step 2: Run Cockpit build**
+- [x] **Step 2: Run Cockpit build**
 
 Run:
 
@@ -847,7 +847,7 @@ npm --prefix cockpit run build
 
 Expected: PASS.
 
-- [ ] **Step 3: Run backend attach compatibility tests**
+- [x] **Step 3: Run backend attach compatibility tests**
 
 Run:
 
@@ -857,7 +857,7 @@ cargo test -p asylum-daemon attach
 
 Expected: PASS. Backend attach token plumbing should remain stable even though Cockpit no longer exposes attach as normal UX.
 
-- [ ] **Step 4: Start the dev stack for rendered validation**
+- [x] **Step 4: Start the dev stack for rendered validation**
 
 Run in a long-lived terminal:
 
@@ -867,7 +867,7 @@ cargo dev
 
 Expected: daemon and Cockpit become available at `http://127.0.0.1:7788/`.
 
-- [ ] **Step 5: Open Cockpit with Playwright CLI**
+- [x] **Step 5: Open Cockpit with Playwright CLI**
 
 Run from the Playwright cache output directory:
 
@@ -877,7 +877,7 @@ playwright-cli -s=validator open http://127.0.0.1:7788/ --config=/home/casey/.co
 
 Expected: browser opens Cockpit. If auth is required, provide the owner token through the rendered prompt before continuing.
 
-- [ ] **Step 6: Validate rendered node/session UX**
+- [x] **Step 6: Validate rendered node/session UX**
 
 Run:
 
@@ -899,7 +899,7 @@ Expected:
 
 Use element refs from the snapshot to click a graph node, a fleet row, and the session expand button. Record the exact refs and observations in this plan under the verification notes before committing.
 
-- [ ] **Step 7: Close and clean Playwright scratch**
+- [x] **Step 7: Close and clean Playwright scratch**
 
 Run:
 
@@ -910,7 +910,7 @@ rm -rf /home/casey/.cache/codex-playwright-cli/output/.playwright-cli
 
 Expected: browser session closes and scratch snapshots are removed from the Playwright output directory.
 
-- [ ] **Step 8: Record verification notes**
+- [x] **Step 8: Record verification notes**
 
 Append a short verification note under this task with:
 
@@ -920,7 +920,7 @@ Append a short verification note under this task with:
 - console/network result,
 - any known residual backend attach terminology that remains intentionally internal.
 
-- [ ] **Step 9: Commit verification notes**
+- [x] **Step 9: Commit verification notes**
 
 Run:
 
@@ -929,12 +929,23 @@ git add docs/superpowers/plans/2026-05-09-cockpit-node-session-ux.md
 git commit -m "docs: record session ux verification"
 ```
 
+### Verification Notes - 2026-05-09
+
+- `npm --prefix cockpit run test` passed: 10 test files, 35 tests. Vitest still prints the existing jsdom `HTMLCanvasElement.getContext()` warning from xterm, but no test failed.
+- `npm --prefix cockpit run build` passed. Vite still reports the existing post-minification chunk-size warning.
+- `cargo test -p asylum-daemon attach` passed: 3 tests covering attach token scope/expiry, malformed token rejection, and Loon browser attach transport disclosure.
+- `cargo build -p asylum` passed and produced `target/debug/asylum` for rendered validation.
+- Port `127.0.0.1:7788` was already in use, so rendered validation used a temp daemon on `http://127.0.0.1:7790/` with `ASYLUM_HOME=/tmp/asylum-node-session-smoke`. The smoke daemon used a temp PTY harness command at `/tmp/asylum-node-session-smoke/fake-harness` so no real Codex or Claude job was launched from validation.
+- Empty-state Playwright smoke opened Cockpit at `http://127.0.0.1:7790/`, saw first-run copy using `open node session`, and reported 0 console errors with Cockpit API requests returning 200.
+- Populated-state Playwright smoke created node `f5c3c1df-14e9-4aff-b46c-f970d0d78ae2` through `POST /api/nodes`. The main Cockpit view showed a selected graph node at ref `e120`, the bottom session panel at ref `e130`, the connected session copy at refs `e159`-`e161`, terminal output at refs `e167`-`e177`, session input at ref `e185`, and inspector controls at refs `e245`, `e248`, `e251`, `e256`, and `e258`. No visible browser/native attach or open-in-terminal controls appeared.
+- Two-node graph selection smoke created `alpha smoke node` and `beta smoke node`, clicked `beta smoke node`, and confirmed the main session/inspector switched to node `e47878cd-8de9-4bc8-86b9-0991adb6af5b`. Snapshot refs showed `alpha smoke node` at `e120`, `beta smoke node` at `e130`, selected bottom session panel at `e140`, connected session copy at `e167`-`e170`, and inspector controls at `e255`, `e258`, `e261`, `e266`, and `e268`.
+- Expand validation clicked the `open node workspace` button and landed on the full node workspace/chat view. The workspace showed `every node is a live tui session`, the command-center rail at ref `e127`, the full session panel at ref `e140`, connected session copy at refs `e163`-`e165`, terminal input at ref `e172`, and send box at ref `e212`. No visible attach workflow appeared.
+- Playwright `console error` returned 0 errors in both populated passes. `requests` showed Cockpit API requests returning 200 and no failed Cockpit API calls.
+- Backend attach terminology intentionally remains in compatibility/internal surfaces: `/api/attach/{token}/ws`, daemon attach-token tests, signed session transport language, `node.attach.browser`, `node.attach.native_target`, and Loon attach transport notes. Cockpit no longer presents attach as a normal user workflow.
+- Cleanup completed: Playwright scratch under `/home/casey/.cache/codex-playwright-cli/output/.playwright-cli` was removed, one-off `*.yml`/`*.png` output files were deleted, and `/tmp/asylum-node-session-smoke*` was removed.
+
 ## Release Status
 
-Planned implementation, not released. When implementation lands, update this section to one of:
-
-- `Released as vX.Y.Z` with a GitHub release link and shipped platforms.
-- `On main, not released - awaiting authorization. Last release: v0.1.10 (2026-05-07).`
-- `Doc-only / internal - no release needed. Last release: v0.1.10 (2026-05-07).`
+Implementation branch, not released - awaiting merge and release authorization. Last release: `v0.1.10` (2026-05-07).
 
 See [RELEASES.md](../../RELEASES.md) for the release ledger.
