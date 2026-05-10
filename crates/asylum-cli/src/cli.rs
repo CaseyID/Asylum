@@ -23,8 +23,7 @@ use crate::runtime::RuntimePaths;
 use asylum_types::api::{
     ChannelCreateRequest, ChannelInboundRequest, ChannelTestRequest, ChannelUpdateRequest,
     CreateNodeRequest, DecisionCreateRequest, DecisionResolveRequest, ForkNodeRequest,
-    HealthResponse, HookAction, HookCreateRequest, RecipeSpawnRequest, RelationshipCreateRequest,
-    RemoteCommandRequest,
+    HealthResponse, HookAction, HookCreateRequest, RelationshipCreateRequest, RemoteCommandRequest,
 };
 use asylum_types::config::{AsylumConfig, AsylumFileConfig};
 use asylum_types::security::TokenRequest;
@@ -320,11 +319,6 @@ pub async fn run(action: CliAction) -> Result<()> {
                 let response = client.list_recipes().await?;
                 println!("{}", serde_json::to_string_pretty(&response.recipes)?);
             }
-            RecipeCommand::Spawn(args) => {
-                let (recipe_id, request) = args.into_request();
-                let response = client.spawn_recipe(&recipe_id, request).await?;
-                println!("{}", serde_json::to_string_pretty(&response.node_ids)?);
-            }
         },
         Command::RemoteCommand { command } => {
             let request = RemoteCommandRequest {
@@ -508,7 +502,7 @@ enum Command {
         #[command(subcommand)]
         command: HookCommand,
     },
-    /// List and spawn starter recipes.
+    /// List configured recipes.
     Recipe {
         #[command(subcommand)]
         command: RecipeCommand,
@@ -874,38 +868,8 @@ impl HookCreateArgs {
 
 #[derive(Subcommand)]
 enum RecipeCommand {
+    /// List configured recipes (currently returns an empty list in shipped builds).
     List,
-    Spawn(RecipeSpawnArgs),
-}
-
-#[derive(Args)]
-struct RecipeSpawnArgs {
-    recipe_id: String,
-    #[arg(long)]
-    harness: String,
-    #[arg(long)]
-    substrate: String,
-    #[arg(long)]
-    workspace: Option<String>,
-    #[arg(long)]
-    description: Option<String>,
-    #[arg(long, alias = "role_hint")]
-    role: Option<String>,
-}
-
-impl RecipeSpawnArgs {
-    fn into_request(self) -> (String, RecipeSpawnRequest) {
-        (
-            self.recipe_id,
-            RecipeSpawnRequest {
-                harness: self.harness,
-                substrate: self.substrate,
-                workspace: self.workspace,
-                description: self.description,
-                role_hint: self.role,
-            },
-        )
-    }
 }
 
 #[derive(Subcommand)]
@@ -1677,11 +1641,9 @@ async fn doctor_checks(
             .map(|h| h.available);
         let check = match (local_found, daemon_available) {
             // Both agree: found.
-            (true, Some(true)) | (true, None) => DoctorCheck::new(
-                CheckStatus::Ok,
-                check_name,
-                format!("`{command}` found"),
-            ),
+            (true, Some(true)) | (true, None) => {
+                DoctorCheck::new(CheckStatus::Ok, check_name, format!("`{command}` found"))
+            }
             // Daemon is running and can also find it (may differ from local PATH).
             (false, Some(true)) => DoctorCheck::new(
                 CheckStatus::Ok,
@@ -2735,6 +2697,17 @@ mod tests {
         assert_eq!(cli.config, Some(PathBuf::from("/tmp/config.toml")));
         let cli = Cli::try_parse_from(["asylum", "--config", "/tmp/config.toml", "status"])?;
         assert_eq!(cli.config, Some(PathBuf::from("/tmp/config.toml")));
+        let cli = Cli::try_parse_from(["asylum", "recipe", "list"])?;
+        assert!(matches!(
+            cli.command,
+            Some(Command::Recipe {
+                command: RecipeCommand::List
+            })
+        ));
+        assert!(
+            Cli::try_parse_from(["asylum", "recipe", "spawn"]).is_err(),
+            "recipe spawn command should be hidden while disabled"
+        );
         Ok(())
     }
 

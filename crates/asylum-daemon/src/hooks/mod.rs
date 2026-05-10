@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use asylum_types::api::{HookAction, HookEventCatalogEntry, HookFiringRecord, HookRule};
 use serde_json::Value as JsonValue;
 use tokio::sync::broadcast;
@@ -44,10 +44,10 @@ impl Default for HookEngine {
     }
 }
 
-pub fn rule_from_row(row: HookRow) -> HookRule {
-    let actions: Vec<HookAction> =
-        serde_json::from_str(&row.actions_json).unwrap_or_else(|_| Vec::new());
-    HookRule {
+pub fn rule_from_row(row: HookRow) -> Result<HookRule> {
+    let actions: Vec<HookAction> = serde_json::from_str(&row.actions_json)
+        .with_context(|| format!("failed to decode hook {} actions_json", row.id))?;
+    Ok(HookRule {
         id: row.id,
         name: row.name,
         enabled: row.enabled,
@@ -57,7 +57,7 @@ pub fn rule_from_row(row: HookRow) -> HookRule {
         future: row.future,
         created_at_epoch_secs: row.created_at,
         updated_at_epoch_secs: row.updated_at,
-    }
+    })
 }
 
 pub fn firing_record_from_row(row: HookFiringRow) -> HookFiringRecord {
@@ -332,6 +332,7 @@ pub const SCHEDULE_30M: Duration = Duration::from_secs(1800);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::HookRow;
 
     #[test]
     fn any_filter_matches() {
@@ -368,5 +369,26 @@ mod tests {
         // not silently pass it through.
         let payload = serde_json::json!({});
         assert!(!evaluate_filter("?(?)*", &payload));
+    }
+
+    #[test]
+    fn rule_from_row_requires_valid_actions_json() {
+        let row = HookRow {
+            id: "hook-bad".to_string(),
+            name: "corrupt".to_string(),
+            enabled: true,
+            event: "node.permission_requested".to_string(),
+            filter: "any".to_string(),
+            actions_json: "{".to_string(),
+            future: false,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let error = rule_from_row(row)
+            .expect_err("corrupt actions_json should not decode to empty actions");
+        assert!(error
+            .to_string()
+            .contains("failed to decode hook hook-bad actions_json"));
     }
 }

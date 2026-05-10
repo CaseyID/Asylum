@@ -5,6 +5,7 @@ import {
   createHook,
   deleteHook,
   dryRunHook,
+  fetchRecipes,
   fetchHookEvents,
   fetchHookFirings,
   fetchHooks,
@@ -15,6 +16,7 @@ import type {
   HookEventCatalogEntry,
   HookFiringRecord,
   HookRule,
+  RecipeDescriptor,
 } from "../types";
 
 function fmtTs(epoch: number): string {
@@ -60,12 +62,14 @@ function HookCard({
   onToggle,
   onEdit,
   onDryRun,
+  disabled,
 }: {
   hook: HookRule;
   stats: HookStats;
   onToggle: () => void;
   onEdit: () => void;
   onDryRun: () => void;
+  disabled?: boolean;
 }) {
   return (
     <div className={`hook-card ${hook.enabled ? "" : "off"} ${hook.future ? "future" : ""}`}>
@@ -77,6 +81,7 @@ function HookCard({
             className={`toggle ${hook.enabled ? "on" : ""}`}
             onClick={onToggle}
             title={hook.enabled ? "disable" : "enable"}
+            disabled={disabled}
           >
             <span className="knob" />
           </button>
@@ -117,7 +122,15 @@ function HookCard({
           <span className="lab">last</span> <b>{stats.lastAt}</b>
         </span>
         <span className="stat r">
-          <Btn size="sm" kind="ghost" icon="play" iconOnly title="dry-run" onClick={onDryRun} />
+          <Btn
+            size="sm"
+            kind="ghost"
+            icon="play"
+            iconOnly
+            title="dry-run"
+            onClick={onDryRun}
+            disabled={disabled}
+          />
           <Btn size="sm" kind="ghost" icon="edit-2" iconOnly title="edit" onClick={onEdit} />
         </span>
       </div>
@@ -125,7 +138,11 @@ function HookCard({
   );
 }
 
-const ACTION_KINDS = ["channel", "spawn", "tool", "pause_node", "archive"] as const;
+const BASE_ACTION_KINDS = ["channel", "tool", "pause_node", "archive"];
+
+function actionKinds(allowSpawn: boolean): readonly string[] {
+  return allowSpawn ? [...BASE_ACTION_KINDS, "spawn"] : BASE_ACTION_KINDS;
+}
 
 function HookEditor({
   hookId,
@@ -134,6 +151,7 @@ function HookEditor({
   events,
   onClose,
   onSaved,
+  allowSpawn,
 }: {
   hookId: string;
   presetEvent?: string;
@@ -141,7 +159,9 @@ function HookEditor({
   events: HookEventCatalogEntry[];
   onClose: () => void;
   onSaved: () => Promise<void> | void;
+  allowSpawn: boolean;
 }) {
+  const allowedActionKinds = useMemo(() => actionKinds(allowSpawn), [allowSpawn]);
   const isNew = hookId === "__new";
   const existing = isNew ? null : hooks.find((h) => h.id === hookId) ?? null;
 
@@ -262,11 +282,17 @@ function HookEditor({
                 <span className="step">{i + 1}</span>
                 <select
                   className="input mono"
-                  value={ACTION_KINDS.includes(a.kind as (typeof ACTION_KINDS)[number]) ? a.kind : "channel"}
+                  value={a.kind}
                   onChange={(e) => setAction(i, { kind: e.target.value })}
+                  disabled={!allowedActionKinds.includes(a.kind)}
                   style={{ width: 120 }}
                 >
-                  {ACTION_KINDS.map((k) => (
+                  {!allowedActionKinds.includes(a.kind) && (
+                    <option value={a.kind}>
+                      {`${a.kind} (disabled)`}
+                    </option>
+                  )}
+                  {allowedActionKinds.map((k) => (
                     <option key={k} value={k}>
                       {k}
                     </option>
@@ -294,6 +320,11 @@ function HookEditor({
                   placeholder="template — e.g. {node.id} triggered"
                   style={{ marginLeft: 28 }}
                 />
+              )}
+              {!allowedActionKinds.includes(a.kind) && a.kind === "spawn" && (
+                <div style={{ marginLeft: 28, color: "var(--fg-muted)", fontSize: 11 }}>
+                  spawn is unavailable until recipes are enabled
+                </div>
               )}
             </div>
           ))}
@@ -340,15 +371,24 @@ export function HooksScreen(): JSX.Element {
   const [hooks, setHooks] = useState<HookRule[]>([]);
   const [firings, setFirings] = useState<HookFiringRecord[]>([]);
   const [events, setEvents] = useState<HookEventCatalogEntry[]>([]);
+  const [recipes, setRecipes] = useState<RecipeDescriptor[]>([]);
   const [tab, setTab] = useState<string>("rules");
   const [drawer, setDrawer] = useState<DrawerState | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [busyHookId, setBusyHookId] = useState<string | null>(null);
+
+  function formatError(prefix: string, err: unknown): string {
+    return `${prefix}: ${err instanceof Error ? err.message : String(err)}`;
+  }
 
   async function reloadHooks() {
     try {
       const list = await fetchHooks();
       setHooks(list);
-    } catch {
-      // leave previous state on transient error
+      setLoadError(null);
+    } catch (err) {
+      setLoadError(formatError("failed to reload hooks", err));
     }
   }
 
@@ -356,16 +396,24 @@ export function HooksScreen(): JSX.Element {
     try {
       const list = await fetchHookFirings();
       setFirings(list);
-    } catch {
-      // leave previous state on transient error
+      setLoadError(null);
+    } catch (err) {
+      setLoadError(formatError("failed to reload firings", err));
     }
   }
 
   useEffect(() => {
     reloadHooks();
+    fetchRecipes()
+      .then(setRecipes)
+      .catch(() => {
+        setRecipes([]);
+      });
     fetchHookEvents()
       .then(setEvents)
-      .catch(() => undefined);
+      .catch((err) => {
+        setLoadError(formatError("failed to load event catalog", err));
+      });
   }, []);
 
   useEffect(() => {
@@ -388,21 +436,29 @@ export function HooksScreen(): JSX.Element {
   }, [firings]);
 
   async function toggle(hook: HookRule) {
+    setActionError(null);
+    setBusyHookId(hook.id);
     try {
       const updated = await updateHook(hook.id, { enabled: !hook.enabled });
       setHooks((hs) => hs.map((h) => (h.id === updated.id ? updated : h)));
-    } catch {
-      // swallow — user can retry
+    } catch (err) {
+      setActionError(`toggle failed for ${hook.name}: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setBusyHookId(null);
     }
   }
 
   async function onDryRun(hook: HookRule) {
+    setActionError(null);
+    setBusyHookId(hook.id);
     try {
       const firing = await dryRunHook(hook.id);
       setFirings((cur) => [firing, ...cur]);
       setTab("firings");
-    } catch {
-      // swallow — surface via firings tab on next poll
+    } catch (err) {
+      setActionError(`dry-run failed for ${hook.name}: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setBusyHookId(null);
     }
   }
 
@@ -421,6 +477,9 @@ export function HooksScreen(): JSX.Element {
           </Btn>
         </div>
       </div>
+
+      {loadError && <div className="error">{loadError}</div>}
+      {actionError && <div className="error">{actionError}</div>}
 
       <div className="hooks-tabs">
         {(
@@ -454,9 +513,10 @@ export function HooksScreen(): JSX.Element {
                 key={h.id}
                 hook={h}
                 stats={statsFor(h.id, firings)}
-                onToggle={() => toggle(h)}
+                onToggle={() => void toggle(h)}
                 onEdit={() => setDrawer({ id: h.id })}
-                onDryRun={() => onDryRun(h)}
+                onDryRun={() => void onDryRun(h)}
+                disabled={busyHookId === h.id}
               />
             ))}
           </div>
@@ -520,14 +580,15 @@ export function HooksScreen(): JSX.Element {
       )}
 
       {drawer && (
-        <HookEditor
-          hookId={drawer.id}
-          presetEvent={drawer.presetEvent}
-          hooks={hooks}
-          events={events}
-          onClose={() => setDrawer(null)}
-          onSaved={reloadHooks}
-        />
+              <HookEditor
+                hookId={drawer.id}
+                presetEvent={drawer.presetEvent}
+                hooks={hooks}
+                events={events}
+                allowSpawn={recipes.length > 0}
+                onClose={() => setDrawer(null)}
+                onSaved={reloadHooks}
+              />
       )}
     </div>
   );

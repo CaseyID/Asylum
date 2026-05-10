@@ -126,6 +126,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejects_unsupported_retry_command() {
+        let result =
+            parse_remote_command("retry token=abc node=00000000-0000-0000-0000-000000000000");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported command"));
+    }
+
+    #[test]
     fn parses_status_and_send_input_commands() {
         assert_eq!(
             parse_remote_command("status token=abc").unwrap().kind,

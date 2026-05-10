@@ -21,8 +21,8 @@ pub struct LoonSubstrate {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoonHealth {
     pub status: String,
-    pub running_instances: usize,
-    pub harness_profiles: Vec<String>,
+    pub running_instances: Option<usize>,
+    pub harness_profiles: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -37,12 +37,12 @@ pub fn capability_flags_from_health(
     health: &LoonHealth,
     harness: &HarnessKind,
 ) -> CapabilitySnapshot {
-    let profile_supported = match harness {
-        HarnessKind::Codex => health.harness_profiles.iter().any(|value| value == "codex"),
-        HarnessKind::ClaudeCode => health
-            .harness_profiles
-            .iter()
-            .any(|value| value == "claude_code"),
+    let profile_supported = match &health.harness_profiles {
+        Some(profiles) => match harness {
+            HarnessKind::Codex => profiles.iter().any(|value| value == "codex"),
+            HarnessKind::ClaudeCode => profiles.iter().any(|value| value == "claude_code"),
+        },
+        None => false,
     };
     if !profile_supported {
         return CapabilitySnapshot {
@@ -91,15 +91,18 @@ impl LoonSubstrate {
         if !self.enabled {
             return Ok(LoonHealth {
                 status: "disabled".to_string(),
-                running_instances: 0,
-                harness_profiles: vec![],
+                running_instances: None,
+                harness_profiles: None,
             });
         }
         if let Ok(output) = self.run_cli(vec!["version".to_string()]).await {
+            if let Some(health) = parse_loon_cli_health(&output) {
+                return Ok(health);
+            }
             return Ok(LoonHealth {
-                status: "ok".to_string(),
-                running_instances: parse_instances_running(&output).unwrap_or(0),
-                harness_profiles: vec!["claude_code".to_string()],
+                status: "limited".to_string(),
+                running_instances: None,
+                harness_profiles: None,
             });
         }
 
@@ -112,9 +115,9 @@ impl LoonSubstrate {
             return Err(anyhow!("loon unreachable"));
         }
         Ok(LoonHealth {
-            status: "ok".to_string(),
-            running_instances: 0,
-            harness_profiles: vec!["claude_code".to_string()],
+            status: "limited".to_string(),
+            running_instances: None,
+            harness_profiles: None,
         })
     }
 
@@ -195,8 +198,8 @@ impl LoonSubstrate {
             },
             Err(_) => SubstrateHealth {
                 status: "unavailable".to_string(),
-                running_instances: 0,
-                harness_profiles: vec![],
+                running_instances: None,
+                harness_profiles: None,
             },
         }
     }
@@ -246,6 +249,14 @@ impl LoonSubstrate {
     }
 }
 
+fn parse_loon_cli_health(output: &str) -> Option<LoonHealth> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() || !trimmed.starts_with('{') {
+        return None;
+    }
+    serde_json::from_str::<LoonHealth>(trimmed).ok()
+}
+
 fn parse_spawned_instance_id(output: &str) -> Option<String> {
     output
         .lines()
@@ -254,19 +265,10 @@ fn parse_spawned_instance_id(output: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn parse_instances_running(output: &str) -> Option<usize> {
-    let marker = "instances_running=";
-    let start = output.find(marker)? + marker.len();
-    let number = output[start..]
-        .chars()
-        .take_while(|value| value.is_ascii_digit())
-        .collect::<String>();
-    number.parse().ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn parses_loon_cli_spawn_and_version_output() {
@@ -274,24 +276,50 @@ mod tests {
             parse_spawned_instance_id("00000000-0000-0000-0000-000000000000\trunning\n"),
             Some("00000000-0000-0000-0000-000000000000".to_string())
         );
-        assert_eq!(
-            parse_instances_running("loon-daemon version 0.1.0 (status=ok, instances_running=3)"),
-            Some(3)
-        );
     }
 
     #[test]
-    fn loon_capabilities_do_not_advertise_structured_events_without_event_stream() {
+    fn loon_capabilities_require_known_harness_profiles() {
         let health = LoonHealth {
             status: "ok".to_string(),
-            running_instances: 1,
-            harness_profiles: vec!["codex".to_string()],
+            running_instances: None,
+            harness_profiles: None,
         };
 
         let snapshot = capability_flags_from_health(&health, &HarnessKind::Codex);
 
         assert!(snapshot.browser_attach);
-        assert!(snapshot.send_input);
+        assert!(!snapshot.send_input);
         assert!(!snapshot.structured_events);
+    }
+
+    #[tokio::test]
+    async fn health_reports_version_checks_as_limited_measurement() {
+        let workdir = tempfile::tempdir().expect("tempdir");
+        let script_path = workdir.path().join("loon-version.sh");
+        std::fs::write(&script_path, "#!/bin/sh\nprintf 'loon 0.1.0\\n'\nexit 0\n")
+            .expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)
+                .expect("metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).expect("chmod");
+        }
+
+        let loon = LoonSubstrate::new(
+            "http://127.0.0.1:0",
+            Some(Path::new(&script_path).to_path_buf()),
+            None,
+            None,
+            true,
+        );
+
+        let health = loon.health().await.expect("health");
+        assert_eq!(health.status, "limited");
+        assert!(health.running_instances.is_none());
+        assert!(health.harness_profiles.is_none());
     }
 }

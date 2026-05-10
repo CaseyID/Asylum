@@ -858,10 +858,13 @@ impl Store {
     pub fn mark_notification_read(&self, id: i64) -> Result<()> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let conn = self.conn()?;
-        conn.execute(
+        let affected = conn.execute(
             "UPDATE notifications SET read_at = ?1 WHERE id = ?2",
             params![now, id],
         )?;
+        if affected == 0 {
+            return Err(anyhow::anyhow!("notification not found"));
+        }
         Ok(())
     }
 
@@ -1051,6 +1054,18 @@ impl Store {
             }
             None => Ok(false),
         }
+    }
+
+    pub fn delete_builtin_channels_by_ids(&self, ids: &[&str]) -> Result<usize> {
+        let conn = self.conn()?;
+        let mut deleted = 0usize;
+        for id in ids {
+            deleted += conn
+                .execute("DELETE FROM channels WHERE id = ?1 AND builtin = 1", [id])
+                .map_err(|err| anyhow::anyhow!("failed to delete channel '{id}': {err}"))?
+                as usize;
+        }
+        Ok(deleted)
     }
 
     pub fn list_channel_messages(&self, id: &str, limit: usize) -> Result<Vec<ChannelMessageRow>> {
@@ -1751,6 +1766,47 @@ mod tests {
     }
 
     #[test]
+    fn delete_builtin_channels_by_ids_only_removes_builtin_rows() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_channel(
+                "legacy-fake-builtin",
+                "webhook",
+                "legacy fake",
+                "legacy fake",
+                "outbound",
+                "configured",
+                "from legacy installer",
+                "{}",
+                false,
+                true,
+            )
+            .unwrap();
+        store
+            .upsert_channel(
+                "legacy-fake-custom",
+                "webhook",
+                "legacy custom",
+                "legacy custom",
+                "outbound",
+                "configured",
+                "user custom",
+                "{}",
+                false,
+                false,
+            )
+            .unwrap();
+
+        let removed = store
+            .delete_builtin_channels_by_ids(&["legacy-fake-builtin", "legacy-fake-custom"])
+            .unwrap();
+        assert_eq!(removed, 1);
+
+        assert!(store.get_channel("legacy-fake-builtin").unwrap().is_none());
+        assert!(store.get_channel("legacy-fake-custom").unwrap().is_some());
+    }
+
+    #[test]
     fn channel_reply_correlation_round_trip() {
         let store = Store::open_in_memory().unwrap();
         store
@@ -1838,5 +1894,35 @@ mod tests {
         assert!(!updated.enabled);
         assert!(store.delete_hook("hook-1").unwrap());
         assert!(!store.delete_hook("hook-1").unwrap());
+    }
+
+    #[test]
+    fn mark_notification_read_sets_read_at_when_exists() {
+        let store = Store::open_in_memory().unwrap();
+        let notification_id = store
+            .insert_notification(None, "status", "Ready", "Node is ready")
+            .unwrap();
+        let before = store
+            .list_notifications()
+            .unwrap()
+            .first()
+            .and_then(|notification| notification.6);
+        assert!(before.is_none());
+
+        store.mark_notification_read(notification_id).unwrap();
+
+        let after = store
+            .list_notifications()
+            .unwrap()
+            .first()
+            .and_then(|notification| notification.6);
+        assert!(after.is_some());
+    }
+
+    #[test]
+    fn mark_notification_read_returns_not_found_for_missing_row() {
+        let store = Store::open_in_memory().unwrap();
+        let error = store.mark_notification_read(424242).unwrap_err();
+        assert!(error.to_string().contains("notification not found"));
     }
 }

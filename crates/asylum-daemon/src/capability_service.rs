@@ -1,4 +1,8 @@
-use std::{env, path::Path, sync::{Arc, OnceLock}};
+use std::{
+    env,
+    path::Path,
+    sync::{Arc, OnceLock},
+};
 
 use anyhow::{anyhow, Context, Result};
 use asylum_types::api::{
@@ -14,9 +18,7 @@ use asylum_types::api::{
 use asylum_types::capabilities::CapabilityDescriptor;
 use asylum_types::capabilities::CapabilityName;
 use asylum_types::event::NodeEventKind;
-use asylum_types::node::{
-    CapabilitySnapshot, GraphRecord, HarnessKind, NodeLiveness, SubstrateKind,
-};
+use asylum_types::node::{CapabilitySnapshot, HarnessKind, NodeLiveness, SubstrateKind};
 use asylum_types::relationship::RelationshipKind;
 use asylum_types::security::TokenRequest;
 use serde_json::{json, Value as JsonValue};
@@ -27,8 +29,8 @@ use crate::attach::AttachTokenIssuer;
 use crate::auth::{issue_owner_token, AuthMode};
 use crate::channels::ntfy_inbound::NtfyInboundConfig;
 use crate::channels::{
-    descriptor_from_row, message_record_from_row, ntfy_inbound, render_template, require_channel,
-    seed_builtin_channels, SeedConfig, NTFY_DEFAULT_ID,
+    descriptor_from_row, is_implemented_channel_kind, message_record_from_row, ntfy_inbound,
+    render_template, require_channel, seed_builtin_channels, SeedConfig, NTFY_DEFAULT_ID,
 };
 use crate::decision_ingester::{DecisionProtocolRequest, ASYLUM_DECISION_PROTOCOL};
 use crate::harness::HarnessRegistry;
@@ -46,8 +48,8 @@ use asylum_types::api::{
     ChannelCreateRequest, ChannelDescriptor, ChannelInboundRequest, ChannelListResponse,
     ChannelMessagesResponse, ChannelTestRequest, ChannelTestResponse, ChannelUpdateRequest,
     ForkNodeRequest, HookAction, HookCreateRequest, HookEventCatalogResponse, HookFiringsResponse,
-    HookListResponse, HookRule, HookTestResponse, HookUpdateRequest, RecipeDescriptor,
-    RecipeListResponse, RecipeSpawnRequest, RecipeSpawnResponse,
+    HookListResponse, HookRule, HookTestResponse, HookUpdateRequest, RecipeListResponse,
+    RecipeSpawnRequest, RecipeSpawnResponse,
 };
 use asylum_types::config::{HarnessConfig, LoonConfig};
 use asylum_types::node::NodeRecord;
@@ -227,7 +229,11 @@ impl CapabilityService {
             // Closed (sender dropped) should stop hook processing.
             loop {
                 match rx.recv().await {
-                    Ok(event) => service.process_hook_event(event).await,
+                    Ok(event) => {
+                        if let Err(error) = service.process_hook_event(event).await {
+                            tracing::warn!(error = %error, "failed to process hook event");
+                        }
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(
                             skipped = n,
@@ -328,15 +334,17 @@ impl CapabilityService {
         Ok(())
     }
 
-    async fn process_hook_event(&self, event: HookEvent) {
-        let Ok(rules) = self.store.list_hooks() else {
-            return;
-        };
+    async fn process_hook_event(&self, event: HookEvent) -> Result<()> {
+        let rules = self
+            .store
+            .list_hooks()
+            .context("failed to load hooks for event processing")?;
+        let mut first_error: Option<anyhow::Error> = None;
         for row in rules {
-            let rule = rule_from_row(row);
-            if !rule.enabled || rule.event != event.event {
+            if !row.enabled || row.event != event.event {
                 continue;
             }
+            let row_id = row.id.clone();
             let mut payload = event.payload.clone();
             if let Some(node_id) = event.node_id {
                 if let Some(map) = payload.as_object_mut() {
@@ -350,6 +358,31 @@ impl CapabilityService {
                     }
                 }
             }
+            let rule = match rule_from_row(row) {
+                Ok(rule) => rule,
+                Err(error) => {
+                    let outcome_text = format!("failed to decode hook actions: {error}");
+                    if let Err(insert_error) = self.store.insert_hook_firing(
+                        &row_id,
+                        &event.event,
+                        &outcome_text,
+                        false,
+                        &payload.to_string(),
+                    ) {
+                        tracing::error!(
+                            hook_id = %row_id,
+                            error = %insert_error,
+                            "failed to persist hook firing for decode failure"
+                        );
+                        if first_error.is_none() {
+                            first_error = Some(insert_error.into());
+                        }
+                    } else if first_error.is_none() {
+                        first_error = Some(anyhow::Error::from(error));
+                    }
+                    continue;
+                }
+            };
             if !evaluate_filter(&rule.filter, &payload) {
                 continue;
             }
@@ -359,14 +392,32 @@ impl CapabilityService {
                 Ok(text) => text.clone(),
                 Err(error) => error.to_string(),
             };
-            let _ = self.store.insert_hook_firing(
+            if let Err(error) = &outcome {
+                if first_error.is_none() {
+                    first_error = Some(anyhow::anyhow!("{}", error));
+                }
+            }
+            if let Err(insert_error) = self.store.insert_hook_firing(
                 &rule.id,
                 &event.event,
                 &outcome_text,
                 ok,
                 &payload.to_string(),
-            );
+            ) {
+                tracing::error!(
+                    hook_id = %row_id,
+                    error = %insert_error,
+                    "failed to persist hook firing"
+                );
+                if first_error.is_none() {
+                    first_error = Some(insert_error.into());
+                }
+            }
         }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn execute_hook_actions(&self, rule: &HookRule, payload: &JsonValue) -> Result<String> {
@@ -405,11 +456,20 @@ impl CapabilityService {
                 let rendered_title = render_template(title, payload);
                 let rendered_body = render_template(&template, payload);
                 let node_id = payload_node_id(payload);
-                self.send_via_channel(&channel.id, &rendered_title, &rendered_body, node_id)
+                let sent = self
+                    .send_via_channel(&channel.id, &rendered_title, &rendered_body, node_id)
                     .await?;
+                if !sent {
+                    return Err(anyhow!("failed to send through channel '{}'", channel.id));
+                }
                 Ok(format!("channel:{}", channel.id))
             }
             "spawn" => {
+                if !recipe_spawn_is_enabled() {
+                    return Err(anyhow!(
+                        "hook action kind 'spawn' is unavailable while recipe spawn is disabled"
+                    ));
+                }
                 let target = action.target.clone();
                 let recipe_id = target
                     .strip_prefix("recipe:")
@@ -516,8 +576,17 @@ impl CapabilityService {
             } else {
                 self.send_ntfy(title, body, None, None, None).await?
             }
+        } else if channel.kind == "webhook" {
+            return Err(anyhow!(
+                "channel '{}' is inbound-only and cannot be used for outbound delivery",
+                channel.id
+            ));
         } else {
-            true
+            return Err(anyhow!(
+                "channel '{}' has unsupported outbound kind '{}'",
+                channel.id,
+                channel.kind
+            ));
         };
         let recorded_subject = if sent || channel.kind != "ntfy" {
             title.to_string()
@@ -548,6 +617,25 @@ fn node_id_from_payload(payload: &JsonValue) -> Result<Uuid> {
     Ok(Uuid::parse_str(raw)?)
 }
 
+fn validate_channel_direction(kind: &str, direction: &str) -> Result<()> {
+    match direction {
+        "inbound" | "outbound" | "duplex" => {}
+        _ => {
+            return Err(anyhow!(
+                "unsupported channel direction '{direction}' (supported: inbound, outbound, duplex)"
+            ));
+        }
+    }
+
+    if kind == "webhook" && direction != "inbound" {
+        return Err(anyhow!(
+            "channel kind '{kind}' is inbound-only and cannot use direction '{direction}'"
+        ));
+    }
+
+    Ok(())
+}
+
 fn payload_node_id(payload: &JsonValue) -> Option<Uuid> {
     payload
         .get("node")
@@ -557,6 +645,16 @@ fn payload_node_id(payload: &JsonValue) -> Option<Uuid> {
         .and_then(|raw| Uuid::parse_str(raw).ok())
 }
 
+fn normalize_workspace(workspace: Option<String>) -> Option<String> {
+    workspace.and_then(|value| {
+        if value.trim().is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    })
+}
+
 fn next_channel_reply_token() -> String {
     Uuid::new_v4()
         .to_string()
@@ -564,6 +662,22 @@ fn next_channel_reply_token() -> String {
         .chars()
         .take(CHANNEL_REPLY_TOKEN_LENGTH)
         .collect()
+}
+
+fn launch_prompt_for_runtime(
+    adapter: &dyn crate::harness::HarnessAdapter,
+    node_id: Uuid,
+    request: &CreateNodeRequest,
+) -> String {
+    let context = adapter.launch_context(node_id, request);
+    match request
+        .description
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        Some(desc) => format!("{}\n\nUser launch packet:\n{}", context.trim_end(), desc),
+        None => context,
+    }
 }
 
 impl CapabilityService {
@@ -900,14 +1014,7 @@ impl CapabilityService {
                 CapabilityName::RecipeList,
                 "/api/recipes",
                 "GET",
-                "List starter recipes",
-                true,
-            ),
-            descriptor(
-                CapabilityName::RecipeSpawn,
-                "/api/recipes/{id}/spawn",
-                "POST",
-                "Spawn nodes from a recipe",
+                "List configured launch recipes (currently none in shipped runtime)",
                 true,
             ),
             descriptor(
@@ -921,10 +1028,9 @@ impl CapabilityService {
         CapabilityListResponse { capabilities }
     }
 
-    pub async fn list_nodes(&self) -> NodeListResponse {
-        NodeListResponse {
-            nodes: self.store.list_nodes().unwrap_or_default(),
-        }
+    pub async fn list_nodes(&self) -> Result<NodeListResponse> {
+        let nodes = self.store.list_nodes()?;
+        Ok(NodeListResponse { nodes })
     }
 
     pub async fn inspect_node(&self, id: Uuid) -> Result<NodeInspectResponse> {
@@ -932,26 +1038,21 @@ impl CapabilityService {
         Ok(NodeInspectResponse { node })
     }
 
-    pub async fn node_events(&self, node_id: Uuid) -> NodeEventsResponse {
-        NodeEventsResponse {
-            events: self.store.list_events(node_id).unwrap_or_default(),
-        }
+    pub async fn node_events(&self, node_id: Uuid) -> Result<NodeEventsResponse> {
+        let events = self.store.list_events(node_id)?;
+        Ok(NodeEventsResponse { events })
     }
 
-    pub async fn list_node_events(&self, node_id: Uuid) -> NodeEventsResponse {
+    pub async fn list_node_events(&self, node_id: Uuid) -> Result<NodeEventsResponse> {
         self.node_events(node_id).await
     }
 
-    pub async fn graph(&self) -> GraphGetResponse {
-        GraphGetResponse {
-            graph: self.store.graph().unwrap_or(GraphRecord {
-                nodes: Vec::new(),
-                relationships: Vec::new(),
-            }),
-        }
+    pub async fn graph(&self) -> Result<GraphGetResponse> {
+        let graph = self.store.graph()?;
+        Ok(GraphGetResponse { graph })
     }
 
-    pub async fn graph_get(&self) -> GraphGetResponse {
+    pub async fn graph_get(&self) -> Result<GraphGetResponse> {
         self.graph().await
     }
 
@@ -1086,8 +1187,8 @@ impl CapabilityService {
         HarnessDescriptorResponse { harnesses }
     }
 
-    pub async fn list_substrate_descriptors(&self) -> SubstrateDescriptorResponse {
-        let nodes = self.store.list_nodes().unwrap_or_default();
+    pub async fn list_substrate_descriptors(&self) -> Result<SubstrateDescriptorResponse> {
+        let nodes = self.store.list_nodes()?;
         let local_nodes = nodes
             .iter()
             .filter(|n| {
@@ -1104,6 +1205,7 @@ impl CapabilityService {
             id: "local".to_string(),
             name: "local".to_string(),
             host: "localhost".to_string(),
+            status: "ok".to_string(),
             healthy: true,
             capacity: 0.0,
             nodes: local_nodes,
@@ -1111,7 +1213,7 @@ impl CapabilityService {
         if self.loon_substrate.is_some() {
             let health = self.substrate_health().await;
             let healthy = health.status == "ok";
-            let running = health.running_instances;
+            let running = health.running_instances.unwrap_or_default();
             let capacity = if running >= 1 {
                 f32::min(1.0, running as f32 / 8.0)
             } else {
@@ -1121,12 +1223,13 @@ impl CapabilityService {
                 id: "loon".to_string(),
                 name: "loon".to_string(),
                 host: "loon".to_string(),
+                status: health.status.clone(),
                 healthy,
                 capacity,
                 nodes: running as u64,
             });
         }
-        SubstrateDescriptorResponse { substrates }
+        Ok(SubstrateDescriptorResponse { substrates })
     }
 
     pub async fn substrate_health(&self) -> SubstrateHealth {
@@ -1135,8 +1238,8 @@ impl CapabilityService {
                 Ok(h) => h,
                 Err(_) => LoonHealth {
                     status: "unavailable".to_string(),
-                    running_instances: 0,
-                    harness_profiles: vec![],
+                    running_instances: None,
+                    harness_profiles: None,
                 },
             };
             SubstrateHealth {
@@ -1147,20 +1250,22 @@ impl CapabilityService {
         } else {
             SubstrateHealth {
                 status: "disabled".to_string(),
-                running_instances: 0,
-                harness_profiles: vec!["local-only".to_string()],
+                running_instances: None,
+                harness_profiles: Some(vec!["local-only".to_string()]),
             }
         };
         status
     }
 
-    pub async fn recent_workspaces(&self) -> Vec<String> {
-        self.store
-            .list_recent_workspaces(self.config.workspace_recent_limit)
-            .unwrap_or_default()
+    pub async fn recent_workspaces(&self) -> Result<Vec<String>> {
+        Ok(self
+            .store
+            .list_recent_workspaces(self.config.workspace_recent_limit)?)
     }
 
     pub async fn create_node(&self, request: CreateNodeRequest) -> Result<NodeCreateResponse> {
+        let mut request = request;
+        request.workspace = normalize_workspace(request.workspace);
         let harness = request
             .harness
             .parse::<HarnessKind>()
@@ -1174,6 +1279,24 @@ impl CapabilityService {
             .get(&harness)
             .ok_or_else(|| anyhow!("missing harness adapter"))?;
         let capabilities = adapter.capabilities();
+        let launch_command = match substrate {
+            SubstrateKind::Local => {
+                resolve_command(adapter.command()).unwrap_or_else(|| adapter.command().to_string())
+            }
+            SubstrateKind::Loon => adapter.command().to_string(),
+        };
+
+        if matches!(substrate, SubstrateKind::Loon) {
+            let loon = self
+                .loon_substrate
+                .as_ref()
+                .ok_or_else(|| anyhow!("unsupported substrate"))?;
+            let caps = loom_support_for_harness(loon, &adapter.command(), &harness).await?;
+            if !caps.send_input {
+                return Err(anyhow!("unsupported_on_substrate"));
+            }
+        }
+
         let harness_for_node = harness.clone();
         let node = self.store.insert_node(
             harness_for_node,
@@ -1188,19 +1311,18 @@ impl CapabilityService {
                 .as_deref()
                 .and_then(|id| Uuid::parse_str(id).ok()),
         )?;
+
+        let launch_prompt = launch_prompt_for_runtime(adapter.as_ref(), node.id, &request);
         let mut launch_args = adapter.launch_args().to_vec();
         launch_args.extend(request.launch_args.clone());
-        // Append the description as a positional prompt argument so the harness receives
-        // it as its first user turn without any PTY timing games. Both `codex [PROMPT]`
-        // and `claude [prompt]` support a trailing positional argument for this purpose.
-        if let Some(desc) = request.description.as_deref().filter(|v| !v.is_empty()) {
-            launch_args.push(desc.to_string());
-        }
+        // Append a single positional prompt argument so both local harness command lines and
+        // Loon `--prompt` receive the same runtime launch intent.
+        launch_args.push(launch_prompt.clone());
         let env = self.local_launch_env(&node, &harness, &substrate, &capabilities)?;
         let context = SubstrateContext {
             node_id: node.id,
             harness: harness.clone(),
-            command: adapter.command().to_string(),
+            command: launch_command,
             args: launch_args,
             workspace: request.workspace.clone(),
             env,
@@ -1209,13 +1331,22 @@ impl CapabilityService {
             SubstrateKind::Local => {
                 // Pre-trust the workspace so harness config dialogs are bypassed before
                 // the process even spawns.
-                if let Some(ws) = request.workspace.as_deref().filter(|v| !v.is_empty()) {
+                if let Some(ws) = request.workspace.as_deref() {
                     if let Err(e) = adapter.pre_trust_workspace(ws) {
+                        let trust_err = anyhow!("pre_trust_workspace failed: {e}");
                         tracing::warn!(
                             error = %e,
+                            node_id = %node.id,
                             workspace = ws,
-                            "pre_trust_workspace failed — harness may show trust dialog"
+                            "pre_trust_workspace failed — failing launch"
                         );
+                        let _ = self.store.set_node_liveness(node.id, NodeLiveness::Failed);
+                        let _ = self.store.record_event(
+                            node.id,
+                            NodeEventKind::HarnessFailure,
+                            json!({ "error": trust_err.to_string() }),
+                        );
+                        return Err(trust_err);
                     }
                 }
                 if let Err(launch_err) = self.local_substrate.launch(context).await {
@@ -1235,37 +1366,29 @@ impl CapabilityService {
                     .loon_substrate
                     .as_ref()
                     .ok_or_else(|| anyhow!("unsupported substrate"))?;
-                let prompt_capabilities = [
-                    ("browser_attach", capabilities.browser_attach),
-                    ("native_attach", capabilities.native_attach),
-                    ("send_input", capabilities.send_input),
-                    ("interrupt", capabilities.interrupt),
-                    ("stop", capabilities.stop),
-                ];
-                let prompt = recipes::launch_packet_markdown(
-                    &node.id.to_string(),
-                    &self.config.base_url,
-                    &node.role_hint,
-                    &harness.to_string(),
-                    &SubstrateKind::Loon.to_string(),
-                    &prompt_capabilities,
-                    "new Loon-backed node; explicit graph edges are available through Asylum",
-                );
                 let payload = crate::substrate::loon::LoonContext {
                     node_id: node.id,
                     harness: harness.clone(),
                     command: adapter.command().to_string(),
-                    prompt,
+                    prompt: launch_prompt,
                 };
-                let caps = loom_support_for_harness(loon, &payload.command, &harness).await?;
-                if !caps.send_input {
-                    return Err(anyhow!("unsupported_on_substrate"));
+                match loon.launch_node(&payload).await {
+                    Ok(external_id) => {
+                        self.store
+                            .set_node_external_id(node.id, Some(external_id))?;
+                        self.store
+                            .set_node_liveness(node.id, NodeLiveness::Running)?;
+                    }
+                    Err(launch_err) => {
+                        let _ = self.store.set_node_liveness(node.id, NodeLiveness::Failed);
+                        let _ = self.store.record_event(
+                            node.id,
+                            NodeEventKind::HarnessFailure,
+                            json!({ "error": launch_err.to_string() }),
+                        );
+                        return Err(launch_err);
+                    }
                 }
-                let external_id = loon.launch_node(&payload).await?;
-                self.store
-                    .set_node_external_id(node.id, Some(external_id))?;
-                self.store
-                    .set_node_liveness(node.id, NodeLiveness::Running)?;
             }
         }
         self.post_hook_event(
@@ -1344,14 +1467,11 @@ impl CapabilityService {
             .create_relationship(source, target, kind, request.label)
     }
 
-    pub async fn list_relationships(&self) -> RelationshipResponse {
-        let graph = self.store.graph().unwrap_or(GraphRecord {
-            nodes: Vec::new(),
-            relationships: Vec::new(),
-        });
-        RelationshipResponse {
+    pub async fn list_relationships(&self) -> Result<RelationshipResponse> {
+        let graph = self.store.graph()?;
+        Ok(RelationshipResponse {
             relationships: graph.relationships,
-        }
+        })
     }
 
     pub async fn delete_relationship(&self, id: Uuid) -> bool {
@@ -1454,8 +1574,36 @@ impl CapabilityService {
         Ok((loon, external_id))
     }
 
-    pub async fn attach_browser(&self, node_id: Uuid) -> Result<AttachResponse> {
+    pub(crate) async fn require_attachable_node(
+        &self,
+        node_id: Uuid,
+    ) -> Result<asylum_types::node::NodeRecord> {
         let node = self.store.get_node(node_id)?.context("node not found")?;
+        if !matches!(
+            node.liveness,
+            NodeLiveness::Running | NodeLiveness::WaitingForInput | NodeLiveness::Starting
+        ) {
+            return Err(anyhow!(
+                "node not attachable in current state: {}",
+                node.liveness
+            ));
+        }
+
+        if node.substrate == SubstrateKind::Local
+            && !self.local_substrate.has_runtime(node_id).await
+        {
+            return Err(anyhow!("local runtime unavailable"));
+        }
+
+        if node.substrate == SubstrateKind::Loon {
+            self.require_loon_target(&node)?;
+        }
+
+        Ok(node)
+    }
+
+    pub async fn attach_browser(&self, node_id: Uuid) -> Result<AttachResponse> {
+        let node = self.require_attachable_node(node_id).await?;
         let token = self.attach_issuer.issue(node_id, 600)?;
         let fingerprint = &token.raw[..token.raw.len().min(6)];
         self.store.record_event(
@@ -1480,7 +1628,7 @@ impl CapabilityService {
     }
 
     pub async fn attach_native_target(&self, node_id: Uuid) -> Result<NativeAttachResponse> {
-        self.store.get_node(node_id)?.context("node not found")?;
+        let _node = self.require_attachable_node(node_id).await?;
         let mut environment = std::collections::BTreeMap::new();
         if let Some(socket_path) = &self.config.socket_path {
             environment.insert("ASYLUM_SOCKET_PATH".to_string(), socket_path.clone());
@@ -1827,11 +1975,10 @@ impl CapabilityService {
         })
     }
 
-    pub async fn list_notifications(&self) -> NotificationsResponse {
+    pub async fn list_notifications(&self) -> Result<NotificationsResponse> {
         let notifications = self
             .store
-            .list_notifications()
-            .unwrap_or_default()
+            .list_notifications()?
             .into_iter()
             .map(
                 |(id, node_id, kind, title, body, created, read)| Notification {
@@ -1845,7 +1992,7 @@ impl CapabilityService {
                 },
             )
             .collect();
-        NotificationsResponse { notifications }
+        Ok(NotificationsResponse { notifications })
     }
 
     pub async fn mark_notification_read(&self, id: i64) -> Result<()> {
@@ -2058,6 +2205,14 @@ impl CapabilityService {
     }
 
     pub async fn create_channel(&self, request: ChannelCreateRequest) -> Result<ChannelDescriptor> {
+        if !is_implemented_channel_kind(&request.kind) {
+            return Err(anyhow!(
+                "unsupported channel kind '{}' (supported kinds: ntfy, webhook)",
+                request.kind
+            ));
+        }
+        validate_channel_direction(&request.kind, &request.direction)?;
+
         let id = format!("custom-{}", Uuid::new_v4());
         let label = request.label.unwrap_or_else(|| request.name.clone());
         let row = self.store.upsert_channel(
@@ -2085,6 +2240,7 @@ impl CapabilityService {
         let new_label = request.label.unwrap_or(existing.label);
         let new_detail = request.detail.unwrap_or(existing.detail);
         let new_direction = request.direction.unwrap_or(existing.direction);
+        validate_channel_direction(&existing.kind, &new_direction)?;
         let new_status = request.status.unwrap_or(existing.status);
         let new_live = request.live.unwrap_or(existing.live);
         let new_config = match request.config {
@@ -2234,7 +2390,10 @@ impl CapabilityService {
 
     pub async fn list_hooks(&self) -> Result<HookListResponse> {
         let rows = self.store.list_hooks()?;
-        let hooks = rows.into_iter().map(rule_from_row).collect();
+        let hooks = rows
+            .into_iter()
+            .map(rule_from_row)
+            .collect::<Result<Vec<_>>>()?;
         Ok(HookListResponse { hooks })
     }
 
@@ -2243,10 +2402,11 @@ impl CapabilityService {
             .store
             .get_hook(id)?
             .ok_or_else(|| anyhow!("hook '{id}' not found"))?;
-        Ok(rule_from_row(row))
+        Ok(rule_from_row(row)?)
     }
 
     pub async fn create_hook(&self, request: HookCreateRequest) -> Result<HookRule> {
+        validate_hook_actions(&request.actions)?;
         let id = Uuid::new_v4().to_string();
         let actions_json = serde_json::to_string(&request.actions)?;
         let row = self.store.insert_hook(
@@ -2258,10 +2418,13 @@ impl CapabilityService {
             &actions_json,
             request.future,
         )?;
-        Ok(rule_from_row(row))
+        Ok(rule_from_row(row)?)
     }
 
     pub async fn update_hook(&self, id: &str, request: HookUpdateRequest) -> Result<HookRule> {
+        if let Some(ref actions) = request.actions {
+            validate_hook_actions(actions)?;
+        }
         let actions_json = match request.actions {
             Some(actions) => Some(serde_json::to_string(&actions)?),
             None => None,
@@ -2278,7 +2441,7 @@ impl CapabilityService {
                 request.future,
             )?
             .ok_or_else(|| anyhow!("hook '{id}' not found"))?;
-        Ok(rule_from_row(row))
+        Ok(rule_from_row(row)?)
     }
 
     pub async fn delete_hook(&self, id: &str) -> Result<bool> {
@@ -2302,8 +2465,8 @@ impl CapabilityService {
             .store
             .get_hook(id)?
             .ok_or_else(|| anyhow!("hook '{id}' not found"))?;
-        let rule = rule_from_row(rule_row);
-        let nodes = self.store.list_nodes().unwrap_or_default();
+        let rule = rule_from_row(rule_row)?;
+        let nodes = self.store.list_nodes()?;
         let target = nodes
             .iter()
             .find(|node| node.is_running_like())
@@ -2337,88 +2500,19 @@ impl CapabilityService {
     }
 
     pub async fn list_recipes(&self) -> RecipeListResponse {
-        let recipes = recipes::starter_recipes()
-            .into_iter()
-            .map(|recipe| RecipeDescriptor {
-                id: recipe.id.to_string(),
-                title: recipe.title.to_string(),
-                prompt_template: recipe.prompt_template.to_string(),
-                kind: if matches!(recipe.id, "spawn-worker-nodes" | "parallel-exploration") {
-                    "fanout".to_string()
-                } else {
-                    "single".to_string()
-                },
-            })
-            .collect();
-        RecipeListResponse { recipes }
+        RecipeListResponse {
+            recipes: Vec::new(),
+        }
     }
 
     pub async fn spawn_recipe(
         &self,
         recipe_id: &str,
-        request: RecipeSpawnRequest,
+        _request: RecipeSpawnRequest,
     ) -> Result<RecipeSpawnResponse> {
-        let recipe = recipes::starter_recipes()
-            .into_iter()
-            .find(|recipe| recipe.id == recipe_id)
-            .ok_or_else(|| anyhow!("recipe '{recipe_id}' not found"))?;
-        let is_fanout = matches!(recipe.id, "spawn-worker-nodes" | "parallel-exploration");
-        let description = request
-            .description
-            .clone()
-            .unwrap_or_else(|| recipe.title.to_string());
-        let mut node_ids = Vec::new();
-        if is_fanout {
-            let supervisor = self
-                .create_node(asylum_types::api::CreateNodeRequest {
-                    harness: request.harness.clone(),
-                    substrate: request.substrate.clone(),
-                    role_hint: "supervisor".to_string(),
-                    workspace: request.workspace.clone(),
-                    description: Some(description.clone()),
-                    created_by: None,
-                    launch_args: Vec::new(),
-                })
-                .await?;
-            let supervisor_id = Uuid::parse_str(&supervisor.node_id)?;
-            node_ids.push(supervisor.node_id.clone());
-            for _ in 0..2 {
-                let worker = self
-                    .create_node(asylum_types::api::CreateNodeRequest {
-                        harness: request.harness.clone(),
-                        substrate: request.substrate.clone(),
-                        role_hint: "worker".to_string(),
-                        workspace: request.workspace.clone(),
-                        description: Some(description.clone()),
-                        created_by: None,
-                        launch_args: Vec::new(),
-                    })
-                    .await?;
-                let worker_id = Uuid::parse_str(&worker.node_id)?;
-                let _ = self.store.create_relationship(
-                    supervisor_id,
-                    worker_id,
-                    RelationshipKind::SpawnedFor,
-                    Some(recipe.id.to_string()),
-                );
-                node_ids.push(worker.node_id);
-            }
-        } else {
-            let role = request.role_hint.unwrap_or_else(|| "worker".to_string());
-            let single = self
-                .create_node(asylum_types::api::CreateNodeRequest {
-                    harness: request.harness.clone(),
-                    substrate: request.substrate.clone(),
-                    role_hint: role,
-                    workspace: request.workspace.clone(),
-                    description: Some(description),
-                    created_by: None,
-                    launch_args: Vec::new(),
-                })
-                .await?;
-            node_ids.push(single.node_id);
-        }
-        Ok(RecipeSpawnResponse { node_ids })
+        Err(anyhow!(
+            "recipe-based spawning is disabled until user/config-backed recipes are implemented ({recipe_id})"
+        ))
     }
 
     pub async fn fork_node(&self, source_id: Uuid, request: ForkNodeRequest) -> Result<NodeRecord> {
@@ -2502,28 +2596,54 @@ pub fn init_login_shell_path() {
 }
 
 fn command_available(command: &str) -> bool {
+    resolve_command(command).is_some()
+}
+
+fn resolve_command(command: &str) -> Option<String> {
+    let login_path = LOGIN_SHELL_PATH.get().cloned().flatten();
+    resolve_command_with_login_path(command, login_path.as_deref())
+}
+
+fn resolve_command_with_login_path(command: &str, login_path: Option<&str>) -> Option<String> {
     if command.trim().is_empty() {
-        return false;
+        return None;
     }
     let command_path = Path::new(command);
     if command_path.components().count() > 1 {
-        return is_executable_file(command_path);
+        if is_executable_file(command_path) {
+            return Some(command.to_string());
+        }
+        return None;
     }
     // Search the process PATH first.
     if let Some(paths) = env::var_os("PATH") {
-        if env::split_paths(&paths).any(|dir| is_executable_file(&dir.join(command))) {
-            return true;
+        if let Some(path) = search_paths(command_path, &paths) {
+            return Some(path);
         }
     }
     // Fall back to the login-shell PATH cached at startup.  This handles the
     // common case where the daemon is launched by systemd with a sanitized
     // PATH that excludes ~/.local/bin or nvm-managed bin directories.
-    if let Some(Some(login_path)) = LOGIN_SHELL_PATH.get() {
-        if env::split_paths(login_path).any(|dir| is_executable_file(&dir.join(command))) {
-            return true;
+    if let Some(login_path) = login_path {
+        if let Some(path) = env::split_paths(login_path)
+            .map(|dir| dir.join(command))
+            .find(|candidate| is_executable_file(candidate))
+        {
+            return Some(path.to_string_lossy().into_owned());
         }
     }
-    false
+    None
+}
+
+fn search_paths(command_path: &Path, paths: &std::ffi::OsStr) -> Option<String> {
+    env::split_paths(paths).find_map(|dir| {
+        let candidate = dir.join(command_path);
+        if is_executable_file(&candidate) {
+            Some(candidate.to_string_lossy().into_owned())
+        } else {
+            None
+        }
+    })
 }
 
 #[cfg(unix)]
@@ -2556,6 +2676,19 @@ fn looks_like_remote_command(raw: &str) -> bool {
         raw.split_whitespace().next(),
         Some("status" | "attach" | "send" | "start" | "interrupt" | "stop" | "approve" | "deny")
     )
+}
+
+fn recipe_spawn_is_enabled() -> bool {
+    false
+}
+
+fn validate_hook_actions(actions: &[HookAction]) -> Result<()> {
+    if !recipe_spawn_is_enabled() && actions.iter().any(|action| action.kind.as_str() == "spawn") {
+        return Err(anyhow!(
+            "hook action kind 'spawn' is unavailable while recipe spawn is disabled"
+        ));
+    }
+    Ok(())
 }
 
 fn remote_command_requires_node(kind: &RemoteCommandKind) -> bool {
@@ -2607,8 +2740,81 @@ fn map_decision(
 mod tests {
     use super::*;
     use crate::auth::hash_token;
+    use crate::channels::WEBHOOK_SUBSTRATE_ID;
     use asylum_types::config::AsylumConfig;
-    use std::collections::HashMap;
+    use rusqlite::Connection;
+    use std::ffi::OsString;
+    use std::{collections::HashMap, path::Path, sync::Mutex};
+    use tokio::time::{sleep, Duration};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_var(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn trusted_codex_projects(config_path: &Path) -> Result<Vec<String>> {
+        if !config_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let raw = std::fs::read_to_string(config_path)?;
+        let doc = raw.parse::<toml::Value>()?;
+        let projects = doc
+            .get("projects")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flat_map(|projects| projects.iter())
+            .filter_map(|(path, entry)| {
+                let is_trusted =
+                    entry.get("trust_level").and_then(toml::Value::as_str) == Some("trusted");
+                is_trusted.then(|| path.clone())
+            })
+            .collect();
+        Ok(projects)
+    }
+
+    fn assert_no_codex_pretrust_for_workspace_value(
+        trusted_projects: &[String],
+        workspace_value: &str,
+    ) -> Result<()> {
+        let cwd = env::current_dir()?.display().to_string();
+        assert!(
+            !trusted_projects
+                .iter()
+                .any(|project| project == workspace_value),
+            "workspace value should not be pre-trusted: {trusted_projects:?}"
+        );
+        assert!(
+            !trusted_projects.iter().any(|project| project == &cwd),
+            "blank/whitespace workspace should not pre-trust the local cwd: {trusted_projects:?}"
+        );
+        Ok(())
+    }
 
     fn test_app_config() -> AppConfig {
         let core = AsylumConfig::default();
@@ -2625,6 +2831,115 @@ mod tests {
             harness: core.harness,
             loon: core.loon,
         }
+    }
+
+    #[test]
+    fn launch_prompt_uses_asylum_context_when_no_user_packet() {
+        let registry = crate::harness::HarnessRegistry::default();
+        let adapter = registry
+            .get(&HarnessKind::Codex)
+            .expect("default codex adapter exists");
+        let node_id = Uuid::new_v4();
+        let request = CreateNodeRequest {
+            harness: "codex".to_string(),
+            substrate: "local".to_string(),
+            role_hint: "worker".to_string(),
+            workspace: Some("/tmp".to_string()),
+            description: None,
+            created_by: None,
+            launch_args: Vec::new(),
+        };
+        let prompt = launch_prompt_for_runtime(adapter.as_ref(), node_id, &request);
+        assert!(prompt.contains(&format!("You are node {} with role 'worker'.", node_id)));
+        assert!(prompt.contains("Workspace: /tmp"));
+        assert!(prompt.contains("System map:"));
+        assert!(!prompt.contains("User launch packet"));
+    }
+
+    fn local_create_request(description: &str) -> CreateNodeRequest {
+        CreateNodeRequest {
+            harness: "codex".to_string(),
+            substrate: "local".to_string(),
+            role_hint: "worker".to_string(),
+            workspace: None,
+            description: Some(description.to_string()),
+            created_by: None,
+            launch_args: Vec::new(),
+        }
+    }
+
+    fn local_create_request_with_workspace(
+        description: &str,
+        workspace: &str,
+    ) -> CreateNodeRequest {
+        CreateNodeRequest {
+            harness: "codex".to_string(),
+            substrate: "local".to_string(),
+            role_hint: "worker".to_string(),
+            workspace: Some(workspace.to_string()),
+            description: Some(description.to_string()),
+            created_by: None,
+            launch_args: Vec::new(),
+        }
+    }
+
+    fn loon_create_request(description: &str) -> CreateNodeRequest {
+        CreateNodeRequest {
+            harness: "codex".to_string(),
+            substrate: "loon".to_string(),
+            role_hint: "worker".to_string(),
+            workspace: None,
+            description: Some(description.to_string()),
+            created_by: None,
+            launch_args: Vec::new(),
+        }
+    }
+
+    fn loon_create_request_with_workspace(description: &str, workspace: &str) -> CreateNodeRequest {
+        CreateNodeRequest {
+            harness: "codex".to_string(),
+            substrate: "loon".to_string(),
+            role_hint: "worker".to_string(),
+            workspace: Some(workspace.to_string()),
+            description: Some(description.to_string()),
+            created_by: None,
+            launch_args: Vec::new(),
+        }
+    }
+
+    fn open_store_with_schema_broken(path: &str, table: &str) -> Result<(), rusqlite::Error> {
+        let connection = Connection::open(path)?;
+        connection.execute_batch(&format!("DROP TABLE {table};"))?;
+        Ok(())
+    }
+
+    fn write_executable_script(path: &Path, body: &str) -> Result<(), Box<dyn std::error::Error>> {
+        std::fs::write(path, body)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(path)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions)?;
+        }
+        Ok(())
+    }
+
+    async fn wait_for_liveness(
+        store: &Store,
+        node_id: Uuid,
+        expected: NodeLiveness,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..50 {
+            let node = store.get_node(node_id)?.expect("node should exist");
+            if node.liveness == expected {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        let node = store.get_node(node_id)?.expect("node should exist");
+        assert_eq!(node.liveness, expected);
+        Ok(())
     }
 
     #[tokio::test]
@@ -2674,6 +2989,435 @@ mod tests {
             issued.token_id
         );
         assert!(service.token_id_for_raw("not-a-token", true).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capabilities_hide_recipe_spawn_descriptor() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        let capabilities = service.capabilities().await;
+        assert!(
+            !capabilities
+                .capabilities
+                .iter()
+                .any(|capability| capability.name == CapabilityName::RecipeSpawn),
+            "recipe spawn capability descriptor should be hidden while disabled"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_channel_rejects_unsupported_kinds() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        let error = service
+            .create_channel(ChannelCreateRequest {
+                kind: "email".to_string(),
+                name: "email channel".to_string(),
+                label: Some("smtp".to_string()),
+                direction: "outbound".to_string(),
+                detail: "smtp".to_string(),
+                config: serde_json::json!({}),
+                live: false,
+            })
+            .await
+            .expect_err("unsupported kinds should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported channel kind 'email'"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_channel_rejects_webhook_outbound_direction(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        let error = service
+            .create_channel(ChannelCreateRequest {
+                kind: "webhook".to_string(),
+                name: "webhook outbound".to_string(),
+                label: None,
+                direction: "outbound".to_string(),
+                detail: "incoming webhook endpoint".to_string(),
+                config: serde_json::json!({}),
+                live: false,
+            })
+            .await
+            .expect_err("webhook outbound should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot use direction 'outbound'"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_channel_rejects_webhook_outbound_direction(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        let error = service
+            .update_channel(
+                WEBHOOK_SUBSTRATE_ID,
+                ChannelUpdateRequest {
+                    name: None,
+                    label: None,
+                    detail: None,
+                    direction: Some("duplex".to_string()),
+                    status: None,
+                    config: None,
+                    live: None,
+                },
+            )
+            .await
+            .expect_err("webhook duplex update should be rejected");
+
+        assert!(
+            error.to_string().contains("cannot use direction 'duplex'"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn channel_test_rejects_webhook_outbound_delivery(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        let error = service
+            .channel_test(
+                WEBHOOK_SUBSTRATE_ID,
+                ChannelTestRequest {
+                    title: "test".to_string(),
+                    body: "body".to_string(),
+                },
+            )
+            .await
+            .expect_err("webhook should not permit outbound channel tests");
+        assert!(
+            error.to_string().contains("inbound-only"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_nodes_returns_empty_when_store_is_empty() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path.clone())?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        let response = service.list_nodes().await?;
+        assert!(response.nodes.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_nodes_propagates_store_errors() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path.clone())?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        open_store_with_schema_broken(&path, "nodes")?;
+        let error = service
+            .list_nodes()
+            .await
+            .expect_err("list_nodes should fail when the nodes table is unavailable");
+        assert!(error.to_string().contains("no such table: nodes"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_substrate_descriptors_propagates_store_errors(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path.clone())?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        open_store_with_schema_broken(&path, "nodes")?;
+        let error = service.list_substrate_descriptors().await.expect_err(
+            "list_substrate_descriptors should fail when the nodes table is unavailable",
+        );
+        assert!(error.to_string().contains("no such table: nodes"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_node_events_returns_empty_when_node_has_no_events(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path.clone())?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        let response = service.node_events(Uuid::new_v4()).await?;
+        assert!(response.events.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_node_events_propagates_store_errors() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path.clone())?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        open_store_with_schema_broken(&path, "events")?;
+        let error = service
+            .node_events(Uuid::new_v4())
+            .await
+            .expect_err("node_events should fail when the events table is unavailable");
+        assert!(error.to_string().contains("no such table: events"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recent_workspaces_propagates_store_errors() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path.clone())?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        open_store_with_schema_broken(&path, "nodes")?;
+        let error = service
+            .recent_workspaces()
+            .await
+            .expect_err("recent_workspaces should fail when the nodes table is unavailable");
+        assert!(error.to_string().contains("no such table: nodes"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graph_returns_empty_when_store_is_empty() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path.clone())?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        let response = service.graph().await?;
+        assert!(response.graph.nodes.is_empty());
+        assert!(response.graph.relationships.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graph_propagates_store_errors() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path.clone())?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        open_store_with_schema_broken(&path, "nodes")?;
+        let error = service
+            .graph()
+            .await
+            .expect_err("graph should fail when the nodes table is unavailable");
+        assert!(error.to_string().contains("no such table: nodes"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_substrate_descriptors_hides_unknown_loon_metrics(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.loon.enabled = true;
+        let script_path = workdir.path().join("fake-loon-cli.sh");
+        config.loon.cli_path = Some(script_path.clone());
+        write_executable_script(&script_path, "#!/bin/sh\nexit 0\n")?;
+
+        let service = CapabilityService::new(store, AuthMode::Disabled, config);
+
+        let health = service.substrate_health().await;
+        assert_eq!(health.status, "limited");
+        assert!(health.running_instances.is_none());
+        assert!(health.harness_profiles.is_none());
+
+        let descriptors = service.list_substrate_descriptors().await?;
+        let loon = descriptors
+            .substrates
+            .iter()
+            .find(|s| s.id == "loon")
+            .expect("loon descriptor should exist when configured");
+        assert!(!loon.healthy);
+        assert_eq!(loon.status, "limited");
+        assert_eq!(loon.capacity, 0.0);
+        assert_eq!(loon.nodes, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loon_create_does_not_create_node_when_substrate_support_is_not_confirmed(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path.clone())?;
+        let mut config = test_app_config();
+        config.loon.enabled = true;
+        let script_path = workdir.path().join("fake-loon-cli.sh");
+        write_executable_script(&script_path, "#!/bin/sh\nprintf 'loon version'\nexit 0\n")?;
+        config.loon.cli_path = Some(script_path);
+
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let error = service
+            .create_node(loon_create_request("unsupported by capability probe"))
+            .await
+            .expect_err("loon create should refuse unsupported substrate profiles");
+        assert!(error.to_string().contains("unsupported_on_substrate"));
+
+        let graph = store.graph()?;
+        assert!(
+            graph.nodes.is_empty(),
+            "no starting node should be created before support check"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_loon_spawn_marks_node_failed_and_records_harness_failure(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path.clone())?;
+        let mut config = test_app_config();
+        config.loon.enabled = true;
+        let script_path = workdir.path().join("fake-loon-cli.sh");
+        write_executable_script(
+            &script_path,
+            "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then\nprintf '{\"status\":\"ok\",\"running_instances\":1,\"harness_profiles\":[\"codex\"]}\n'\nexit 0\nfi\nif [ \"$1\" = \"spawn\" ]; then\nprintf 'spawn failed' >&2\nexit 1\nfi\nexit 0\n",
+        )?;
+        config.loon.cli_path = Some(script_path);
+
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let error = service
+            .create_node(loon_create_request("spawn failure regression"))
+            .await
+            .expect_err("spawn failure should return an error and keep an error row");
+        assert!(error.to_string().contains("spawn failed"));
+
+        let graph = store.graph()?;
+        let node = graph
+            .nodes
+            .into_iter()
+            .find(|node| node.description == "spawn failure regression")
+            .expect("failed Loon launch should persist node row");
+        assert_eq!(node.liveness, NodeLiveness::Failed);
+
+        let events = store.list_events(node.id)?;
+        assert!(events.iter().any(|event| {
+            event.kind == NodeEventKind::LivenessChanged
+                && event.body["liveness"] == serde_json::json!("failed")
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == NodeEventKind::HarnessFailure
+                && event.body["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("spawn failed")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loon_launch_uses_context_plus_user_prompt_in_commandline(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path.clone())?;
+        let mut config = test_app_config();
+        config.loon.enabled = true;
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let cli_args_path = workdir.path().join("loon-args.txt");
+        let script_path = workdir.path().join("fake-loon-cli.sh");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then\nprintf '{{\"status\":\"ok\",\"running_instances\":1,\"harness_profiles\":[\"codex\"]}}\\n'\nexit 0\nfi\nif [ \"$1\" = \"spawn\" ]; then\nprintf '%s\\n' \"$@\" > '{}' \nprintf '00000000-0000-0000-0000-000000000000\\n'\nexit 0\nfi\nexit 0\n",
+            cli_args_path.display()
+        );
+        write_executable_script(&script_path, &script)?;
+        config.loon.cli_path = Some(script_path);
+
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+        let description = "Build exactly this as your first action";
+        let response = service
+            .create_node(loon_create_request_with_workspace(
+                description,
+                &workspace.display().to_string(),
+            ))
+            .await?;
+        let node_id = Uuid::parse_str(&response.node_id)?;
+
+        wait_for_liveness(&store, node_id, NodeLiveness::Running).await?;
+        let cli_args = std::fs::read_to_string(&cli_args_path)?;
+        assert!(cli_args.contains("spawn"));
+        assert!(cli_args.contains("--prompt"));
+        assert!(cli_args.contains(&format!("You are node {} with role 'worker'.", node_id)));
+        assert!(cli_args.contains(&format!("Workspace: {}", workspace.display())));
+        assert!(cli_args.contains("User launch packet:"));
+        assert!(cli_args.contains(description));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_relationships_returns_empty_when_store_is_empty(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path.clone())?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        let response = service.list_relationships().await?;
+        assert!(response.relationships.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_relationships_propagates_store_errors() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path.clone())?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        open_store_with_schema_broken(&path, "relationships")?;
+        let error = service
+            .list_relationships()
+            .await
+            .expect_err("list_relationships should fail when relationship table is unavailable");
+        assert!(error.to_string().contains("no such table: relationships"));
         Ok(())
     }
 
@@ -2768,6 +3512,30 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn list_notifications_propagates_store_errors() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path.clone())?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let _ = store.insert_notification(
+            None,
+            "system",
+            "Daemon started",
+            "notifications now available",
+        )?;
+
+        open_store_with_schema_broken(&path, "notifications")?;
+        let error = service
+            .list_notifications()
+            .await
+            .expect_err("list_notifications should fail when notifications table is unavailable");
+        assert!(error.to_string().contains("no such table: notifications"));
+        Ok(())
+    }
+
     #[test]
     fn command_available_reflects_launchable_executable() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -2787,6 +3555,23 @@ mod tests {
         assert!(!command_available(
             &workdir.path().join("missing").display().to_string()
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn command_resolution_uses_login_shell_fallback_path() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let workdir = tempfile::tempdir()?;
+        let fake_bin = workdir.path().join("login-shell-bin");
+        let executable = fake_bin.join("codex-login-shell");
+        std::fs::create_dir_all(&fake_bin)?;
+        write_executable_script(&executable, "#!/bin/sh\n")?;
+
+        let fallback = fake_bin.display().to_string();
+        let resolved = resolve_command_with_login_path("codex-login-shell", Some(&fallback));
+        assert_eq!(resolved.as_deref(), Some(executable.to_str().unwrap()));
+        assert!(!resolve_command_with_login_path("codex-login-shell", Some("")).is_some());
+
         Ok(())
     }
 
@@ -2933,6 +3718,409 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_create_prefers_workspace_pre_trust_for_codex(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let test_workdir = tempfile::tempdir()?;
+        let workspace = test_workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let script_path = test_workdir.path().join("fake-codex.sh");
+        let release_marker = test_workdir.path().join("codex-run-release");
+        let script = format!(
+            "#!/bin/sh\nwhile [ ! -f '{}' ]; do sleep 0.01; done\n",
+            release_marker.display()
+        );
+        write_executable_script(&script_path, &script)?;
+
+        let (store, node_id) = {
+            let _home = EnvVarGuard::set_var("HOME", test_workdir.path());
+
+            let path = test_workdir
+                .path()
+                .join("asylum.sqlite3")
+                .display()
+                .to_string();
+            let store = Store::open(path)?;
+            let mut config = test_app_config();
+            config.harness.codex_command = script_path.display().to_string();
+            let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+            let response = service
+                .create_node(local_create_request_with_workspace(
+                    "pre-trust codex workspace test",
+                    &workspace.display().to_string(),
+                ))
+                .await?;
+            let node_id = Uuid::parse_str(&response.node_id)?;
+
+            let codex_config = test_workdir.path().join(".codex").join("config.toml");
+            for _ in 0..10 {
+                if codex_config.exists() {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            assert!(codex_config.exists());
+
+            let mut found = false;
+            for _ in 0..10 {
+                let contents = std::fs::read_to_string(&codex_config)?;
+                if contents.contains("trust_level = \"trusted\"")
+                    && contents.contains(&workspace.display().to_string())
+                {
+                    found = true;
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            assert!(found, "codex workspace was not pre-trusted in config");
+
+            Ok::<(Store, Uuid), Box<dyn std::error::Error>>((store, node_id))
+        }?;
+
+        std::fs::write(&release_marker, b"release")?;
+        wait_for_liveness(&store, node_id, NodeLiveness::Stopped).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_create_fails_when_workspace_pre_trust_fails(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let test_workdir = tempfile::tempdir()?;
+        let workspace = test_workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let script_path = test_workdir.path().join("fake-codex.sh");
+        let script = "#!/bin/sh\necho should-not-run\n";
+        write_executable_script(&script_path, script)?;
+
+        let bad_home = test_workdir.path().join("bad-home");
+        std::fs::write(&bad_home, b"blocked\n")?;
+
+        let path = test_workdir
+            .path()
+            .join("asylum.sqlite3")
+            .display()
+            .to_string();
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let error = {
+            let _home = EnvVarGuard::set_var("HOME", bad_home);
+            service
+                .create_node(local_create_request_with_workspace(
+                    "pre-trust should fail",
+                    &workspace.display().to_string(),
+                ))
+                .await
+                .expect_err("pre-trust failure should reject create")
+        };
+
+        assert!(
+            error.to_string().contains("pre_trust_workspace failed"),
+            "unexpected create error: {error}"
+        );
+
+        let nodes = store.list_nodes()?;
+        let node = nodes
+            .into_iter()
+            .find(|node| node.description == "pre-trust should fail")
+            .expect("pre-trust failure should still persist a node row");
+        assert_eq!(node.liveness, NodeLiveness::Failed);
+
+        let events = store.list_events(node.id)?;
+        assert!(events.iter().any(|event| {
+            event.kind == NodeEventKind::HarnessFailure
+                && event.body["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("pre_trust_workspace failed")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_create_normalizes_blank_workspace_to_absent_and_does_not_pre_trust(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let test_workdir = tempfile::tempdir()?;
+        let home = test_workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let script_path = test_workdir.path().join("fake-codex.sh");
+        let argv_path = test_workdir.path().join("codex-argv.txt");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 0\n",
+            argv_path.display()
+        );
+        write_executable_script(&script_path, &script)?;
+
+        let response = {
+            let _home = EnvVarGuard::set_var("HOME", &home);
+            let path = test_workdir
+                .path()
+                .join("asylum.sqlite3")
+                .display()
+                .to_string();
+            let store = Store::open(path)?;
+            let mut config = test_app_config();
+            config.harness.codex_command = script_path.display().to_string();
+            let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+            let response = service
+                .create_node(local_create_request_with_workspace("blank workspace", ""))
+                .await?;
+            let node_id = Uuid::parse_str(&response.node_id)?;
+            wait_for_liveness(&store, node_id, NodeLiveness::Stopped).await?;
+            let node = store.get_node(node_id)?.expect("node should exist");
+            assert_eq!(node.workspace, None);
+            let output = std::fs::read_to_string(&argv_path)?;
+            assert!(output.contains("Workspace: <none>"));
+            response
+        };
+
+        let codex_config = home.join(".codex").join("config.toml");
+        let trusted_projects = trusted_codex_projects(&codex_config)?;
+        assert_no_codex_pretrust_for_workspace_value(&trusted_projects, "")?;
+
+        assert!(!response.node_id.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_create_normalizes_whitespace_workspace_to_absent_and_does_not_pre_trust(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let test_workdir = tempfile::tempdir()?;
+        let home = test_workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let script_path = test_workdir.path().join("fake-codex.sh");
+        let argv_path = test_workdir.path().join("codex-argv.txt");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 0\n",
+            argv_path.display()
+        );
+        write_executable_script(&script_path, &script)?;
+
+        let response = {
+            let _home = EnvVarGuard::set_var("HOME", &home);
+            let path = test_workdir
+                .path()
+                .join("asylum.sqlite3")
+                .display()
+                .to_string();
+            let store = Store::open(path)?;
+            let mut config = test_app_config();
+            config.harness.codex_command = script_path.display().to_string();
+            let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+            let response = service
+                .create_node(local_create_request_with_workspace(
+                    "whitespace workspace",
+                    "   ",
+                ))
+                .await?;
+            let node_id = Uuid::parse_str(&response.node_id)?;
+            wait_for_liveness(&store, node_id, NodeLiveness::Stopped).await?;
+            let node = store.get_node(node_id)?.expect("node should exist");
+            assert_eq!(node.workspace, None);
+            let output = std::fs::read_to_string(&argv_path)?;
+            assert!(output.contains("Workspace: <none>"));
+            response
+        };
+
+        let codex_config = home.join(".codex").join("config.toml");
+        let trusted_projects = trusted_codex_projects(&codex_config)?;
+        assert_no_codex_pretrust_for_workspace_value(&trusted_projects, "   ")?;
+        assert!(!response.node_id.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_local_spawn_marks_node_failed_and_records_harness_failure(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = workdir.path().join("missing-codex").display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let error = service
+            .create_node(local_create_request("spawn failure regression"))
+            .await
+            .expect_err("missing local harness command should fail launch");
+        assert!(error.to_string().contains("spawn local harness process"));
+
+        let graph = store.graph()?;
+        let node = graph
+            .nodes
+            .into_iter()
+            .find(|node| node.description == "spawn failure regression")
+            .expect("failed launch should leave a durable node row");
+        assert_eq!(node.liveness, NodeLiveness::Failed);
+
+        let events = store.list_events(node.id)?;
+        assert!(events.iter().any(|event| {
+            event.kind == NodeEventKind::LivenessChanged && event.body["liveness"] == "failed"
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == NodeEventKind::HarnessFailure
+                && event.body["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("spawn local harness process")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_launch_delivers_description_as_prompt_and_persists_early_tui_output(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let argv_path = workdir.path().join("argv.txt");
+        let release_marker = workdir.path().join("codex-run-release");
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let script_path = workdir.path().join("fake-codex.sh");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '\\033[1;1H\\033[0mwelcome'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\n",
+            argv_path.display()
+            ,
+            release_marker.display()
+        );
+        write_executable_script(&script_path, &script)?;
+
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let prompt = "Print exactly: hello world from Asylum";
+        let response = service
+            .create_node(local_create_request_with_workspace(
+                prompt,
+                &workspace.display().to_string(),
+            ))
+            .await?;
+        let node_id = Uuid::parse_str(&response.node_id)?;
+        std::fs::write(&release_marker, b"release")?;
+
+        for _ in 0..50 {
+            if argv_path.exists() {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        let argv = std::fs::read_to_string(&argv_path)?;
+        let args: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            args.first(),
+            Some(&"--dangerously-bypass-approvals-and-sandbox")
+        );
+        let payload = argv;
+        let expected_workspace = format!("Workspace: {}", workspace.display());
+        let expected_context = format!("You are node {} with role 'worker'.", node_id);
+        assert!(
+            payload.contains(&expected_context),
+            "missing node-role prefix in launch prompt: {payload}"
+        );
+        assert!(
+            payload.contains(&expected_workspace),
+            "missing workspace in launch context: {payload}"
+        );
+        assert!(
+            payload.contains("System map:"),
+            "missing system map in launch context: {payload}"
+        );
+        assert!(
+            payload.contains("Capabilities:"),
+            "missing capabilities in launch context: {payload}"
+        );
+        assert!(
+            payload.contains("User launch packet:"),
+            "missing user packet header in launch prompt: {payload}"
+        );
+        assert!(
+            payload.contains(prompt),
+            "missing user launch packet body: {payload}"
+        );
+
+        wait_for_liveness(&store, node_id, NodeLiveness::Stopped).await?;
+        let events = store.list_events(node_id)?;
+        assert!(events.iter().any(|event| {
+            event.kind == NodeEventKind::OutputChunk
+                && event.body["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("\u{1b}[1;1H\u{1b}[0mwelcome")
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == NodeEventKind::LivenessChanged && event.body["liveness"] == "stopped"
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_create_uses_resolved_login_shell_command_for_launch(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _env_lock = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let fake_bin = workdir.path().join("login-shell-bin");
+        let script = fake_bin.join("codex-login-shell");
+        let argv = workdir.path().join("argv.log");
+        let release_marker = workdir.path().join("codex-run-release");
+        std::fs::create_dir_all(&fake_bin)?;
+        let script_body = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$0\" > '{}'\nprintf '%s\\n' \"$@\" >> '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\n",
+            argv.display(),
+            argv.display(),
+            release_marker.display()
+        );
+        write_executable_script(&script, &script_body)?;
+
+        let runtime_path = "/usr/bin:/bin";
+        let login_probe_path = format!("{}:{}", fake_bin.display(), runtime_path);
+        let _login_probe_guard = EnvVarGuard::set_var("PATH", &login_probe_path);
+        init_login_shell_path();
+        let _runtime_path_guard = EnvVarGuard::set_var("PATH", runtime_path);
+
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = "codex-login-shell".to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let response = service
+            .create_node(local_create_request("launch through fallback command path"))
+            .await?;
+        let node_id = Uuid::parse_str(&response.node_id)?;
+        std::fs::write(&release_marker, b"release")?;
+
+        for _ in 0..80 {
+            if argv.exists() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(argv.exists());
+        let argv_lines = std::fs::read_to_string(&argv)?;
+        let first_line = argv_lines
+            .lines()
+            .next()
+            .ok_or_else(|| anyhow!("argv output missing"))?;
+        assert_eq!(first_line, script.display().to_string());
+
+        wait_for_liveness(&store, node_id, NodeLiveness::Stopped).await?;
+        let events = store.list_events(node_id)?;
+        assert!(events.iter().any(|event| {
+            event.kind == NodeEventKind::LivenessChanged && event.body["liveness"] == "running"
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn notify_send_errors_when_ntfy_is_unconfigured() -> Result<(), Box<dyn std::error::Error>>
     {
         let workdir = tempfile::tempdir()?;
@@ -2976,6 +4164,237 @@ mod tests {
 
         assert!(!response.firing.ok);
         assert!(response.firing.outcome.contains("not supported yet"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hook_action_channel_with_webhook_records_failure(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+        let hook = service
+            .create_hook(HookCreateRequest {
+                name: "webhook-channel".to_string(),
+                enabled: true,
+                event: "node.ctx_pressure".to_string(),
+                filter: "any".to_string(),
+                actions: vec![HookAction {
+                    kind: "channel".to_string(),
+                    target: WEBHOOK_SUBSTRATE_ID.to_string(),
+                    template: Some("{{event}}".to_string()),
+                    args: serde_json::json!({"title": "from hook"}),
+                }],
+                future: false,
+            })
+            .await?;
+
+        let response = service.hook_test(&hook.id).await?;
+
+        assert!(!response.firing.ok);
+        assert!(response.firing.outcome.contains("inbound-only"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hook_test_propagates_store_errors() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path.clone())?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+        let hook = service
+            .create_hook(HookCreateRequest {
+                name: "store-error-hook".to_string(),
+                enabled: true,
+                event: "node.ctx_pressure".to_string(),
+                filter: "any".to_string(),
+                actions: vec![],
+                future: false,
+            })
+            .await?;
+
+        open_store_with_schema_broken(&path, "nodes")?;
+        let error = service
+            .hook_test(&hook.id)
+            .await
+            .expect_err("hook_test should fail when the nodes table is unavailable");
+        assert!(error.to_string().contains("no such table: nodes"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hook_test_fails_for_corrupt_actions_json() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+        let hook = service
+            .create_hook(HookCreateRequest {
+                name: "corrupt-json".to_string(),
+                enabled: true,
+                event: "node.ctx_pressure".to_string(),
+                filter: "any".to_string(),
+                actions: vec![HookAction {
+                    kind: "tool".to_string(),
+                    target: "graph.get".to_string(),
+                    template: None,
+                    args: serde_json::json!({}),
+                }],
+                future: false,
+            })
+            .await?;
+
+        let _ = store.update_hook(&hook.id, None, None, None, None, Some("{"), None)?;
+
+        let error = service
+            .hook_test(&hook.id)
+            .await
+            .expect_err("hook_test should fail when stored actions_json is malformed");
+        assert!(error.to_string().contains("actions_json"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hook_event_processor_records_decode_error_when_actions_json_is_corrupt(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+        let hook = service
+            .create_hook(HookCreateRequest {
+                name: "corrupt-runtime".to_string(),
+                enabled: true,
+                event: "node.ctx_pressure".to_string(),
+                filter: "any".to_string(),
+                actions: vec![HookAction {
+                    kind: "tool".to_string(),
+                    target: "graph.get".to_string(),
+                    template: None,
+                    args: serde_json::json!({}),
+                }],
+                future: false,
+            })
+            .await?;
+
+        let _ = store.update_hook(&hook.id, None, None, None, None, Some("{"), None)?;
+
+        let process_error = service
+            .process_hook_event(HookEvent {
+                event: "node.ctx_pressure".to_string(),
+                node_id: None,
+                payload: serde_json::json!({}),
+            })
+            .await
+            .expect_err("corrupt hook should fail hook-event processing");
+        assert!(process_error.to_string().contains("failed to decode hook"));
+
+        let firings = store.list_hook_firings(10)?;
+        assert_eq!(firings.len(), 1);
+        let firing = firings
+            .first()
+            .expect("hook processing should persist a failure firing record");
+        assert!(!firing.ok);
+        assert!(firing.outcome.contains("failed to decode hook actions"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hook_event_processor_fails_when_firing_persistence_fails(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path.clone())?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+        let hook = service
+            .create_hook(HookCreateRequest {
+                name: "drop-table".to_string(),
+                enabled: true,
+                event: "node.ctx_pressure".to_string(),
+                filter: "any".to_string(),
+                actions: vec![],
+                future: false,
+            })
+            .await?;
+        assert_eq!(hook.actions.len(), 0);
+
+        open_store_with_schema_broken(&path, "hook_firings")?;
+
+        let process_error = service
+            .process_hook_event(HookEvent {
+                event: "node.ctx_pressure".to_string(),
+                node_id: None,
+                payload: serde_json::json!({}),
+            })
+            .await
+            .expect_err("missing hook_firings table should surface persistence failure");
+
+        assert!(process_error
+            .to_string()
+            .contains("no such table: hook_firings"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hook_actions_reject_spawn_while_disabled() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        let create_error = service
+            .create_hook(HookCreateRequest {
+                name: "spawn-disabled".to_string(),
+                enabled: true,
+                event: "node.ctx_pressure".to_string(),
+                filter: "any".to_string(),
+                actions: vec![HookAction {
+                    kind: "spawn".to_string(),
+                    target: "recipe:quickstart".to_string(),
+                    template: None,
+                    args: serde_json::json!({}),
+                }],
+                future: false,
+            })
+            .await
+            .expect_err("hook creation should reject spawn actions");
+        assert!(create_error
+            .to_string()
+            .contains("hook action kind 'spawn'"));
+
+        let hook = service
+            .create_hook(HookCreateRequest {
+                name: "update-target".to_string(),
+                enabled: true,
+                event: "node.ctx_pressure".to_string(),
+                filter: "any".to_string(),
+                actions: vec![],
+                future: false,
+            })
+            .await?;
+        let update_error = service
+            .update_hook(
+                &hook.id,
+                HookUpdateRequest {
+                    name: Some("update-target".to_string()),
+                    enabled: Some(true),
+                    event: None,
+                    filter: None,
+                    actions: Some(vec![HookAction {
+                        kind: "spawn".to_string(),
+                        target: "recipe:quickstart".to_string(),
+                        template: None,
+                        args: serde_json::json!({}),
+                    }]),
+                    future: Some(false),
+                },
+            )
+            .await
+            .expect_err("spawn actions should remain rejected on update");
+        assert!(update_error
+            .to_string()
+            .contains("hook action kind 'spawn'"));
         Ok(())
     }
 
@@ -3082,12 +4501,195 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loon_browser_attach_response_discloses_transport(
+    async fn attach_rejects_stopped_failed_and_archived_nodes(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let workdir = tempfile::tempdir()?;
         let path = workdir.path().join("asylum.sqlite3").display().to_string();
         let store = Store::open(path)?;
         let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        for liveness in [
+            NodeLiveness::Stopped,
+            NodeLiveness::Failed,
+            NodeLiveness::Archived,
+        ] {
+            let node = store.insert_node(
+                HarnessKind::Codex,
+                SubstrateKind::Local,
+                "worker",
+                Some("/tmp"),
+                Some("attach state rejection"),
+                None,
+                CapabilitySnapshot::default(),
+                None,
+            )?;
+            store.set_node_liveness(node.id, liveness)?;
+
+            let browser_error = service
+                .attach_browser(node.id)
+                .await
+                .expect_err("browser attach should fail for non-attachable node");
+            assert!(
+                browser_error.to_string().contains("node not attachable"),
+                "unexpected browser attach error: {browser_error}"
+            );
+            let native_error = service
+                .attach_native_target(node.id)
+                .await
+                .expect_err("native attach should fail for non-attachable node");
+            assert!(
+                native_error.to_string().contains("node not attachable"),
+                "unexpected native attach error: {native_error}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_rejects_local_runtime_missing_nodes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let node = store.insert_node(
+            HarnessKind::Codex,
+            SubstrateKind::Local,
+            "worker",
+            Some("/tmp"),
+            Some("stale local runtime"),
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        store.set_node_liveness(node.id, NodeLiveness::Running)?;
+
+        let browser_error = service
+            .attach_browser(node.id)
+            .await
+            .expect_err("browser attach should fail when local runtime is unavailable");
+        assert!(browser_error
+            .to_string()
+            .contains("local runtime unavailable"));
+
+        let native_error = service
+            .attach_native_target(node.id)
+            .await
+            .expect_err("native attach should fail when local runtime is unavailable");
+        assert!(native_error
+            .to_string()
+            .contains("local runtime unavailable"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_is_allowed_for_running_local_node_with_runtime(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let script_path = workdir.path().join("fake-codex.sh");
+        write_executable_script(
+            &script_path,
+            "#!/bin/sh\nwhile true; do\n  sleep 0.1\ndone\n",
+        )?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let response = service
+            .create_node(local_create_request("attachable local"))
+            .await?;
+        let node_id = Uuid::parse_str(&response.node_id)?;
+        wait_for_liveness(&store, node_id, NodeLiveness::Running).await?;
+
+        let browser = service.attach_browser(node_id).await?;
+        assert_eq!(browser.transport.as_deref(), Some("local_pty"));
+        assert!(browser.url.contains(&node_id.to_string()));
+
+        let native = service.attach_native_target(node_id).await?;
+        assert_eq!(native.command, "asylum");
+        assert_eq!(native.args.first().map(String::as_str), Some("attach"));
+        assert_eq!(
+            native.args.get(1).map(String::as_str),
+            Some(node_id.to_string().as_str())
+        );
+
+        service.stop_node(node_id).await?;
+        wait_for_liveness(&store, node_id, NodeLiveness::Stopped).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_to_loon_rejects_without_configured_substrate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let node = store.insert_node(
+            HarnessKind::Codex,
+            SubstrateKind::Loon,
+            "worker",
+            Some("/tmp"),
+            Some("loon"),
+            Some("loon-instance-1"),
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+
+        let error = service
+            .attach_browser(node.id)
+            .await
+            .expect_err("browser attach should fail without loon substrate");
+        assert!(error
+            .to_string()
+            .contains("loon substrate is not configured"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_to_loon_rejects_without_external_id() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.loon.enabled = true;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let node = store.insert_node(
+            HarnessKind::Codex,
+            SubstrateKind::Loon,
+            "worker",
+            Some("/tmp"),
+            Some("loon without external id"),
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+
+        let error = service
+            .attach_browser(node.id)
+            .await
+            .expect_err("browser attach should fail without loon external id");
+        assert!(error.to_string().contains("missing loon external id"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loon_browser_attach_response_discloses_transport(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.loon.enabled = true;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
 
         let node = store.insert_node(
             HarnessKind::Codex,
@@ -3294,6 +4896,45 @@ mod tests {
         assert!(!service.validate_owner_token_value(&issued.raw_token));
         // new token must be valid
         assert!(service.validate_owner_token_value(&rotated.new_token.raw_token));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recipes_are_disabled_and_not_preseeded() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        let response = service.list_recipes().await;
+        assert!(response.recipes.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spawn_recipe_returns_error_until_configured() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        let error = service
+            .spawn_recipe(
+                "start-command-center",
+                RecipeSpawnRequest {
+                    harness: "codex".to_string(),
+                    substrate: "local".to_string(),
+                    workspace: None,
+                    description: None,
+                    role_hint: Some("command-center".to_string()),
+                },
+            )
+            .await
+            .expect_err("spawning recipes should be disabled");
+        assert!(error
+            .to_string()
+            .contains("recipe-based spawning is disabled"));
         Ok(())
     }
 }

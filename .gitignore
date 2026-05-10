@@ -11,3 +11,5 @@ target/
 .superpowers/
 .worktrees/
 .asylum-dev/
+.agents/
+.codex/

@@ -1,20 +1,32 @@
 // ports prototype CreateScreen
 import { Fragment, useEffect, useState, type JSX } from "react";
-import { Btn, Field, Panel, Pill, Tag } from "../lib/ui";
+import { Btn, Field, Panel, Pill } from "../lib/ui";
 import {
   createNode,
   fetchHarnessDescriptors,
-  fetchRecipes,
   fetchSubstrateDescriptors,
-  spawnRecipe,
 } from "../api";
 import type {
   HarnessDescriptor,
   HarnessKind,
-  RecipeDescriptor,
   SubstrateDescriptor,
   SubstrateKind,
 } from "../types";
+
+function formatSubstrateStatus(status: string | undefined, healthy: boolean): string {
+  const normalized = (status ?? "").trim().toLowerCase();
+  if (healthy) {
+    return "healthy";
+  }
+  return normalized === "ok" || normalized === "" ? "unavailable" : normalized;
+}
+
+function substrateMetricsHint(status: string, host: string, capacity: number): string {
+  if (status === "healthy") {
+    return `${host} · cap ${Math.round(capacity * 100)}%`;
+  }
+  return `${host} · metrics unavailable`;
+}
 
 export interface CreateScreenProps {
   onCreated: (nodeId: string) => void;
@@ -25,30 +37,17 @@ export function CreateScreen({ onCreated, onCancel }: CreateScreenProps): JSX.El
   const [harness, setHarness] = useState<string>("codex");
   const [substrate, setSubstrate] = useState<string>("local");
   const [role, setRole] = useState<string>("command-center");
-  const [workspace, setWorkspace] = useState<string>("~/src/asylum");
-  const [recipes, setRecipes] = useState<RecipeDescriptor[] | null>(null);
+  const [workspace, setWorkspace] = useState<string>("");
   const [harnesses, setHarnesses] = useState<HarnessDescriptor[]>([]);
   const [substrates, setSubstrates] = useState<SubstrateDescriptor[]>([]);
-  const [recipe, setRecipe] = useState<string | null>(null);
   const [prompt, setPrompt] = useState<string>(
     "inspect the asylum context, summarize active nodes, and ask me what to spawn next.",
   );
   const [launching, setLaunching] = useState<boolean>(false);
-  const [spawningRecipe, setSpawningRecipe] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    fetchRecipes()
-      .then((items) => {
-        if (!cancelled) setRecipes(items);
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          setRecipes([]);
-          setError(err instanceof Error ? err.message : String(err));
-        }
-      });
     fetchHarnessDescriptors()
       .then((items) => {
         if (!cancelled) setHarnesses(items);
@@ -91,33 +90,11 @@ export function CreateScreen({ onCreated, onCancel }: CreateScreenProps): JSX.El
     }
   }
 
-  async function handleSpawnRecipe(r: RecipeDescriptor) {
-    setSpawningRecipe(r.id);
-    setError(null);
-    try {
-      const nodeIds = await spawnRecipe(r.id, {
-        harness: harness as HarnessKind,
-        substrate: substrate as SubstrateKind,
-        workspace: workspace || undefined,
-        description: prompt || `${r.title} · ${new Date().toISOString()}`,
-      });
-      if (nodeIds.length > 0) {
-        onCreated(nodeIds[0]);
-      } else {
-        setError(`recipe ${r.id} returned no nodes`);
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSpawningRecipe(null);
-    }
-  }
-
   const selectedHarness = harnesses.find((h) => h.id === harness);
 
   return (
     <div className="page" style={{ maxWidth: 880 }}>
-      <div className="page-head">
+          <div className="page-head">
         <div>
           <h1 className="page-title">launch node</h1>
           <div className="page-sub">creates a real harness session. capabilities advertised at launch.</div>
@@ -204,10 +181,16 @@ export function CreateScreen({ onCreated, onCancel }: CreateScreenProps): JSX.El
                 >
                   <div style={{ display: "flex", alignItems: "center", gap: 8, width: "100%" }}>
                     <span>{s.name}</span>
-                    <Pill status={s.healthy ? "running" : "errored"}>{s.healthy ? "healthy" : "down"}</Pill>
+                  <Pill status={s.healthy ? "running" : "errored"}>
+                    {formatSubstrateStatus(s.status, s.healthy)}
+                  </Pill>
                   </div>
                   <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, opacity: 0.7 }}>
-                    {s.host} · {s.healthy ? `cap ${Math.round(s.capacity * 100)}%` : "unreachable"}
+                    {substrateMetricsHint(
+                      formatSubstrateStatus(s.status, s.healthy),
+                      s.host,
+                      s.capacity,
+                    )}
                   </span>
                 </button>
               ))}
@@ -225,9 +208,11 @@ export function CreateScreen({ onCreated, onCancel }: CreateScreenProps): JSX.El
                 <option value="custom">custom…</option>
               </select>
             </Field>
-            <Field label="workspace" hint="absolute path or repo url">
+            <Field label="workspace" hint="absolute path to a local workspace directory">
               <input
+                aria-label="workspace"
                 className="input mono"
+                placeholder="/abs/path/to/workspace"
                 value={workspace}
                 onChange={(e) => setWorkspace(e.target.value)}
               />
@@ -246,87 +231,6 @@ export function CreateScreen({ onCreated, onCancel }: CreateScreenProps): JSX.El
         </div>
 
         <div className="col" style={{ gap: 18 }}>
-          <Panel eyebrow="recipes" flush>
-            {recipes === null && (
-              <div
-                style={{
-                  padding: "10px 14px",
-                  fontFamily: "var(--font-mono)",
-                  fontSize: 11,
-                  color: "var(--fg-muted)",
-                }}
-              >
-                loading recipes…
-              </div>
-            )}
-            {recipes !== null && recipes.length === 0 && (
-              <div
-                style={{
-                  padding: "10px 14px",
-                  fontFamily: "var(--font-mono)",
-                  fontSize: 11,
-                  color: "var(--fg-muted)",
-                }}
-              >
-                no recipes available
-              </div>
-            )}
-            {recipes !== null &&
-              recipes.map((r) => {
-                const sub = r.prompt_template.split("\n")[0].slice(0, 80);
-                const isSpawning = spawningRecipe === r.id;
-                return (
-                  <div
-                    key={r.id}
-                    onClick={() => setRecipe(r.id)}
-                    style={{
-                      padding: "10px 14px",
-                      cursor: "pointer",
-                      borderBottom: "1px solid var(--border-subtle)",
-                      background: recipe === r.id ? "var(--bg-elev-2)" : "transparent",
-                    }}
-                  >
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 8,
-                        fontFamily: "var(--font-mono)",
-                        fontSize: 12,
-                        color: "var(--fg)",
-                      }}
-                    >
-                      <span style={{ flex: 1 }}>{r.title}</span>
-                      <Tag kind={r.kind === "fanout" ? "fanout" : "single"}>{r.kind}</Tag>
-                    </div>
-                    <div
-                      style={{
-                        fontFamily: "var(--font-mono)",
-                        fontSize: 10,
-                        color: "var(--fg-muted)",
-                        marginTop: 2,
-                      }}
-                    >
-                      {sub}
-                    </div>
-                    <div style={{ marginTop: 8 }}>
-                      <Btn
-                        kind="primary"
-                        size="sm"
-                        icon="play"
-                        disabled={isSpawning || spawningRecipe !== null}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          void handleSpawnRecipe(r);
-                        }}
-                      >
-                        {isSpawning ? "spawning…" : "spawn"}
-                      </Btn>
-                    </div>
-                  </div>
-                );
-              })}
-          </Panel>
           <Panel eyebrow="capabilities at launch">
             <div className="capgrid">
               {selectedHarness?.caps.slice(0, 8).map((c) => (

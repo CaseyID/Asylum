@@ -5,7 +5,6 @@ import type {
   AttachBrowserResponse,
   ChannelCreateRequest,
   ChannelDescriptor,
-  ChannelInboundRequest,
   ChannelMessageRecord,
   ChannelTestRequest,
   ChannelUpdateRequest,
@@ -29,10 +28,9 @@ import type {
   HookUpdateRequest,
   NativeTargetResponse,
   NotificationRecord,
-  RecipeDescriptor,
-  RecipeSpawnRequest,
   SubstrateDescriptor,
   SubstrateKind,
+  RecipeListResponse,
   TokenListResponse,
   TokenRotateResponse,
 } from "./types";
@@ -248,6 +246,29 @@ export async function requestBrowserAttach(nodeId: string): Promise<AttachBrowse
   return data;
 }
 
+export interface AttachSocketOptions {
+  onMessage?: (data: string) => void;
+  onError?: (e: Event) => void;
+  onClose?: () => void;
+  onOpen?: () => void;
+}
+
+export function openAttachSocket(token: string, options: AttachSocketOptions = {}): WebSocket {
+  const proto = typeof window !== "undefined" && window.location.protocol === "https:" ? "wss" : "ws";
+  const host = typeof window !== "undefined" ? window.location.host : "";
+  const url = `${proto}://${host}/api/attach/${encodeURIComponent(token)}/ws`;
+  const ws = new WebSocket(url);
+  if (options.onOpen) ws.addEventListener("open", () => options.onOpen!());
+  if (options.onMessage) {
+    ws.addEventListener("message", (event: MessageEvent) => {
+      options.onMessage!(event.data as string);
+    });
+  }
+  if (options.onError) ws.addEventListener("error", (e: Event) => options.onError!(e));
+  if (options.onClose) ws.addEventListener("close", () => options.onClose!());
+  return ws;
+}
+
 export async function requestNativeTarget(nodeId: string): Promise<NativeTargetResponse> {
   const data = await request<
     NativeTargetResponse | { command: string; args: string[]; environment: Record<string, string>; label?: string }
@@ -306,13 +327,6 @@ export async function fetchChannelMessages(id: string, limit = 200): Promise<Cha
 
 export async function testChannel(id: string, body: ChannelTestRequest): Promise<{ sent: boolean }> {
   return request<{ sent: boolean }>(`/channels/${id}/test`, {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
-}
-
-export async function inboundChannel(id: string, body: ChannelInboundRequest): Promise<void> {
-  await request<void>(`/channels/${id}/inbound`, {
     method: "POST",
     body: JSON.stringify(body),
   });
@@ -389,17 +403,11 @@ export async function resolveDecision(id: string, req: DecisionResolveRequest): 
 
 // — recipes —
 
-export async function fetchRecipes(): Promise<RecipeDescriptor[]> {
-  const data = await request<{ recipes: RecipeDescriptor[] } | RecipeDescriptor[]>("/recipes");
-  return Array.isArray(data) ? data : data.recipes ?? [];
-}
-
-export async function spawnRecipe(id: string, req: RecipeSpawnRequest): Promise<string[]> {
-  const data = await request<{ node_ids: string[] } | string[]>(`/recipes/${id}/spawn`, {
-    method: "POST",
-    body: JSON.stringify(req),
-  });
-  return Array.isArray(data) ? data : data.node_ids ?? [];
+export async function fetchRecipes(): Promise<RecipeListResponse["recipes"]> {
+  const data = await request<{ recipes: RecipeListResponse["recipes"] } | RecipeListResponse>("/recipes");
+  return Array.isArray((data as { recipes?: unknown })?.recipes)
+    ? ((data as { recipes: RecipeListResponse["recipes"] }).recipes)
+    : (data as RecipeListResponse).recipes;
 }
 
 // — fork —

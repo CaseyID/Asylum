@@ -6,11 +6,22 @@ import {
   deleteChannel,
   fetchChannelMessages,
   fetchChannels,
-  inboundChannel,
   testChannel,
   updateChannel,
 } from "../api";
 import type { ChannelDescriptor, ChannelMessageRecord } from "../types";
+
+const CHANNEL_KINDS = ["ntfy", "webhook"] as const;
+type ChannelKind = (typeof CHANNEL_KINDS)[number];
+
+const directionOptionsByKind: Record<ChannelKind, ("inbound" | "outbound" | "duplex")[]> = {
+  ntfy: ["outbound", "inbound", "duplex"],
+  webhook: ["inbound"],
+};
+
+function defaultDirection(kind: ChannelKind): "inbound" | "outbound" | "duplex" {
+  return kind === "webhook" ? "inbound" : "outbound";
+}
 
 function fmtTs(epoch: number): string {
   if (!epoch) return "—";
@@ -44,10 +55,6 @@ function ChannelRow({
   const glyph: Record<string, string> = {
     ntfy: "◉",
     webhook: "⇄",
-    sms: "✉",
-    discord: "◈",
-    slack: "◇",
-    email: "✦",
   };
   const g = glyph[ch.kind] ?? "·";
   return (
@@ -56,7 +63,7 @@ function ChannelRow({
       <div className="m">
         <div className="r1">
           <span className="nm">{ch.name}</span>
-          {!ch.live && <span className="badge-future">future</span>}
+          {!ch.live && <span className="badge-future">inactive</span>}
         </div>
         <div className="r2">{ch.label}</div>
       </div>
@@ -74,6 +81,12 @@ function ChannelRow({
   );
 }
 
+function canSendTestForChannel(ch: ChannelDescriptor): boolean {
+  if (ch.kind !== "ntfy") return false;
+  if (!ch.live) return false;
+  return ch.direction === "outbound" || ch.direction === "duplex";
+}
+
 function ChannelDetail({
   ch,
   msgs,
@@ -82,7 +95,6 @@ function ChannelDetail({
   onSendTest,
   onOpenSettings,
   onSubscribe,
-  onOpenInbound,
   sendStatus,
 }: {
   ch: ChannelDescriptor;
@@ -92,10 +104,10 @@ function ChannelDetail({
   onSendTest: () => void;
   onOpenSettings: () => void;
   onSubscribe: () => void;
-  onOpenInbound: () => void;
   sendStatus: { ok: boolean; text: string } | null;
 }) {
-  const stat = ch.live ? "connected" : "not built";
+  const canSendTest = canSendTestForChannel(ch);
+  const stat = ch.live ? "connected" : "disabled";
   const lastAt = msgs.length > 0 ? fmtTs(msgs[0].ts_epoch_secs) : "—";
   return (
     <div className="ch-detail">
@@ -143,14 +155,20 @@ function ChannelDetail({
           ))}
         </div>
         <div className="acts">
-          {ch.live && (ch.direction === "inbound" || ch.direction === "duplex") && (
-            <Btn size="sm" icon="message-square" onClick={onOpenInbound}>
-              record inbound
-            </Btn>
-          )}
-          <Btn size="sm" icon="send" onClick={onSendTest}>
+          <Btn
+            size="sm"
+            icon="send"
+            title={canSendTest ? "send test message" : "send test unavailable: no outbound adapter for this channel"}
+            onClick={onSendTest}
+            disabled={!canSendTest}
+          >
             send test
           </Btn>
+          {!canSendTest && (
+            <span style={{ fontSize: 11, color: "var(--fg-muted)" }}>
+              send-test unavailable · no outbound adapter
+            </span>
+          )}
         </div>
       </div>
       {sendStatus && (
@@ -214,7 +232,7 @@ function ChannelDetail({
       ) : (
         <div className="ch-future">
           <div className="g">⌖</div>
-          <div className="t">adapter not built</div>
+          <div className="t">adapter disabled</div>
           <div className="d">{ch.detail}</div>
         </div>
       )}
@@ -229,13 +247,18 @@ function CreateChannelModal({
   onClose: () => void;
   onCreated: () => void;
 }) {
-  const [kind, setKind] = useState("ntfy");
+  const [kind, setKind] = useState<(typeof CHANNEL_KINDS)[number]>(CHANNEL_KINDS[0]);
+  const [direction, setDirection] = useState<"inbound" | "outbound" | "duplex">(defaultDirection(CHANNEL_KINDS[0]));
   const [name, setName] = useState("");
   const [label, setLabel] = useState("");
-  const [direction, setDirection] = useState("outbound");
   const [detail, setDetail] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const options = directionOptionsByKind[kind];
+
+  useEffect(() => {
+    setDirection(defaultDirection(kind));
+  }, [kind]);
 
   const submit = async () => {
     setBusy(true);
@@ -264,13 +287,15 @@ function CreateChannelModal({
       }
     >
       <Field label="kind">
-        <select value={kind} onChange={(e) => setKind(e.target.value)}>
-          <option value="ntfy">ntfy</option>
-          <option value="webhook">webhook</option>
-          <option value="sms">sms</option>
-          <option value="discord">discord</option>
-          <option value="slack">slack</option>
-          <option value="email">email</option>
+        <select
+          value={kind}
+          onChange={(e) => setKind(e.target.value as ChannelKind)}
+        >
+          {CHANNEL_KINDS.map((supportedKind) => (
+            <option key={supportedKind} value={supportedKind}>
+              {supportedKind}
+            </option>
+          ))}
         </select>
       </Field>
       <Field label="name">
@@ -280,10 +305,12 @@ function CreateChannelModal({
         <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="short description" />
       </Field>
       <Field label="direction">
-        <select value={direction} onChange={(e) => setDirection(e.target.value)}>
-          <option value="outbound">outbound</option>
-          <option value="inbound">inbound</option>
-          <option value="duplex">duplex</option>
+        <select value={direction} onChange={(e) => setDirection(e.target.value as "inbound" | "outbound" | "duplex")}>
+          {options.map((value) => (
+            <option key={value} value={value}>
+              {value}
+            </option>
+          ))}
         </select>
       </Field>
       <Field label="detail">
@@ -397,88 +424,6 @@ function SubscribeModal({ ch, onClose }: { ch: ChannelDescriptor; onClose: () =>
   );
 }
 
-function InboundMessageModal({
-  ch,
-  onClose,
-  onRecorded,
-}: {
-  ch: ChannelDescriptor;
-  onClose: () => void;
-  onRecorded: (status: { ok: boolean; text: string }) => void;
-}) {
-  const [sender, setSender] = useState("operator");
-  const [subject, setSubject] = useState("manual inbound");
-  const [body, setBody] = useState("");
-  const [replies, setReplies] = useState("");
-  const [nodeId, setNodeId] = useState("");
-  const [correlationToken, setCorrelationToken] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-
-  const submit = async () => {
-    setBusy(true);
-    setErr(null);
-    try {
-      await inboundChannel(ch.id, {
-        sender,
-        subject,
-        body,
-        replies: replies
-          .split(",")
-          .map((value) => value.trim())
-          .filter(Boolean),
-        node_id: nodeId.trim() || undefined,
-        correlation_token: correlationToken.trim() || undefined,
-      });
-      onRecorded({
-        ok: true,
-        text: nodeId.trim()
-          ? "inbound recorded · routed to node input"
-          : "inbound recorded",
-      });
-      onClose();
-    } catch (e) {
-      setErr(String((e as Error).message));
-      setBusy(false);
-    }
-  };
-
-  return (
-    <Modal
-      title={`record inbound · ${ch.name}`}
-      onClose={onClose}
-      foot={
-        <>
-          <Btn onClick={onClose}>cancel</Btn>
-          <Btn kind="primary" onClick={submit} disabled={busy || !body.trim()}>
-            record
-          </Btn>
-        </>
-      }
-    >
-      <Field label="sender">
-        <input value={sender} onChange={(e) => setSender(e.target.value)} />
-      </Field>
-      <Field label="subject">
-        <input value={subject} onChange={(e) => setSubject(e.target.value)} />
-      </Field>
-      <Field label="body">
-        <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={5} />
-      </Field>
-      <Field label="quick replies" hint="comma-separated labels">
-        <input value={replies} onChange={(e) => setReplies(e.target.value)} placeholder="approve, deny, attach" />
-      </Field>
-      <Field label="correlation token" hint="optional manual correlation metadata; ntfy reply markers are correlated automatically">
-        <input value={correlationToken} onChange={(e) => setCorrelationToken(e.target.value)} />
-      </Field>
-      <Field label="route to node" hint="optional node id; body is sent to the node input stream">
-        <input value={nodeId} onChange={(e) => setNodeId(e.target.value)} placeholder="00000000-0000-0000-0000-000000000000" />
-      </Field>
-      {err && <div style={{ color: "var(--status-errored)", fontSize: 12 }}>{err}</div>}
-    </Modal>
-  );
-}
-
 export function ChannelsScreen(): JSX.Element {
   const [channels, setChannels] = useState<ChannelDescriptor[]>([]);
   const [messages, setMessages] = useState<ChannelMessageRecord[]>([]);
@@ -487,18 +432,33 @@ export function ChannelsScreen(): JSX.Element {
   const [showCreate, setShowCreate] = useState(false);
   const [showEdit, setShowEdit] = useState(false);
   const [showSubscribe, setShowSubscribe] = useState(false);
-  const [showInbound, setShowInbound] = useState(false);
   const [sendStatus, setSendStatus] = useState<{ ok: boolean; text: string } | null>(null);
+  const [channelsLoading, setChannelsLoading] = useState(true);
+  const [channelsError, setChannelsError] = useState<string | null>(null);
+  const [messagesError, setMessagesError] = useState<string | null>(null);
 
   const refreshChannels = async () => {
-    const cs = await fetchChannels();
-    setChannels(cs);
+    setChannelsLoading(true);
+    try {
+      const cs = await fetchChannels();
+      setChannels(cs);
+      setChannelsError(null);
+    } catch (err) {
+      setChannelsError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setChannelsLoading(false);
+    }
   };
 
   const refreshMessages = async (id: string) => {
     if (!id) return;
-    const ms = await fetchChannelMessages(id);
-    setMessages(ms);
+    try {
+      const ms = await fetchChannelMessages(id);
+      setMessages(ms);
+      setMessagesError(null);
+    } catch (err) {
+      setMessagesError(err instanceof Error ? err.message : String(err));
+    }
   };
 
   useEffect(() => {
@@ -514,6 +474,8 @@ export function ChannelsScreen(): JSX.Element {
 
   useEffect(() => {
     if (!activeId) return;
+    setMessages([]);
+    setMessagesError(null);
     refreshMessages(activeId);
     const t = window.setInterval(() => refreshMessages(activeId), 5000);
     return () => window.clearInterval(t);
@@ -524,11 +486,19 @@ export function ChannelsScreen(): JSX.Element {
   const msgs = filter === "all" ? allMsgs : allMsgs.filter((m) => m.direction === filter);
 
   const liveCount = channels.filter((c) => c.live).length;
-  const futureCount = channels.length - liveCount;
   const total24h = channels.reduce((s, c) => s + c.message_count_24h, 0);
+  const inactiveCount = channels.length - liveCount;
 
   const onSendTest = async () => {
     if (!active) return;
+    if (!canSendTestForChannel(active)) {
+      setSendStatus({
+        ok: false,
+        text: "send-test unavailable · this channel type has no outbound adapter",
+      });
+      return;
+    }
+
     setSendStatus(null);
     try {
       const r = await testChannel(active.id, {
@@ -539,14 +509,14 @@ export function ChannelsScreen(): JSX.Element {
       setMessages(fresh);
       setSendStatus({
         ok: r.sent,
-        text: r.sent ? "sent · message recorded" : "recorded but not delivered (adapter not live)",
+        text: r.sent ? "sent · message recorded" : "recorded but not delivered (adapter disabled)",
       });
     } catch (e) {
       setSendStatus({ ok: false, text: "send failed: " + String((e as Error).message) });
     }
   };
 
-  if (channels.length === 0) {
+  if (channels.length === 0 && channelsLoading) {
     return (
       <div className="page channels-page">
         <div className="page-head">
@@ -560,14 +530,27 @@ export function ChannelsScreen(): JSX.Element {
     );
   }
 
+  if (channelsError && channels.length === 0) {
+    return (
+      <div className="page channels-page">
+        <div className="page-head">
+          <div>
+            <h1 className="page-title">channels</h1>
+            <div className="page-sub">how nodes reach you when you&apos;re away · how commands come back in</div>
+          </div>
+        </div>
+        <Empty glyph="⚠" lead="unable to load channels" sub={channelsError} />
+      </div>
+    );
+  }
+
   return (
     <div className="page channels-page">
       <div className="page-head">
         <div>
           <h1 className="page-title">channels</h1>
           <div className="page-sub">
-            how nodes reach you when you&apos;re away · how commands come back in · {liveCount} live, {futureCount}{" "}
-            planned · {total24h} msgs / 24h
+            how nodes reach you when you&apos;re away · how commands come back in · {liveCount} live, {inactiveCount} disabled · {total24h} msgs / 24h
           </div>
         </div>
         <div className="page-actions">
@@ -588,7 +571,7 @@ export function ChannelsScreen(): JSX.Element {
               ))}
           </div>
           <div className="ch-group">
-            <div className="ch-group-lab">planned · adapters not built</div>
+            <div className="ch-group-lab">inactive · adapters disabled</div>
             {channels
               .filter((c) => !c.live)
               .map((c) => (
@@ -607,9 +590,22 @@ export function ChannelsScreen(): JSX.Element {
               onSendTest={onSendTest}
               onOpenSettings={() => setShowEdit(true)}
               onSubscribe={() => setShowSubscribe(true)}
-              onOpenInbound={() => setShowInbound(true)}
               sendStatus={sendStatus}
             />
+          )}
+          {messagesError && (
+            <div
+              style={{
+                margin: "12px 16px 0",
+                padding: "10px 12px",
+                fontSize: 12,
+                border: "1px solid var(--status-errored)",
+                color: "var(--status-errored)",
+                background: "var(--status-errored-bg)",
+              }}
+            >
+              message refresh failed: {messagesError}
+            </div>
           )}
         </div>
       </div>
@@ -636,17 +632,6 @@ export function ChannelsScreen(): JSX.Element {
         />
       )}
       {showSubscribe && active && <SubscribeModal ch={active} onClose={() => setShowSubscribe(false)} />}
-      {showInbound && active && (
-        <InboundMessageModal
-          ch={active}
-          onClose={() => setShowInbound(false)}
-          onRecorded={(status) => {
-            setSendStatus(status);
-            refreshMessages(active.id);
-            refreshChannels();
-          }}
-        />
-      )}
     </div>
   );
 }

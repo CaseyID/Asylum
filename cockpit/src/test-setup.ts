@@ -97,3 +97,34 @@ if (typeof window !== "undefined") {
     value: TestResizeObserver,
   });
 }
+
+function testMatchMedia(query: string): MediaQueryList {
+  return {
+    matches: false,
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  };
+}
+
+Object.defineProperty(globalThis, "matchMedia", {
+  configurable: true,
+  value: testMatchMedia,
+});
+if (typeof window !== "undefined") {
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    value: testMatchMedia,
+  });
+}
+
+if (typeof HTMLCanvasElement !== "undefined") {
+  Object.defineProperty(HTMLCanvasElement.prototype, "getContext", {
+    configurable: true,
+    value: () => null,
+  });
+}

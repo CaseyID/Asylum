@@ -11,8 +11,9 @@ export function uiStateForLiveness(liveness: NodeLiveness): UiState {
     case "waiting_for_input":
       return "waiting";
     case "exited":
-    case "archived":
       return "idle";
+    case "archived":
+      return "archived";
     case "failed":
       return "errored";
     case "stopped":
@@ -114,5 +115,7 @@ export function previewFor(node: AsylumNode): string {
       return "— idle";
     case "stopped":
       return "— stopped";
+    case "archived":
+      return "— archived";
   }
 }

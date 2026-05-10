@@ -23,7 +23,7 @@ export interface FleetScreenProps {
   onOpen: (node: AsylumNode) => void;
 }
 
-const STATE_FILTERS: ("all" | UiState)[] = ["all", "running", "waiting", "idle", "errored", "stopped"];
+const STATE_FILTERS: ("all" | UiState)[] = ["all", "running", "waiting", "idle", "errored", "stopped", "archived"];
 
 export function FleetScreen({ nodes, onLaunch, onOpen }: FleetScreenProps): JSX.Element {
   const [q, setQ] = useState("");
@@ -38,7 +38,15 @@ export function FleetScreen({ nodes, onLaunch, onOpen }: FleetScreenProps): JSX.
   }, [nodes, q, filter]);
 
   const counts = useMemo(() => {
-    const c: Record<string, number> = { all: nodes.length, running: 0, waiting: 0, idle: 0, errored: 0, stopped: 0 };
+    const c: Record<string, number> = {
+      all: nodes.length,
+      running: 0,
+      waiting: 0,
+      idle: 0,
+      errored: 0,
+      stopped: 0,
+      archived: 0,
+    };
     nodes.forEach((n) => {
       const s = uiStateOf(n);
       c[s] = (c[s] ?? 0) + 1;

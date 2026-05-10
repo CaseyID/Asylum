@@ -1164,6 +1164,18 @@ mod tests {
     }
 
     #[test]
+    fn systemd_unit_text_renders_explicit_path_setting() {
+        let unit = render_systemd_unit(&ServiceRenderConfig {
+            binary: PathBuf::from("/usr/local/bin/asylum"),
+            config: PathBuf::from("/tmp/asylum/config.toml"),
+            log: PathBuf::from("/tmp/asylum/logs/asylum.log"),
+            path: Some("/home/user/.local/bin:/usr/bin:/bin".to_string()),
+        });
+
+        assert!(unit.contains("Environment=PATH=/home/user/.local/bin:/usr/bin:/bin\n"));
+    }
+
+    #[test]
     fn systemd_renderer_omits_path_environment_when_none() {
         let unit = render_systemd_unit(&render_config());
         assert!(!unit.contains("Environment=PATH="));

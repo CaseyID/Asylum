@@ -6,6 +6,7 @@ use crate::harness::claude::ClaudeHarness;
 use crate::harness::codex::CodexHarness;
 use asylum_types::config::HarnessConfig;
 use asylum_types::node::{CapabilitySnapshot, HarnessKind};
+use uuid::Uuid;
 
 mod claude;
 mod codex;
@@ -21,7 +22,11 @@ pub trait HarnessAdapter: Send + Sync {
     fn command(&self) -> &str;
     fn launch_args(&self) -> &[String];
     fn capabilities(&self) -> CapabilitySnapshot;
-    fn launch_context(&self, request: &asylum_types::api::CreateNodeRequest) -> String;
+    fn launch_context(
+        &self,
+        node_id: Uuid,
+        request: &asylum_types::api::CreateNodeRequest,
+    ) -> String;
     /// Idempotently record the workspace path as trusted in the harness's own config
     /// so the first-run trust dialog is skipped when the process spawns.
     fn pre_trust_workspace(&self, workspace: &str) -> anyhow::Result<()>;
@@ -154,9 +159,10 @@ mod tests {
     #[test]
     fn config_startup_args_are_appended_after_defaults() {
         let mut config = HarnessConfig::default();
-        config
-            .startup_args
-            .insert("codex".to_string(), vec!["--model".to_string(), "o3".to_string()]);
+        config.startup_args.insert(
+            "codex".to_string(),
+            vec!["--model".to_string(), "o3".to_string()],
+        );
 
         let registry = HarnessRegistry::from_config(&config);
         let codex = registry.get(&HarnessKind::Codex).unwrap();

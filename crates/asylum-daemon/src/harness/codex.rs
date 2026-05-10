@@ -46,9 +46,13 @@ impl super::HarnessAdapter for CodexHarness {
         }
     }
 
-    fn launch_context(&self, request: &asylum_types::api::CreateNodeRequest) -> String {
+    fn launch_context(
+        &self,
+        node_id: uuid::Uuid,
+        request: &asylum_types::api::CreateNodeRequest,
+    ) -> String {
         let context = LaunchContext {
-            node_id: uuid::Uuid::new_v4(),
+            node_id,
             workspace: request.workspace.clone().map(std::path::PathBuf::from),
             role_hint: request.role_hint.clone(),
             graph_summary: "No relationships by default".to_string(),
@@ -96,7 +100,9 @@ impl super::HarnessAdapter for CodexHarness {
             raw.parse::<toml::Value>()?
         };
 
-        let table = doc.as_table_mut().ok_or_else(|| anyhow::anyhow!("codex config is not a TOML table"))?;
+        let table = doc
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("codex config is not a TOML table"))?;
         let projects = table
             .entry("projects")
             .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
@@ -113,7 +119,10 @@ impl super::HarnessAdapter for CodexHarness {
                 .as_table_mut()
                 .ok_or_else(|| anyhow::anyhow!("codex config project entry is not a table"))?;
             if entry_table.get("trust_level").and_then(|v| v.as_str()) != Some("trusted") {
-                entry_table.insert("trust_level".to_string(), toml::Value::String("trusted".to_string()));
+                entry_table.insert(
+                    "trust_level".to_string(),
+                    toml::Value::String("trusted".to_string()),
+                );
                 any_changed = true;
             }
         }
@@ -123,7 +132,9 @@ impl super::HarnessAdapter for CodexHarness {
         }
 
         // Write atomically: temp file in same dir then rename.
-        let dir = config_path.parent().ok_or_else(|| anyhow::anyhow!("config path has no parent"))?;
+        let dir = config_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("config path has no parent"))?;
         fs::create_dir_all(dir)?;
         let tmp_path = config_path.with_extension("toml.tmp");
         {
