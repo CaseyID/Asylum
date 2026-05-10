@@ -4,26 +4,24 @@ This file is the entry point for AI coding agents (Claude Code, Codex, others) w
 
 ## What Asylum is
 
-A single-user, always-on control plane for real agent harness sessions (Codex, Claude Code, etc.). It launches them, gives them shared tools and context, observes them, lets humans attach or intervene, and lets harnesses coordinate other harnesses across local and Loon-backed substrates. It does NOT replace harnesses; it orchestrates them.
+A single-user, always-on control plane for real agent harness sessions (Codex, Claude Code, etc.). It launches them, gives them shared tools and context, observes them, lets humans open live node sessions and intervene, and lets harnesses coordinate other harnesses across local and Loon-backed substrates. It does NOT replace harnesses; it orchestrates them.
 
 The core product object is the **Node**: a live or resumable harness session. Roles (command-center, supervisor, worker, evaluator, assistant) are hints, not mandatory workflow states. The cockpit is the primary first-party UI; CLI, MCP, and API share the same root capabilities.
 
 Canonical current product spec: [docs/specs/asylum-current-product-spec.md](docs/specs/asylum-current-product-spec.md).
 
-Original PRD / product-intent source: [docs/prd/asylum-live-v2-prd.md](docs/prd/asylum-live-v2-prd.md).
+Current docs map: [docs/README.md](docs/README.md).
 
 ## Current focus — read this if you're picking up active work
 
-**Cockpit deliverability and prototype-residue cleanup is delivered (2026-04-29).** All 7 PRs merged to `main` (range `6e5054a..7458e4c`). See:
+**Current branch focus:** Cockpit node interaction should be session-first. Users should click/select nodes and operate the live session; Cockpit should not expose "attach" as a normal UX concept.
 
-- **Delivery handoff:** [docs/handoff/2026-04-29-cockpit-deliverability-and-prototype-cleanup.md](docs/handoff/2026-04-29-cockpit-deliverability-and-prototype-cleanup.md) — what shipped, what's deferred, manual smoke owed.
-- **Plan + audit (canonical):** [docs/reviews/2026-04-29-cockpit-audit-and-deliverability-plan.md](docs/reviews/2026-04-29-cockpit-audit-and-deliverability-plan.md) — Status section reflects all 7 PRs landed.
-- **CHANGELOG:** [CHANGELOG.md](CHANGELOG.md) — release notes for the delivery.
-- **Prior ultrareview (companion findings, all addressed):** [docs/reviews/2026-04-29-local-ultrareview-findings.md](docs/reviews/2026-04-29-local-ultrareview-findings.md)
+Branch-local source of truth for this cleanup:
 
-**Active follow-up under discussion:** ntfy inbound auto-routing into node input streams. Transport works; addressing/correlation does not. Design notes in the delivery handoff; no PR open yet.
-
-**Current spec coverage audit brief:** [docs/reviews/2026-05-05-asylum-spec-coverage-audit-brief.md](docs/reviews/2026-05-05-asylum-spec-coverage-audit-brief.md) — use this for the next full repo-vs-spec gap audit.
+- **Current product spec:** [docs/specs/asylum-current-product-spec.md](docs/specs/asylum-current-product-spec.md)
+- **Session UX design note:** [docs/superpowers/specs/2026-05-09-cockpit-node-session-ux-design.md](docs/superpowers/specs/2026-05-09-cockpit-node-session-ux-design.md)
+- **Session UX implementation/verification plan:** [docs/superpowers/plans/2026-05-09-cockpit-node-session-ux.md](docs/superpowers/plans/2026-05-09-cockpit-node-session-ux.md)
+- **Release truth:** [RELEASES.md](RELEASES.md)
 
 ## The principle that drives current work
 
@@ -39,12 +37,12 @@ Test fixtures and unit-test mocks are fine. The principle applies to behavior de
 ## Repository layout
 
 - `crates/asylum/` — tiny composition crate that builds the installed `asylum` binary
-- `crates/asylum-cli/` — CLI, MCP bridge, Unix-socket daemon client, service lifecycle, native attach helpers
+- `crates/asylum-cli/` — CLI, MCP bridge, Unix-socket daemon client, service lifecycle, native session compatibility helpers
 - `crates/asylum-daemon/` — daemon runtime, HTTP/WebSocket Cockpit service, storage (SQLite), substrates (`local`, `loon`), harnesses (`claude_code`, `codex`), hooks engine, channels, capability service
 - `crates/asylum-types/` — shared types and contracts (API, capabilities, config, security primitives)
 - `cockpit/` — TypeScript/React single-page app served by the daemon (`/api/...` routes; `/` serves the SPA)
 - `scripts/` — release, install, build-artifact scripts
-- `docs/` — PRD, handoffs, reviews, source trail, plan archive
+- `docs/` — current product spec plus active branch design/plan notes
 
 ## How to work
 
@@ -90,10 +88,10 @@ Asylum is **released manually**. There is no GitHub Actions release pipeline by 
 
 **Tracking is your job. Cutting is the user's call.**
 
-When you finish a delivery cycle (a multi-PR plan from `docs/reviews/` or `docs/handoff/`):
+When you finish a delivery cycle:
 
 1. Open [RELEASES.md](RELEASES.md) and skim the ledger so you know the current published version and what's outstanding.
-2. **Update tracking, always:** the delivery's plan/handoff must end with a "Release status" section that says one of:
+2. **Update tracking, always:** the delivery plan must end with a "Release status" section that says one of:
    - `Released as vX.Y.Z` (with link to GitHub release + which platforms shipped)
    - `On main, not released — awaiting authorization. Last release: vX.Y.Z (date).`
    - `Doc-only / internal — no release needed. Last release: vX.Y.Z (date).`
@@ -101,7 +99,7 @@ When you finish a delivery cycle (a multi-PR plan from `docs/reviews/` or `docs/
 4. **Exception:** if the user has explicitly authorized autonomous mode for the delivery (e.g., "execute the whole plan and ship it") — then cut the release as the final step and update the ledger.
 5. Whenever you do cut: bump version, build, tag, publish, **update the RELEASES.md ledger row**. The ledger update is what makes it real for the next agent.
 
-Every plan/handoff document must include a "Release status" section that links to the ledger. If you're authoring a plan and you don't see one, add one. If you're picking up an existing plan and the section is missing or stale, fix it before starting work.
+Every delivery plan must include a "Release status" section that links to the ledger. If you're authoring a plan and you don't see one, add one. If you're picking up an existing plan and the section is missing or stale, fix it before starting work.
 
 ## Conventions to preserve
 
@@ -114,6 +112,5 @@ Every plan/handoff document must include a "Release status" section that links t
 
 ## Other entry points
 
-- General product handoff (older, pre-implementation): [docs/handoff/transition-to-implementation-planning.md](docs/handoff/transition-to-implementation-planning.md)
-- Source-trail / context: [docs/context/source-trail.md](docs/context/source-trail.md)
 - README (user-facing install/run): [README.md](README.md)
+- Changelog: [CHANGELOG.md](CHANGELOG.md)

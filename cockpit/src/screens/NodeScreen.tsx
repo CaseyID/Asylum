@@ -26,8 +26,6 @@ interface NodeEventRecord {
 }
 
 export type NodeScreenAction =
-  | "attach"
-  | "native-attach"
   | "send"
   | "interrupt"
   | "fork"
@@ -143,14 +141,6 @@ export function NodeScreen({
             <span className="id">{shortNodeId(node.id)}</span>
             <Pill status={state}>{uiStateLabel(state)}</Pill>
             {cc && <Tag kind="role">command-center</Tag>}
-            <span className="right">
-              <Btn size="sm" icon="external-link" onClick={() => fire("attach", "attach link issued")}>
-                open attach tab
-              </Btn>
-              <Btn size="sm" icon="terminal" onClick={() => fire("native-attach", "terminal attach prepared")}>
-                open in terminal
-              </Btn>
-            </span>
           </div>
           <div className="meta">
             <span>
@@ -183,8 +173,6 @@ export function NodeScreen({
             key={node.id}
             node={node}
             mode="fullscreen"
-            onAttach={() => fire("attach", "attach link issued")}
-            onNativeAttach={() => fire("native-attach", "terminal attach prepared")}
             onInterrupt={() => fire("interrupt", "sigint sent · paused")}
           />
         )}
@@ -435,8 +423,6 @@ function CapsView({ node, harnesses }: { node: AsylumNode; harnesses: HarnessDes
   const harness = harnesses.find((h) => h.id === node.harness);
   const caps = node.capabilities;
   const rows: [string, boolean][] = [
-    ["browser_attach", caps.browser_attach],
-    ["native_attach", caps.native_attach],
     ["send_input", caps.send_input],
     ["interrupt", caps.interrupt],
     ["stop", caps.stop],

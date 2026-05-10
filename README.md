@@ -2,17 +2,16 @@
 
 Asylum is a single-user, always-on control plane for real agent harness sessions.
 
-It does not replace Codex, Claude Code, Pi, Hermes, or future harnesses. It launches them, gives them shared tools and context, observes them, lets humans attach or intervene, and lets harnesses coordinate other harnesses across local and Loon-backed substrates.
+It does not replace Codex, Claude Code, Pi, Hermes, or future harnesses. It launches them, gives them shared tools and context, observes them, lets humans open live node sessions and intervene, and lets harnesses coordinate other harnesses across local and Loon-backed substrates.
 
 The core product object is the **Node**: a live or resumable harness session running somewhere. A node may be a command center, supervisor, worker, evaluator, plain assistant, or custom role, but those are role hints, not mandatory workflow states.
 
 ## Start Here
 
 - Current product spec: [docs/specs/asylum-current-product-spec.md](docs/specs/asylum-current-product-spec.md)
-- Product PRD: [docs/prd/asylum-live-v2-prd.md](docs/prd/asylum-live-v2-prd.md)
-- Spec coverage audit brief: [docs/reviews/2026-05-05-asylum-spec-coverage-audit-brief.md](docs/reviews/2026-05-05-asylum-spec-coverage-audit-brief.md)
-- Implementation-planning handoff: [docs/handoff/transition-to-implementation-planning.md](docs/handoff/transition-to-implementation-planning.md)
-- Source and context trail: [docs/context/source-trail.md](docs/context/source-trail.md)
+- Docs map: [docs/README.md](docs/README.md)
+- Current node session UX plan: [docs/superpowers/plans/2026-05-09-cockpit-node-session-ux.md](docs/superpowers/plans/2026-05-09-cockpit-node-session-ux.md)
+- Release ledger: [RELEASES.md](RELEASES.md)
 
 ## Product Path
 
@@ -74,7 +73,7 @@ When configured, the daemon subscribes to the topic at startup. Inbound ntfy mes
 - Local substrate behavior is the most validated path. Loon is optional and requires a configured Loon endpoint plus the `loon` CLI contract.
 - Inbound ntfy/webhook messages are recorded and can trigger hooks, but node addressing/reply correlation is still limited.
 - Decisions are not yet a first-class operator workflow; remote approve/deny pieces exist, but pending decision surfacing is incomplete.
-- Keep Cockpit bound to localhost unless you are deliberately protecting access with a private network such as Tailscale. Browser attach URLs and transcripts are sensitive.
+- Keep Cockpit bound to localhost unless you are deliberately protecting access with a private network such as Tailscale. Session URLs and transcripts are sensitive.
 
 ## Release Artifact Expectations
 
@@ -215,7 +214,6 @@ These commands print service definitions you can save as launch artifacts.
 ./target/debug/asylum node stop <node-id>
 ./target/debug/asylum node archive <node-id>
 ./target/debug/asylum graph get
-./target/debug/asylum attach <node-id>
 ./target/debug/asylum token issue --name operator --scope node.create node.list graph.get
 ./target/debug/asylum notify send --title "note" --body "message"
 ./target/debug/asylum mcp
@@ -228,11 +226,11 @@ Token scopes are advisory labels in v0.1.x. Owner-token auth is enforced at the 
 - `ASYLUM_BASE_URL` (default `http://127.0.0.1:7717`) for Cockpit URLs and explicit HTTP clients
 - `ASYLUM_TOKEN` (Bearer token for protected endpoints)
 - `ASYLUM_OWNER_TOKEN` and `ASYLUM_OWNER_TOKENS_ENABLED` for daemon-side owner-token auth
-- `ASYLUM_ATTACH_SECRET` for attach URL signing; omitted means a per-process random secret
+- `ASYLUM_ATTACH_SECRET` for internal signed session transport; omitted means a per-process random secret
 - `ASYLUM_NTFY_SERVER`, `ASYLUM_NTFY_TOPIC`, `ASYLUM_NTFY_TOKEN`
 - `ASYLUM_LOON_ENABLED`, `ASYLUM_LOON_ENDPOINT`, and optional config-file `loon.cli_path`, `loon.api_key_file`, `loon.cert_fingerprint_file`
 
-When Loon is enabled, Asylum drives the documented `loon` CLI contract (`spawn`, `tell`, `interrupt`, `stop`, `terminate`, `attach`) and passes `LOON_ENDPOINT` plus configured auth/cert env vars to that process.
+When Loon is enabled, Asylum drives the documented `loon` CLI contract for launch, input, interrupt, stop, terminate, and session relay operations. It passes `LOON_ENDPOINT` plus configured auth/cert env vars to that process.
 
 ### Acceptance Walkthrough
 
@@ -241,18 +239,16 @@ When Loon is enabled, Asylum drives the documented `loon` CLI contract (`spawn`,
 3. Create a node:
    - `asylum node create --harness codex --substrate local --role worker`
    - Verify `/api/nodes/:id` returns created `node_id`.
-4. Attach and observe:
-   - `asylum attach <node-id>` prints a native attach command.
+4. Observe and interact:
    - `wss`/WS path `/api/nodes/:id/observe/ws` returns at least an initial message and closes cleanly.
-5. Emit a browser attach:
+   - `asylum node send <node-id> "status"` records input and reaches the node when the harness supports input.
+5. Inspect root capabilities:
    - `asylum node inspect <node-id>` shows a node record.
-   - `asylum mcp` starts JSON-RPC stdio server and advertises `node.create`, `node.list`, `node.inspect`, `node.send_input`, `node.interrupt`, `node.stop`, `graph.get`, `attach_url.issue`.
-6. Generate a browser URL:
-   - `curl -X POST -H 'Content-Type: application/json' /api/nodes/<id>/attach/browser` returns `{ "url", "expires_in_seconds" }` in `attach` response.
-7. Generate notifications:
+   - `asylum mcp` starts JSON-RPC stdio server and advertises `node.create`, `node.list`, `node.inspect`, `node.send_input`, `node.interrupt`, `node.stop`, `graph.get`, and relationship tools.
+6. Generate notifications:
    - `asylum notify send --title "hello" --body "it works"` returns `notify sent: true` when sender config is enabled.
-8. Exercise remote commands:
+7. Exercise remote commands:
    - Issue a token, then `curl -X POST -H 'Content-Type: application/json' -d '{"command":"status token=<token>"}' http://127.0.0.1:7717/api/remote-commands`.
-9. If Loon is configured:
+8. If Loon is configured:
    - `asylum daemon run --loon-enabled --loon-endpoint https://<host>:7777`
    - `asylum node create --harness claude_code --substrate loon --role worker`

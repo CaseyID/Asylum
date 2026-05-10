@@ -17,8 +17,6 @@ import {
   hydrateOwnerTokenFromLocation,
   interruptNode,
   postNodeInput,
-  requestBrowserAttach,
-  requestNativeTarget,
   sendRemoteCommand,
   setStoredOwnerToken,
   stopNode,
@@ -336,20 +334,7 @@ export function App() {
   ): Promise<void> {
     if (!target) return;
     try {
-      if (action === "attach") {
-        const r = await requestBrowserAttach(target.id);
-        setLocalNotice(r.note ?? `attach link issued · ttl ${r.expires_in_seconds ?? 3600}s`);
-        if (typeof window !== "undefined" && r.attach_url) {
-          window.open(r.attach_url, "_blank", "noopener,noreferrer");
-        }
-      } else if (action === "native-attach") {
-        const r = await requestNativeTarget(target.id);
-        const cmd = [r.command, ...r.args].join(" ");
-        if (typeof navigator !== "undefined" && navigator.clipboard) {
-          await navigator.clipboard.writeText(cmd);
-        }
-        setLocalNotice("terminal attach command copied to clipboard");
-      } else if (action === "send") {
+      if (action === "send") {
         setSelectedNode(target.id);
         setChatNodeId(target.id);
         setScreen("chat");
@@ -381,7 +366,9 @@ export function App() {
   }
 
   const inspectorAction = useCallback(
-    (action: InspectorAction | "native-attach", payload?: string) => handleNodeAction(selectedNode, action, payload),
+    (action: InspectorAction, payload?: string) => {
+      void handleNodeAction(selectedNode, action, payload);
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [selectedNode],
   );
@@ -539,8 +526,6 @@ export function App() {
               nodes={graph.nodes}
               chatNodeId={chatNodeId ?? ccNode?.id}
               onSelectChat={setChatNodeId}
-              onAttach={(node) => void handleNodeAction(node, "attach")}
-              onNativeAttach={(node) => void handleNodeAction(node, "native-attach")}
               onInterrupt={(node) => void handleNodeAction(node, "interrupt")}
               onLaunch={() => setScreen("create")}
             />
@@ -566,23 +551,12 @@ export function App() {
             setScreen("node");
             setCmdkOpen(false);
           }}
-          onAttachInBrowser={() => {
-            const target =
-              graph.nodes.find((n) => n.id === selectedNodeId) ??
-              graph.nodes.find((n) => n.id === openNodeId);
-            setCmdkOpen(false);
-            if (!target) {
-              setLocalNotice("select a node first");
-              return;
-            }
-            void handleNodeAction(target, "attach");
-          }}
           onSendRemoteCommand={() => {
             setCmdkOpen(false);
             const example =
               "send token=<owner-token> node=<node-id> text=<message>";
             const raw = window.prompt(
-              `remote command:\n  status token=…\n  ${example}\n  interrupt token=… node=…\n  stop token=… node=…\n  attach token=… node=…`,
+              `remote command:\n  status token=…\n  ${example}\n  interrupt token=… node=…\n  stop token=… node=…`,
               "",
             );
             if (!raw || !raw.trim()) return;

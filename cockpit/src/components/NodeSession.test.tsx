@@ -63,7 +63,7 @@ const caps: CapabilitySnapshot = {
 
 function node(overrides: Partial<AsylumNode> = {}): AsylumNode {
   return {
-    id: "node-attach-loop",
+    id: "node-session-loop",
     harness: "codex",
     substrate: "local",
     role_hint: "worker",
@@ -142,7 +142,7 @@ class MockWebSocket {
   }
 }
 
-describe("NodeSession attach events", () => {
+describe("NodeSession session semantics", () => {
   beforeEach(() => {
     apiMocks.postNodeInput.mockReset();
     apiMocks.openNodeObserveSocket.mockReset();
@@ -174,39 +174,61 @@ describe("NodeSession attach events", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders attach-issued history without firing the attach action again", async () => {
+  it("does not expose attach controls in the session header", () => {
+    apiMocks.openNodeObserveSocket.mockReturnValue({ close: vi.fn() });
+
+    const { queryByTitle } = render(<NodeSession node={node()} />);
+
+    expect(queryByTitle("open attach tab")).toBeNull();
+    expect(queryByTitle("open attach tab via loon attach")).toBeNull();
+    expect(queryByTitle("open in terminal")).toBeNull();
+  });
+
+  it("ignores attach-issued history as an internal transport event", async () => {
     let onMessage: ((data: string) => void) | undefined;
     apiMocks.openNodeObserveSocket.mockImplementation((_nodeId: string, options: { onMessage?: (data: string) => void }) => {
       onMessage = options.onMessage;
       return { close: vi.fn() };
     });
-    const onAttach = vi.fn();
 
-    const { getByText } = render(<NodeSession node={node()} onAttach={onAttach} />);
+    const { container, queryByText, queryByTitle } = render(<NodeSession node={node()} />);
+
+    await waitFor(() => {
+      expect(onMessage).toBeTypeOf("function");
+    });
 
     onMessage?.(JSON.stringify({
       kind: "attach_issued",
-      node_id: "node-attach-loop",
+      node_id: "node-session-loop",
       body: {
         url: "http://127.0.0.1:7717/attach/token",
-        node_id: "node-attach-loop",
+        node_id: "node-session-loop",
       },
     }));
 
-    fireEvent.click(getByText("struct"));
-    await waitFor(() => expect(getByText("open a time-limited Cockpit attach view for this node")).toBeDefined());
-    expect(onAttach).not.toHaveBeenCalled();
+    await waitFor(() => expect(apiMocks.openNodeObserveSocket).toHaveBeenCalled());
+    expect(queryByText("open a time-limited Cockpit attach view for this node")).toBeNull();
+    expect(queryByTitle("open attach tab")).toBeNull();
+    expect(container.textContent ?? "").not.toContain("attach tab");
   });
 
-  it("fires the attach action only from the explicit toolbar button", () => {
-    apiMocks.openNodeObserveSocket.mockReturnValue({ close: vi.fn() });
-    const onAttach = vi.fn();
+  it("describes Loon live-stream limitations in session language", async () => {
+    let onMessage: ((data: string) => void) | undefined;
+    apiMocks.openNodeObserveSocket.mockImplementation((_nodeId: string, options: { onMessage?: (data: string) => void }) => {
+      onMessage = options.onMessage;
+      return { close: vi.fn() };
+    });
 
-    const { getByTitle } = render(<NodeSession node={node()} onAttach={onAttach} />);
+    const { queryByText, getByText, container } = render(<NodeSession node={node({ substrate: "loon" })} />);
 
-    fireEvent.click(getByTitle("open attach tab"));
+    onMessage?.("asylum.observe.ws.initialized");
+    onMessage?.("asylum.observe.ws.live_stream_unavailable");
+    fireEvent.click(getByText("struct"));
 
-    expect(onAttach).toHaveBeenCalledWith("node-attach-loop");
+    await waitFor(() => {
+      expect(container.textContent).toContain("Loon nodes do not stream local PTY-style live observe output; open the node session for an interactive terminal");
+    });
+    expect(queryByText(/use attach/i)).toBeNull();
   });
 
   it("renders missing workspace as none, not a home-directory default", () => {
@@ -240,7 +262,7 @@ describe("NodeSession attach events", () => {
     const ws = MockWebSocket.instances[0];
     ws.open();
 
-    const prompt = screen.getByPlaceholderText(/send input to node-attach-loop/i);
+    const prompt = screen.getByPlaceholderText(/send input to node-session-loop/i);
     fireEvent.change(prompt, { target: { value: "Reply with ASYLUM_VALIDATION_ACK" } });
     fireEvent.keyDown(prompt, { key: "Enter", code: "Enter" });
 
@@ -279,8 +301,8 @@ describe("NodeSession attach events", () => {
     ws.close();
     xtermMocks.terminals[0].emitData("b");
 
-    expect(apiMocks.postNodeInput).toHaveBeenCalledWith("node-attach-loop", "a");
-    expect(apiMocks.postNodeInput).toHaveBeenCalledWith("node-attach-loop", "b");
+    expect(apiMocks.postNodeInput).toHaveBeenCalledWith("node-session-loop", "a");
+    expect(apiMocks.postNodeInput).toHaveBeenCalledWith("node-session-loop", "b");
   });
 
   it("falls back to line input when attach token cannot be extracted", async () => {
@@ -299,7 +321,7 @@ describe("NodeSession attach events", () => {
 
     xtermMocks.terminals[0].emitData("q");
 
-    await waitFor(() => expect(apiMocks.postNodeInput).toHaveBeenCalledWith("node-attach-loop", "q"));
+    await waitFor(() => expect(apiMocks.postNodeInput).toHaveBeenCalledWith("node-session-loop", "q"));
     expect(MockWebSocket.instances).toHaveLength(0);
     expect(apiMocks.postNodeInput).toHaveBeenCalledTimes(1);
   });
@@ -326,8 +348,8 @@ describe("NodeSession attach events", () => {
 
     ws.open();
 
-    await waitFor(() => expect(apiMocks.postNodeInput).toHaveBeenCalledWith("node-attach-loop", "a"));
-    expect(apiMocks.postNodeInput).toHaveBeenCalledWith("node-attach-loop", "\r");
+    await waitFor(() => expect(apiMocks.postNodeInput).toHaveBeenCalledWith("node-session-loop", "a"));
+    expect(apiMocks.postNodeInput).toHaveBeenCalledWith("node-session-loop", "\r");
     expect(ws.sent).toEqual([]);
     expect(apiMocks.postNodeInput).toHaveBeenCalledTimes(2);
   });
@@ -355,8 +377,8 @@ describe("NodeSession attach events", () => {
       const matching = screen.getAllByText(/send-input fallback failed: input endpoint offline/i);
       expect(matching).toHaveLength(2);
     });
-    expect(apiMocks.postNodeInput).toHaveBeenCalledWith("node-attach-loop", "q");
-    expect(apiMocks.postNodeInput).toHaveBeenCalledWith("node-attach-loop", "\r");
+    expect(apiMocks.postNodeInput).toHaveBeenCalledWith("node-session-loop", "q");
+    expect(apiMocks.postNodeInput).toHaveBeenCalledWith("node-session-loop", "\r");
     expect(apiMocks.postNodeInput).toHaveBeenCalledTimes(2);
   });
 });

@@ -29,10 +29,10 @@ const apiMocks = vi.hoisted(() => {
     hydrateOwnerTokenFromLocation: vi.fn(),
     interruptNode: vi.fn(),
     markNotificationRead: vi.fn(),
+    openAttachSocket: vi.fn(),
     openNodeObserveSocket: vi.fn(),
     postNodeInput: vi.fn(),
     requestBrowserAttach: vi.fn(),
-    requestNativeTarget: vi.fn(),
     sendRemoteCommand: vi.fn(),
     setStoredOwnerToken: vi.fn(),
     stopNode: vi.fn(),
@@ -133,6 +133,12 @@ describe("App populated daemon state", () => {
       transport: "local_pty",
       note: null,
     });
+    apiMocks.openAttachSocket.mockReturnValue({
+      readyState: 1,
+      send: vi.fn(),
+      close: vi.fn(),
+      addEventListener: vi.fn(),
+    } as unknown as WebSocket);
   });
 
   afterEach(() => {

@@ -18,7 +18,7 @@ export interface CockpitScreenProps {
   onOpen: (node: AsylumNode) => void;
   layout: GraphLayout;
   setLayout: (layout: GraphLayout) => void;
-  onAction: (action: InspectorAction | "native-attach", payload?: string) => void;
+  onAction: (action: InspectorAction, payload?: string) => void;
   onExpandToChat: (nodeId: string) => void;
   onLaunchCC: () => void;
   substrates: { id: string; name: string; healthy: boolean; capacity: number }[];
@@ -94,8 +94,6 @@ export function CockpitScreen({
               key={panelNode.id}
               node={panelNode}
               mode="cockpit"
-              onAttach={() => onAction("attach")}
-              onNativeAttach={() => onAction("native-attach")}
               onInterrupt={() => onAction("interrupt")}
               onExpand={() => onExpandToChat(panelNode.id)}
             />
