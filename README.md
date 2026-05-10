@@ -77,6 +77,10 @@ When configured, the daemon subscribes to the topic at startup. Inbound ntfy mes
 
 ## Release Artifact Expectations
 
+Asylum releases are built locally from this checkout. There is no GitHub
+Actions release pipeline. Use the Cargo release commands for the normal path;
+they wrap the release scripts behind the scenes.
+
 Local release packaging produces archives named:
 
 - `asylum-darwin-arm64.tar.gz`
@@ -86,16 +90,50 @@ Local release packaging produces archives named:
 
 Each archive should contain exactly one executable `asylum` binary.
 
-Build artifacts locally from a MacBook with Docker running:
+Normal release flow:
 
 ```bash
-scripts/build-release-artifacts.sh --version v0.1.1
-scripts/publish-release.sh --version v0.1.1 --dry-run
-scripts/publish-release.sh --version v0.1.1
-scripts/test-release-install.sh --version v0.1.1
+# after version/changelog/release-ledger updates are committed
+git tag -a vX.Y.Z -m "vX.Y.Z"
+cargo build-asylum-release -- --version vX.Y.Z
+cargo test-asylum-release -- --version vX.Y.Z
+cargo publish-asylum-release -- --version vX.Y.Z --dry-run
+cargo publish-asylum-release -- --version vX.Y.Z
 ```
 
-The local release builder uses native macOS Rust targets for `darwin-arm64` and `darwin-x86_64`, and Docker for `linux-arm64` and `linux-x86_64`. On Apple Silicon, `linux-x86_64` is cross-compiled from a native arm64 Linux container so the compiler does not run under amd64 emulation. The release build runs the Cockpit production build before compiling the release binaries so Cockpit is embedded into each archive.
+If you omit `--version`, the commands use the workspace version in
+`Cargo.toml`. Build/test/publish read and write `dist/release/vX.Y.Z/`. To
+pass release-script options, put them after `--`:
+
+```bash
+cargo build-asylum-release -- --version v0.1.11 --targets linux-x86_64,darwin-arm64
+cargo test-asylum-release -- --version v0.1.11
+cargo publish-asylum-release -- --version v0.1.11 --targets linux-x86_64,darwin-arm64 --dry-run
+```
+
+`cargo publish-asylum-release` expects a clean working tree and a local tag
+for the release version pointing at `HEAD`. It preserves existing GitHub
+Release assets unless you explicitly pass `--allow-clobber`.
+
+The underlying scripts are still available for lower-level work:
+
+- `scripts/build-release-artifacts.sh`
+- `scripts/publish-release.sh`
+- `scripts/test-release-install.sh`
+
+The release builder runs `npm --prefix cockpit ci`, builds Cockpit production
+assets, then compiles the release binaries so Cockpit is embedded into each
+archive. Both Apple Silicon macOS and Linux x86_64 hosts can build the full
+four-archive matrix:
+
+- On Linux x86_64, `linux-x86_64` builds natively in Docker, while
+  `darwin-arm64`, `darwin-x86_64`, and `linux-arm64` build through the pinned
+  `ghcr.io/rust-cross/cargo-zigbuild` Docker image. That image provides
+  cargo-zigbuild, zig, and the macOS SDK; no QEMU, osxcross, or extra apt
+  setup is required beyond Docker.
+- On Apple Silicon macOS, Darwin targets use native/cross Rust targets, Linux
+  ARM builds in an arm64 Docker container, and Linux x86_64 is cross-compiled
+  from that arm64 Linux container.
 
 ### Trust model
 
