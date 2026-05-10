@@ -16,7 +16,7 @@ const STEPS: [string, string][] = [
   ["ask it to run another node", "launch a second local node with a fresh context"],
   ["watch the graph", "spawned nodes appear as supervisor / worker cards with explicit edges"],
   ["inspect any node", "live transcript, capability matrix"],
-  ["open attach tab", "real harness ui at any time, no extra install required"],
+  ["open node session", "real harness ui or terminal from the node workspace"],
   ["receive ntfy", "remote command channel — tokened replies require command payloads"],
   ["drive from mcp", "asylum tools available in claude desktop, cursor, anything mcp-capable"],
   ["hand off to remote substrates", "support depends on substrate setup and may have capability differences"],

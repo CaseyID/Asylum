@@ -13,7 +13,6 @@ import {
 import type { AsylumNode, GraphRelationship } from "../types";
 
 export type InspectorAction =
-  | "attach"
   | "send"
   | "interrupt"
   | "fork"
@@ -29,8 +28,6 @@ export interface InspectorProps {
 }
 
 const CAPABILITY_KEYS: Array<keyof AsylumNode["capabilities"]> = [
-  "browser_attach",
-  "native_attach",
   "send_input",
   "interrupt",
   "stop",
@@ -143,13 +140,6 @@ export function Inspector({ node, onAction, onOpen, relationships }: InspectorPr
             <Btn
               size="sm"
               kind="primary"
-              icon="external-link"
-              onClick={() => onAction("attach")}
-            >
-              attach
-            </Btn>
-            <Btn
-              size="sm"
               icon="message-square"
               onClick={() => onAction("send")}
             >

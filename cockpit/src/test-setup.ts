@@ -91,10 +91,32 @@ Object.defineProperty(globalThis, "ResizeObserver", {
   configurable: true,
   value: TestResizeObserver,
 });
+
+const createMatchMedia = (query: string): MediaQueryList => ({
+  matches: query === "(pointer: fine)",
+  media: query,
+  onchange: null,
+  addEventListener: () => {},
+  removeEventListener: () => {},
+  addListener: () => {},
+  removeListener: () => {},
+  dispatchEvent: () => false,
+});
+
+Object.defineProperty(globalThis, "matchMedia", {
+  configurable: true,
+  value: createMatchMedia,
+});
+
 if (typeof window !== "undefined") {
   Object.defineProperty(window, "ResizeObserver", {
     configurable: true,
     value: TestResizeObserver,
+  });
+
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    value: createMatchMedia,
   });
 }
 
