@@ -136,43 +136,92 @@ installer falls back to `<archive>.sha256`. If neither artifact is reachable,
 verification fails the same way as the missing-tool path (use
 `ASYLUM_SKIP_CHECKSUM=1` to override).
 
-For release binaries, use the release scripts. For source builds, prefer the
-Cargo stack commands below; they run the Cockpit build behind the scenes before
-building Rust when needed.
+## Source Development With Cargo
 
-## Source and Advanced CLI (below product path)
+Cargo commands operate on this source checkout only. They do not manage the
+installed `asylum` binary or user service. The repo-local `xtask` crate backs
+these aliases so day-to-day source work does not require typing direct
+`npm --prefix cockpit ...` or release-script commands.
 
-### Source Build
+Naming:
+
+- `run-*` starts a source-built process.
+- `build-*` produces artifacts and exits.
+- `test-*` runs tests and exits.
+- `check-*` runs fast validation and exits.
+- `status-*` reports source-dev runtime state.
+- `stop-*` stops source-dev runtime processes.
+- `reset-*` stops source-dev processes and removes source-dev runtime state.
+- `*-dev` means watch/hot reload/source-dev runtime state.
+
+| Command                         | Meaning |
+|---------------------------------|---------|
+| `cargo run-asylum-dev`          | Full source dev loop: daemon + Cockpit hot reload. Long-running. |
+| `cargo run-daemon-dev`          | Source daemon only, watched/restarted on Rust changes, `.asylum-dev`, `127.0.0.1:7788`. |
+| `cargo run-cockpit-dev`         | Cockpit/Vite only, hot reload, proxies to source daemon. |
+| `cargo run-asylum`              | Product-like source run: build Cockpit once, then run daemon serving built UI. No hot reload. |
+| `cargo run-daemon`              | Source daemon only, no watch/hot reload. |
+| `cargo build-asylum`            | Full source product build: Cockpit assets + Rust workspace. |
+| `cargo build-rust`              | Rust workspace only. |
+| `cargo build-cockpit`           | Cockpit production assets only. |
+| `cargo build-asylum-release`    | Build release artifacts into `dist/release/vX.Y.Z/`; wraps the release build script internally. |
+| `cargo test-asylum`             | Full repo test pass: Rust + Cockpit. |
+| `cargo test-rust`               | Rust workspace tests only. |
+| `cargo test-cockpit`            | Cockpit/Vitest only. |
+| `cargo test-asylum-release`     | Smoke-test the host release archive from `dist/release/vX.Y.Z/`. |
+| `cargo check-asylum`            | Fast preflight: format/check/build-style validation, no long-running server. |
+| `cargo status-asylum-dev`       | Show source-dev daemon/Vite processes, ports, and `.asylum-dev` state. |
+| `cargo stop-asylum-dev`         | Stop source-dev daemon/Vite processes for this checkout. |
+| `cargo reset-asylum-dev`        | Stop source-dev processes and clear `.asylum-dev`. |
+| `cargo publish-asylum-release`  | Publish already-built release artifacts to GitHub Releases; wraps the release publish script internally. |
+
+Runtime and artifact paths:
+
+| Path                    | Purpose |
+|-------------------------|---------|
+| `target/debug/`         | Source-built Rust binaries and debug artifacts. |
+| `target/release/`       | Source-built Rust release artifacts. |
+| `cockpit/dist/`         | Cockpit production build used by product-like source runs and releases. |
+| `.asylum-dev/`          | Source-dev runtime state: config, DB, socket, logs. Safe to delete via `cargo reset-asylum-dev`. |
+| `dist/release/vX.Y.Z/`  | Local release archives/checksums before publishing. |
+
+Common workflows:
 
 ```bash
-cargo build-stack
+# Full source dev loop
+cargo run-asylum-dev
+
+# Backend-only work
+cargo run-daemon-dev
+
+# Frontend-only work
+cargo run-cockpit-dev
+
+# Check what source dev left running
+cargo status-asylum-dev
+
+# Stop source dev processes
+cargo stop-asylum-dev
+
+# Product-like run from the checkout, no hot reload
+cargo run-asylum
+
+# Full build and test
+cargo build-asylum
+cargo test-asylum
 ```
 
-### Source Run
+Release workflow from source:
 
 ```bash
-cargo run-stack
+cargo build-asylum-release
+cargo test-asylum-release
+cargo publish-asylum-release
 ```
 
-For hot-reload development:
-
-```bash
-cargo dev          # daemon + Cockpit Vite dev server
-cargo dev-daemon   # daemon only; rebuilds/restarts on Rust changes
-cargo dev-cockpit  # Cockpit only; proxies /api to the daemon
-cargo test-stack   # Rust tests + Cockpit tests
-```
-
-These are Cargo aliases defined in `.cargo/config.toml`. They run the repo-local
-`xtask` tooling crate; they are not `asylum` product CLI subcommands.
-The frontend still uses Node/Vite internally, but normal source work should not
-require typing `npm --prefix cockpit ...` directly.
-Source dev/runtime commands default to `.asylum-dev/` under the checkout and
-`127.0.0.1:7788`, which keeps them separate from an installed daemon using
-`~/.asylum` and `127.0.0.1:7717`.
-
-Useful overrides: `ASYLUM_DEV_BIND=127.0.0.1:7790` changes the daemon bind,
-and `ASYLUM_COCKPIT_DEV_PORT=5174` changes the Vite dev-server port.
+Useful source-dev overrides: `ASYLUM_DEV_BIND=127.0.0.1:7790` changes the
+daemon bind, and `ASYLUM_COCKPIT_DEV_PORT=5174` changes the Vite dev-server
+port.
 
 For protected mode, bootstrap with an owner token and point CLI/Cockpit at it:
 
@@ -186,9 +235,9 @@ ASYLUM_TOKEN="$ASYLUM_OWNER_TOKEN" ./target/debug/asylum graph get
 open "http://127.0.0.1:7717/?token=$ASYLUM_OWNER_TOKEN"
 ```
 
-The debug daemon exposes:
-- `~/.asylum/run/asylum.sock` for local CLI/MCP control
-- `http://127.0.0.1:7717/api/...` for Cockpit HTTP APIs
+The source daemon exposes:
+- `.asylum-dev/run/asylum.sock` for local CLI/MCP control when using the Cargo source workflow
+- `http://127.0.0.1:7788/api/...` for Cockpit HTTP APIs by default
 - `/` for the Cockpit single-page UI when `cockpit/dist/index.html` exists
 - `/assets/*` for static assets from `cockpit/dist/assets`
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Replaced the Cargo source workflow aliases with explicit `run-*`, `build-*`, `test-*`, `check-*`, `status-*`, `stop-*`, and `reset-*` naming.
+- Removed Cargo aliases that delegated to the installed product; source checkout work now stays under Cargo, installed product lifecycle stays under the installed `asylum` command.
+- `cargo test-asylum-release` now smoke-tests the local host release archive from `dist/release/vX.Y.Z/`.
+
 ## 0.1.10 — 2026-05-07
 
 ### Added
@@ -27,14 +35,13 @@
 
 ### Added
 
-- Added repo-local `cargo dev`, `cargo build-stack`, `cargo test-stack`, and `cargo run-stack` workflows backed by an `xtask` crate.
-- Added Cargo aliases for installed product lifecycle checks (`cargo status-stack`, `cargo doctor-stack`, and related commands) that delegate to the installed `asylum` binary.
+- Added repo-local Cargo source workflows backed by an `xtask` crate.
 - Added Vite API/WebSocket proxying for Cockpit source development.
 
 ### Fixed
 
 - Source dev/runtime commands now default to `.asylum-dev/` and `127.0.0.1:7788` so they do not collide with the installed `~/.asylum` daemon on `127.0.0.1:7717`.
-- `cargo dev-daemon` now respects Cargo's target directory instead of assuming `target/debug/asylum`.
+- The source daemon dev launcher now respects Cargo's target directory instead of assuming `target/debug/asylum`.
 
 ## 0.1.8 — 2026-05-06
 
