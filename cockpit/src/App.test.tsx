@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { App } from "./App";
 import { useCockpitStore } from "./state";
 import type { AsylumNode, CapabilitySnapshot, GraphRelationship } from "./types";
@@ -126,6 +126,13 @@ describe("App populated daemon state", () => {
       removeEventListener: vi.fn(),
       close: vi.fn(),
     });
+    apiMocks.requestBrowserAttach.mockResolvedValue({
+      attach_url: "http://localhost/attach/session",
+      token: "session-token",
+      expires_in_seconds: 3600,
+      transport: "local_pty",
+      note: null,
+    });
   });
 
   afterEach(() => {
@@ -172,4 +179,51 @@ describe("App populated daemon state", () => {
     expect(container.textContent).toContain("worker");
     expect(container.textContent).toContain("local");
   });
+
+  it("marks per-resource refresh failures instead of silently keeping stale state", async () => {
+    const nodes = [node({ id: "cc-node", role_hint: "command-center", liveness: "running" })];
+    apiMocks.fetchGraph.mockResolvedValue({ nodes, relationships: [] });
+    apiMocks.fetchChannels.mockRejectedValue(new Error("channel endpoint unavailable"));
+
+    render(<App />);
+
+    await waitFor(() => expect(apiMocks.fetchChannels).toHaveBeenCalled());
+    expect(screen.getByText(/channels: channels refresh failed: channel endpoint unavailable/i)).toBeDefined();
+  });
+
+  it("logs ntfy toast polling failures instead of swallowing them", async () => {
+    const channels = [
+      {
+        id: "ntfy-main",
+        kind: "ntfy",
+        name: "ntfy",
+        label: "ntfy",
+        direction: "duplex",
+        status: "live",
+        detail: "ntfy",
+        config: {},
+        live: true,
+        builtin: true,
+        created_at_epoch_secs: 0,
+        message_count_24h: 0,
+      },
+    ];
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    apiMocks.fetchGraph.mockResolvedValue({ nodes: [node({ id: "cc-node", role_hint: "command-center", liveness: "running" })], relationships: [] });
+    apiMocks.fetchChannels.mockResolvedValue(channels);
+    apiMocks.fetchChannelMessages.mockRejectedValue(new Error("ntfy timeout"));
+
+    render(<App />);
+    await waitFor(() => expect(apiMocks.fetchChannels).toHaveBeenCalled());
+
+    await new Promise((resolve) => setTimeout(resolve, 6500));
+    await waitFor(() =>
+      expect(consoleSpy).toHaveBeenCalledWith(
+        "ntfy toast poll failed",
+        expect.objectContaining({ channelId: "ntfy-main", reason: "ntfy timeout" }),
+      ),
+    );
+
+    consoleSpy.mockRestore();
+  }, 12000);
 });

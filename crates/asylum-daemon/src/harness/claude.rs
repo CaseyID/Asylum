@@ -47,9 +47,13 @@ impl super::HarnessAdapter for ClaudeHarness {
         }
     }
 
-    fn launch_context(&self, request: &asylum_types::api::CreateNodeRequest) -> String {
+    fn launch_context(
+        &self,
+        node_id: uuid::Uuid,
+        request: &asylum_types::api::CreateNodeRequest,
+    ) -> String {
         let context = LaunchContext {
-            node_id: uuid::Uuid::new_v4(),
+            node_id,
             workspace: request.workspace.clone().map(std::path::PathBuf::from),
             role_hint: request.role_hint.clone(),
             graph_summary: "Graph edges are explicit only.".to_string(),

@@ -118,6 +118,8 @@ body { overflow: hidden; background: var(--bg); }
 .pill-info .dot { background: var(--status-info); }
 .pill-stopped { border-color: var(--border); background: transparent; color: var(--fg-subtle); }
 .pill-stopped .dot { background: var(--fg-subtle); }
+.pill-archived { border-color: var(--border); background: transparent; color: var(--fg-muted); }
+.pill-archived .dot { background: var(--fg-muted); }
 
 .tag {
   display: inline-flex; align-items: center; gap: 4px;
@@ -807,7 +809,15 @@ select.input {
   display: flex; align-items: center; gap: 6px;
   animation: fadeInUp 240ms ease both;
 }
+.node-side .action-flash.error {
+  color: var(--status-errored);
+}
 .node-side .action-flash .ok-tick {
+  display: inline-flex; width: 14px; height: 14px; align-items: center; justify-content: center;
+  border: 1px solid currentColor; border-radius: 999px;
+  font-size: 9px;
+}
+.node-side .action-flash .fail-cross {
   display: inline-flex; width: 14px; height: 14px; align-items: center; justify-content: center;
   border: 1px solid currentColor; border-radius: 999px;
   font-size: 9px;

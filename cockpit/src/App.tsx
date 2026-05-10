@@ -53,6 +53,15 @@ import type {
   SubstrateDescriptor,
 } from "./types";
 
+type ResourceStatus = "fresh" | "stale" | "unknown";
+
+type ResourceRefreshState = {
+  channels: { status: ResourceStatus; error: string | null };
+  hooks: { status: ResourceStatus; error: string | null };
+  substrates: { status: ResourceStatus; error: string | null };
+  harnesses: { status: ResourceStatus; error: string | null };
+};
+
 export function App() {
   const {
     graph,
@@ -85,6 +94,12 @@ export function App() {
   const [localError, setLocalError] = useState<string | null>(null);
   const [localNotice, setLocalNotice] = useState<string | null>(null);
   const [notifications, setNotifications] = useState<NotificationRecord[]>([]);
+  const [resourceRefreshState, setResourceRefreshState] = useState<ResourceRefreshState>({
+    channels: { status: "unknown", error: null },
+    hooks: { status: "unknown", error: null },
+    substrates: { status: "unknown", error: null },
+    harnesses: { status: "unknown", error: null },
+  });
   const refreshInFlight = useRef(false);
 
   // theme attribute on <html>
@@ -127,19 +142,33 @@ export function App() {
       setNotifications(notifs);
       setHealth(daemonHealth);
       setCommandCenterSelection(cc?.id);
-      try {
-        const [c, h, s, harnesses] = await Promise.all([
-          fetchChannels(),
-          fetchHooks(),
-          fetchSubstrateDescriptors(),
-          fetchHarnessDescriptors(),
-        ]);
-        setChannels(c);
-        setHooks(h);
-        setSubstrates(s);
+      const resourceCalls = await Promise.allSettled([
+        fetchChannels(),
+        fetchHooks(),
+        fetchSubstrateDescriptors(),
+        fetchHarnessDescriptors(),
+      ]);
+
+      setResourceRefreshState((prev) => ({
+        ...prev,
+        channels: describeResourceResult("channels", resourceCalls[0]),
+        hooks: describeResourceResult("hooks", resourceCalls[1]),
+        substrates: describeResourceResult("substrates", resourceCalls[2]),
+        harnesses: describeResourceResult("harnesses", resourceCalls[3]),
+      }));
+
+      if (resourceCalls[0].status === "fulfilled") {
+        setChannels(resourceCalls[0].value);
+      }
+      if (resourceCalls[1].status === "fulfilled") {
+        setHooks(resourceCalls[1].value);
+      }
+      if (resourceCalls[2].status === "fulfilled") {
+        setSubstrates(resourceCalls[2].value);
+      }
+      if (resourceCalls[3].status === "fulfilled") {
+        const harnesses = resourceCalls[3].value;
         setHarnessCount(harnesses.filter((item) => item.available).length);
-      } catch {
-        /* leave previous state */
       }
       setLocalError(null);
       setAuthRequired(false);
@@ -215,8 +244,11 @@ export function App() {
             replies: latest.replies,
           },
         ].slice(-3));
-      } catch {
-        /* silent — surface via Logs screen */
+      } catch (err) {
+        console.error("ntfy toast poll failed", {
+          channelId: ntfyChannel.id,
+          reason: err instanceof Error ? err.message : String(err),
+        });
       }
     };
     const t = setInterval(tick, 6000);
@@ -297,7 +329,11 @@ export function App() {
     }
   }
 
-  async function handleNodeAction(target: AsylumNode | undefined, action: InspectorAction | NodeScreenAction, _payload?: string) {
+  async function handleNodeAction(
+    target: AsylumNode | undefined,
+    action: InspectorAction | NodeScreenAction,
+    _payload?: string,
+  ): Promise<void> {
     if (!target) return;
     try {
       if (action === "attach") {
@@ -338,20 +374,30 @@ export function App() {
       }
     } catch (err) {
       setLocalError(`${action} failed: ${String(err instanceof Error ? err.message : err)}`);
+      throw err;
+    } finally {
+      void refreshAll();
     }
-    void refreshAll();
   }
 
   const inspectorAction = useCallback(
-    (action: InspectorAction | "native-attach", payload?: string) => {
-      void handleNodeAction(selectedNode, action, payload);
-    },
+    (action: InspectorAction | "native-attach", payload?: string) => handleNodeAction(selectedNode, action, payload),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [selectedNode],
   );
 
   const liveChannelCount = useMemo(() => channels.filter((c) => c.live).length, [channels]);
   const enabledHookCount = useMemo(() => hooks.filter((h) => h.enabled).length, [hooks]);
+  const resourceRefreshWarning = useMemo(() => {
+    const stale = Object.entries(resourceRefreshState).filter(([, value]) => value.status === "stale");
+    if (stale.length === 0) return null;
+    return stale
+      .map(
+        ([resource, value]) =>
+          `${resource}: ${value.error ?? "resource refresh failed; previous values may be stale"}`,
+      )
+      .join(" • ");
+  }, [resourceRefreshState]);
 
   // first-run hero when no nodes exist
   const showFirstRun = !loading && graph.nodes.length === 0 && !authRequired;
@@ -464,7 +510,7 @@ export function App() {
               onGraphRefresh={() => void refreshAll()}
               onBack={() => setScreen("fleet")}
               onOpen={handleOpenNode}
-              onAction={(a, p) => void handleNodeAction(openNode ?? selectedNode, a, p)}
+              onAction={(a, p) => handleNodeAction(openNode ?? selectedNode, a, p)}
             />
           )}
           {screen === "create" && (
@@ -598,7 +644,16 @@ export function App() {
       )}
 
       {localError && <div className="error-banner">{localError}</div>}
+      {resourceRefreshWarning && <div className="error-banner">{resourceRefreshWarning}</div>}
       {localNotice && <div className="notice-banner">{localNotice}</div>}
     </div>
   );
+}
+
+function describeResourceResult(resourceName: string, result: PromiseSettledResult<unknown>) {
+  if (result.status === "fulfilled") {
+    return { status: "fresh", error: null } as const;
+  }
+  const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
+  return { status: "stale", error: `${resourceName} refresh failed: ${message}` } as const;
 }

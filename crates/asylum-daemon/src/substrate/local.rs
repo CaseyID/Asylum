@@ -67,6 +67,10 @@ impl LocalSubstrate {
         }
     }
 
+    pub async fn has_runtime(&self, node_id: Uuid) -> bool {
+        self.runtimes.read().await.contains_key(&node_id)
+    }
+
     pub async fn launch(&self, ctx: SubstrateContext) -> Result<()> {
         let pty = native_pty_system().openpty(PtySize::default())?;
         let command = {
@@ -163,7 +167,7 @@ impl LocalSubstrate {
     }
 
     pub async fn send_input(&self, node_id: Uuid, text: &str) -> Result<()> {
-        self.send_input_raw(node_id, &format!("{text}\n")).await
+        self.send_input_raw(node_id, &format!("{text}\r")).await
     }
 
     pub async fn send_input_raw(&self, node_id: Uuid, text: &str) -> Result<()> {

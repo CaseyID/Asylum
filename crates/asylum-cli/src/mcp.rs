@@ -100,7 +100,7 @@ pub async fn run_stdio_server(client: Arc<AsylumClient>) -> Result<()> {
 }
 
 fn tool_definitions() -> Vec<ToolSpec> {
-    vec![
+    let mut tools = vec![
         // — node lifecycle —
         ToolSpec {
             name: "node.create",
@@ -421,24 +421,8 @@ fn tool_definitions() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "recipe.list",
-            description: "List starter recipes available for launch",
+            description: "List configured launch recipes",
             input_schema: json!({"type":"object","properties":{}}),
-        },
-        ToolSpec {
-            name: "recipe.spawn",
-            description: "Spawn nodes from a recipe",
-            input_schema: json!({
-                "type":"object",
-                "properties":{
-                    "recipe_id":{"type":"string"},
-                    "harness":{"type":"string"},
-                    "substrate":{"type":"string"},
-                    "workspace":{"type":"string"},
-                    "description":{"type":"string"},
-                    "role_hint":{"type":"string"},
-                },
-                "required":["recipe_id","harness","substrate"]
-            }),
         },
         ToolSpec {
             name: "remote_command.send",
@@ -504,7 +488,26 @@ fn tool_definitions() -> Vec<ToolSpec> {
         },
         // Skipped (out of scope for v1 MCP): token management (security-sensitive),
         // substrate/harness descriptors (static metadata), artifact refs.
-    ]
+    ];
+    if recipe_spawn_is_enabled() {
+        tools.push(ToolSpec {
+            name: "recipe.spawn",
+            description: "Spawn nodes from a configured recipe",
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "recipe_id":{"type":"string"},
+                    "harness":{"type":"string"},
+                    "substrate":{"type":"string"},
+                    "workspace":{"type":"string"},
+                    "description":{"type":"string"},
+                    "role_hint":{"type":"string"},
+                },
+                "required":["recipe_id","harness","substrate"]
+            }),
+        });
+    }
+    tools
 }
 
 /// M7: Returns None for JSON-RPC notifications (id is absent); caller must not send a response.
@@ -1029,6 +1032,9 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
             Err(err) => rpc_error(-32000, &format!("recipe.list failed: {err}")),
         },
         "recipe.spawn" => {
+            if !recipe_spawn_is_enabled() {
+                return rpc_error(-32601, "recipe.spawn is not supported");
+            }
             #[derive(Deserialize)]
             struct SpawnArgs {
                 recipe_id: String,
@@ -1237,6 +1243,10 @@ fn rpc_error(code: i32, message: &str) -> RpcResponse {
     }
 }
 
+fn recipe_spawn_is_enabled() -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1268,12 +1278,38 @@ mod tests {
         assert!(names.contains(&"context.system_map"));
         assert!(names.contains(&"context.launch_packet"));
         assert!(names.contains(&"recipe.list"));
-        assert!(names.contains(&"recipe.spawn"));
+        assert!(!names.contains(&"recipe.spawn"));
         assert!(names.contains(&"remote_command.send"));
         assert!(names.contains(&"decision.create"));
         assert!(names.contains(&"decision.list"));
         assert!(names.contains(&"decision.inspect"));
         assert!(names.contains(&"decision.resolve"));
+    }
+
+    #[tokio::test]
+    async fn recipe_spawn_tool_call_fails_when_disabled() {
+        use std::sync::Arc;
+        let client = Arc::new(AsylumClient::new(
+            "http://127.0.0.1:1",
+            Option::<String>::None,
+        ));
+        let response = handle_tools_call(
+            &client,
+            Some(json!({
+                "name": "recipe.spawn",
+                "arguments": {
+                    "recipe_id": "start-command-center",
+                    "harness": "codex",
+                    "substrate": "local",
+                },
+            })),
+        )
+        .await;
+
+        assert!(response.error.is_some());
+        let error = response.error.unwrap();
+        assert_eq!(error.code, -32601);
+        assert!(error.message.contains("not supported"));
     }
 
     #[test]

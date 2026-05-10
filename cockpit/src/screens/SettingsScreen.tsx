@@ -24,6 +24,21 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
+function formatSubstrateStatus(status: string | undefined, healthy: boolean): string {
+  const normalized = (status ?? "").trim().toLowerCase();
+  if (healthy) {
+    return "healthy";
+  }
+  return normalized === "ok" || normalized === "" ? "unavailable" : normalized;
+}
+
+function substrateMetricText(status: string, capacity: number): string {
+  if (status === "healthy") {
+    return `cap ${Math.round(capacity * 100)}%`;
+  }
+  return "metrics unavailable";
+}
+
 function maskToken(token: string): string {
   if (!token || token.length < 8) return "••••••••";
   return `${token.slice(0, 4)}…${token.slice(-4)}`;
@@ -375,9 +390,9 @@ export function SettingsScreen(): JSX.Element {
                 <div key={s.id} className="connection-row">
                   <div className="ico">{s.id === "local" ? "∎" : "L"}</div>
                   <div>
-                    <div className="name">{s.name}</div>
+                  <div className="name">{s.name}</div>
                     <div className="meta">
-                      {s.host} · {s.nodes} nodes · cap {Math.round(s.capacity * 100)}%
+                      {s.host} · {s.nodes} nodes · {substrateMetricText(formatSubstrateStatus(s.status, s.healthy), s.capacity)}
                     </div>
                     {s.healthy && (
                       <div style={{ marginTop: 6, width: 200 }}>
@@ -387,7 +402,9 @@ export function SettingsScreen(): JSX.Element {
                       </div>
                     )}
                   </div>
-                  <Pill status={s.healthy ? "running" : "errored"}>{s.healthy ? "healthy" : "unreachable"}</Pill>
+                  <Pill status={s.healthy ? "running" : "errored"}>
+                    {formatSubstrateStatus(s.status, s.healthy)}
+                  </Pill>
                 </div>
               ))}
             </Panel>

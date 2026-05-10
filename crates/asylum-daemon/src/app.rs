@@ -7,8 +7,7 @@ use anyhow::{bail, Context, Result};
 use asylum_types::api::{
     ChannelCreateRequest, ChannelInboundRequest, ChannelTestRequest, ChannelUpdateRequest,
     CreateNodeRequest, DecisionCreateRequest, DecisionResolveRequest, ErrorPayload,
-    ForkNodeRequest, HookCreateRequest, HookUpdateRequest, LaunchPacketResponse,
-    RecipeSpawnRequest, SendInputRequest,
+    ForkNodeRequest, HookCreateRequest, HookUpdateRequest, LaunchPacketResponse, SendInputRequest,
 };
 use asylum_types::config::AsylumConfig;
 use asylum_types::node::SubstrateKind;
@@ -291,7 +290,6 @@ pub fn build_router_for_transport(state: Arc<AppState>, require_auth: bool) -> R
         .route("/api/hooks/events", get(api_hook_events))
         .route("/api/hooks/{id}/test", post(api_hook_test))
         .route("/api/recipes", get(api_recipes_list))
-        .route("/api/recipes/{id}/spawn", post(api_recipe_spawn))
         .route("/api/nodes/{id}/fork", post(api_node_fork));
     let protected = if require_auth {
         protected.layer(middleware::from_fn_with_state(
@@ -345,14 +343,24 @@ pub async fn api_client_config(
 
 pub async fn api_nodes_list(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_types::api::NodeListResponse> {
-    Json(state.service.list_nodes().await)
+) -> Result<Json<asylum_types::api::NodeListResponse>, AppError> {
+    let response = state
+        .service
+        .list_nodes()
+        .await
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(response))
 }
 
 pub async fn api_graph(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_types::api::GraphGetResponse> {
-    Json(state.service.graph().await)
+) -> Result<Json<asylum_types::api::GraphGetResponse>, AppError> {
+    let response = state
+        .service
+        .graph()
+        .await
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(response))
 }
 
 pub async fn api_nodes_create(
@@ -387,7 +395,12 @@ pub async fn api_node_events(
 ) -> Result<Json<asylum_types::api::NodeEventsResponse>, AppError> {
     let id = Uuid::parse_str(&id)
         .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
-    Ok(Json(state.service.node_events(id).await))
+    let response = state
+        .service
+        .node_events(id)
+        .await
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(response))
 }
 
 pub async fn api_node_send_input(
@@ -500,6 +513,19 @@ async fn handle_node_observe_ws(
     let response = service.node_events(node_id).await;
     let mut socket = socket;
 
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(error = %error, node_id = %node_id, "failed to load node events");
+            let _ = socket
+                .send(Message::Text(
+                    format!("failed to load node events: {error}").into(),
+                ))
+                .await;
+            return;
+        }
+    };
+
     for event in response.events {
         if let Ok(payload) = serde_json::to_string(&event) {
             if socket.send(Message::Text(payload.into())).await.is_err() {
@@ -577,20 +603,35 @@ pub async fn api_harness_descriptors(
 
 pub async fn api_substrate_descriptors(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_types::api::SubstrateDescriptorResponse> {
-    Json(state.service.list_substrate_descriptors().await)
+) -> Result<Json<asylum_types::api::SubstrateDescriptorResponse>, AppError> {
+    let response = state
+        .service
+        .list_substrate_descriptors()
+        .await
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(response))
 }
 
 pub async fn api_recent_workspaces(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<Vec<String>> {
-    Json(state.service.recent_workspaces().await)
+) -> Result<Json<Vec<String>>, AppError> {
+    let response = state
+        .service
+        .recent_workspaces()
+        .await
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(response))
 }
 
 pub async fn api_system_map(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_types::api::GraphGetResponse> {
-    Json(state.service.graph().await)
+) -> Result<Json<asylum_types::api::GraphGetResponse>, AppError> {
+    let response = state
+        .service
+        .graph()
+        .await
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(response))
 }
 
 pub async fn api_launch_packet(
@@ -621,8 +662,13 @@ pub async fn api_create_relationship(
 
 pub async fn api_list_relationships(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_types::api::RelationshipResponse> {
-    Json(state.service.list_relationships().await)
+) -> Result<Json<asylum_types::api::RelationshipResponse>, AppError> {
+    let response = state
+        .service
+        .list_relationships()
+        .await
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(response))
 }
 
 pub async fn api_delete_relationship(
@@ -692,18 +738,23 @@ pub async fn api_token_rotate(
 
 pub async fn api_notifications(
     Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_types::api::NotificationsResponse> {
-    Json(state.service.list_notifications().await)
+) -> Result<Json<asylum_types::api::NotificationsResponse>, AppError> {
+    let response = state
+        .service
+        .list_notifications()
+        .await
+        .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(response))
 }
 
 pub async fn api_notification_read(
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> StatusCode {
-    if state.service.mark_notification_read(id).await.is_ok() {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
+    match state.service.mark_notification_read(id).await {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(error) if error.to_string().contains("notification not found") => StatusCode::NOT_FOUND,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -922,6 +973,9 @@ pub async fn api_attach_ws(
             return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
         }
     };
+    if let Err(error) = state.service.require_attachable_node(node.id).await {
+        return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+    }
     match node.substrate {
         SubstrateKind::Local => {
             ws.on_upgrade(move |socket| handle_attach_ws(socket, state.service.clone(), node.id))
@@ -1317,11 +1371,14 @@ pub async fn api_hook_test(
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<asylum_types::api::HookTestResponse>, AppError> {
-    let response = state
-        .service
-        .hook_test(&id)
-        .await
-        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    let response = state.service.hook_test(&id).await.map_err(|err| {
+        let status = if err.to_string().contains("not found") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        AppError::new(status, err.to_string())
+    })?;
     Ok(Json(response))
 }
 
@@ -1329,19 +1386,6 @@ pub async fn api_recipes_list(
     Extension(state): Extension<Arc<AppState>>,
 ) -> Json<asylum_types::api::RecipeListResponse> {
     Json(state.service.list_recipes().await)
-}
-
-pub async fn api_recipe_spawn(
-    Extension(state): Extension<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(request): Json<RecipeSpawnRequest>,
-) -> Result<Json<asylum_types::api::RecipeSpawnResponse>, AppError> {
-    let response = state
-        .service
-        .spawn_recipe(&id, request)
-        .await
-        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
-    Ok(Json(response))
 }
 
 pub async fn api_node_fork(
@@ -1468,10 +1512,17 @@ fn content_type(path: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[cfg(debug_assertions)]
     use super::{content_type, normalize_asset_path};
     #[cfg(not(debug_assertions))]
     use super::{content_type, normalize_asset_path, ASSETS_ROUTE};
+    use crate::capability_service::{AppConfig, CapabilityService};
+    use crate::storage::Store;
+    use asylum_types::config::AsylumConfig;
+    use rusqlite::Connection;
+    use std::sync::Arc;
+    use tempfile::tempdir;
 
     #[test]
     fn normalize_asset_path_rejects_traversal_and_empty_paths() {
@@ -1496,6 +1547,211 @@ mod tests {
         assert_eq!(content_type("image.png"), "image/png");
         assert_eq!(content_type("docs/README.txt"), "text/plain; charset=utf-8");
         assert_eq!(content_type("bundle.unknown"), "application/octet-stream");
+    }
+
+    fn test_app_config() -> AppConfig {
+        let core = AsylumConfig::default();
+        AppConfig {
+            base_url: core.base_url,
+            bind_addr: "127.0.0.1:0".to_string(),
+            socket_path: None,
+            transcripts_dir: "/tmp/asylum-test-app/transcripts".to_string(),
+            workspace_recent_limit: core.workspace.recent_limit,
+            ntfy_server: core.ntfy.server,
+            ntfy_topic: core.ntfy.topic,
+            ntfy_token: core.ntfy.token,
+            ntfy_poll_interval_seconds: Some(core.ntfy.poll_interval_seconds),
+            harness: core.harness,
+            loon: core.loon,
+        }
+    }
+
+    fn open_with_missing_table(path: &std::path::Path, table: &str) {
+        let connection = Connection::open(path).expect("open sqlite");
+        connection
+            .execute_batch(&format!("DROP TABLE {table};"))
+            .expect("drop sqlite table");
+    }
+
+    #[tokio::test]
+    async fn api_nodes_list_returns_500_when_store_fails() {
+        let workdir = tempdir().expect("create test workdir");
+        let path = workdir.path().join("asylum.sqlite3");
+        let store = Store::open(path.to_str().expect("path")).expect("open store");
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+        let state = Arc::new(AppState { service });
+
+        open_with_missing_table(path.as_path(), "nodes");
+
+        let error = api_nodes_list(Extension(state))
+            .await
+            .expect_err("nodes handler should fail when nodes table is missing");
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn api_graph_returns_500_when_store_fails() {
+        let workdir = tempdir().expect("create test workdir");
+        let path = workdir.path().join("asylum.sqlite3");
+        let store = Store::open(path.to_str().expect("path")).expect("open store");
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+        let state = Arc::new(AppState { service });
+
+        open_with_missing_table(path.as_path(), "nodes");
+
+        let error = api_graph(Extension(state))
+            .await
+            .expect_err("graph handler should fail when nodes table is missing");
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn api_node_events_returns_500_when_store_fails() {
+        let workdir = tempdir().expect("create test workdir");
+        let path = workdir.path().join("asylum.sqlite3");
+        let store = Store::open(path.to_str().expect("path")).expect("open store");
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+        let state = Arc::new(AppState { service });
+
+        open_with_missing_table(path.as_path(), "events");
+
+        let error = api_node_events(Extension(state), Path(Uuid::new_v4().to_string()))
+            .await
+            .expect_err("node events handler should fail when events table is missing");
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn api_list_relationships_returns_500_when_store_fails() {
+        let workdir = tempdir().expect("create test workdir");
+        let path = workdir.path().join("asylum.sqlite3");
+        let store = Store::open(path.to_str().expect("path")).expect("open store");
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+        let state = Arc::new(AppState { service });
+
+        open_with_missing_table(path.as_path(), "relationships");
+
+        let error = api_list_relationships(Extension(state))
+            .await
+            .expect_err("relationship handler should fail when relationship table is missing");
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn api_substrate_descriptors_returns_500_when_store_fails() {
+        let workdir = tempdir().expect("create test workdir");
+        let path = workdir.path().join("asylum.sqlite3");
+        let store = Store::open(path.to_str().expect("path")).expect("open store");
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+        let state = Arc::new(AppState { service });
+
+        open_with_missing_table(path.as_path(), "nodes");
+
+        let error = api_substrate_descriptors(Extension(state))
+            .await
+            .expect_err("substrate descriptor handler should fail when nodes table is missing");
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn api_recent_workspaces_returns_500_when_store_fails() {
+        let workdir = tempdir().expect("create test workdir");
+        let path = workdir.path().join("asylum.sqlite3");
+        let store = Store::open(path.to_str().expect("path")).expect("open store");
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+        let state = Arc::new(AppState { service });
+
+        open_with_missing_table(path.as_path(), "nodes");
+
+        let error = api_recent_workspaces(Extension(state))
+            .await
+            .expect_err("recent workspaces handler should fail when nodes table is missing");
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn api_notifications_returns_500_when_store_fails() {
+        let workdir = tempdir().expect("create test workdir");
+        let path = workdir.path().join("asylum.sqlite3");
+        let store = Store::open(path.to_str().expect("path")).expect("open store");
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+        let state = Arc::new(AppState { service });
+
+        open_with_missing_table(path.as_path(), "notifications");
+
+        let error = api_notifications(Extension(state))
+            .await
+            .expect_err("notifications handler should fail when notifications table is missing");
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn api_notification_read_returns_204_for_existing_notification() {
+        let workdir = tempdir().expect("create test workdir");
+        let path = workdir.path().join("asylum.sqlite3");
+        let store = Store::open(path.to_str().expect("path")).expect("open store");
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+        let notification_id = service
+            .store
+            .insert_notification(None, "status", "Ready", "Node is ready")
+            .expect("insert test notification");
+
+        let state = Arc::new(AppState { service });
+        let status = api_notification_read(Extension(state), Path(notification_id)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn api_notification_read_returns_404_for_missing_notification() {
+        let workdir = tempdir().expect("create test workdir");
+        let path = workdir.path().join("asylum.sqlite3");
+        let store = Store::open(path.to_str().expect("path")).expect("open store");
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+        let state = Arc::new(AppState { service });
+
+        let status = api_notification_read(Extension(state), Path(999_999)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn api_notification_read_returns_500_when_store_fails() {
+        let workdir = tempdir().expect("create test workdir");
+        let path = workdir.path().join("asylum.sqlite3");
+        let store = Store::open(path.to_str().expect("path")).expect("open store");
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+        let state = Arc::new(AppState { service });
+
+        open_with_missing_table(path.as_path(), "notifications");
+        let status = api_notification_read(Extension(state), Path(1)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn api_hook_test_returns_500_when_node_store_fails() {
+        let workdir = tempdir().expect("create test workdir");
+        let path = workdir.path().join("asylum.sqlite3");
+        let store = Store::open(path.to_str().expect("path")).expect("open store");
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let hook = service
+            .create_hook(HookCreateRequest {
+                name: "store-error-hook".to_string(),
+                enabled: true,
+                event: "node.ctx_pressure".to_string(),
+                filter: "any".to_string(),
+                actions: vec![],
+                future: false,
+            })
+            .await
+            .expect("create hook");
+
+        let state = Arc::new(AppState { service });
+        open_with_missing_table(path.as_path(), "nodes");
+
+        let error = api_hook_test(Extension(state), Path(hook.id))
+            .await
+            .expect_err("hook test handler should fail when nodes table is missing");
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[cfg(not(debug_assertions))]

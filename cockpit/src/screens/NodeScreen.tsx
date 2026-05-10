@@ -41,11 +41,19 @@ export interface NodeScreenProps {
   relationships: GraphRelationship[];
   onBack: () => void;
   onOpen: (node: AsylumNode) => void;
-  onAction: (action: NodeScreenAction, payload?: string) => void;
+  onAction: (action: NodeScreenAction, payload?: string) => Promise<void>;
   onGraphRefresh: () => void;
 }
 
 type Tab = "session" | "events" | "activity" | "capabilities" | "relationships";
+
+type ActionFlashStatus = "ok" | "error";
+
+type ActionFlash = {
+  id: number;
+  label: string;
+  status: ActionFlashStatus;
+};
 
 export function NodeScreen({
   node,
@@ -57,7 +65,7 @@ export function NodeScreen({
   onGraphRefresh,
 }: NodeScreenProps): JSX.Element {
   const [tab, setTab] = useState<Tab>("session");
-  const [flash, setFlash] = useState<{ action: string; label: string; t: number } | null>(null);
+  const [flash, setFlash] = useState<ActionFlash | null>(null);
   const [harnesses, setHarnesses] = useState<HarnessDescriptor[]>([]);
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -74,6 +82,9 @@ export function NodeScreen({
       cancelled = true;
     };
   }, []);
+
+  // Clear flash timer on unmount (L13).
+  useEffect(() => () => { if (flashTimerRef.current !== null) clearTimeout(flashTimerRef.current); }, []);
 
   if (!node) {
     return (
@@ -101,21 +112,26 @@ export function NodeScreen({
     .filter((n): n is AsylumNode => Boolean(n));
   const parent = parentRel ? nodes.find((n) => n.id === parentRel.source_node_id) : undefined;
 
-  function fire(action: NodeScreenAction, label: string) {
+  async function fire(action: NodeScreenAction, label: string) {
     if (action === "send") setTab("session");
-    onAction(action);
-    const t = Date.now();
-    setFlash({ action, label, t });
-    // Clear any previous timer before starting a new one to avoid leaking on unmount (L13).
-    if (flashTimerRef.current !== null) clearTimeout(flashTimerRef.current);
-    flashTimerRef.current = setTimeout(() => {
-      flashTimerRef.current = null;
-      setFlash((f) => (f && f.action === action ? null : f));
-    }, 2200);
+    const id = Date.now();
+    try {
+      await onAction(action);
+      reportFlash("ok", label, id);
+    } catch (err) {
+      reportFlash("error", `${action} failed: ${String(err instanceof Error ? err.message : err)}`, id);
+    }
   }
 
-  // Clear flash timer on unmount (L13).
-  useEffect(() => () => { if (flashTimerRef.current !== null) clearTimeout(flashTimerRef.current); }, []);
+  function reportFlash(status: ActionFlashStatus, message: string, id: number) {
+    // Clear any previous timer before starting a new one to avoid leaking on unmount (L13).
+    if (flashTimerRef.current !== null) clearTimeout(flashTimerRef.current);
+    setFlash({ id, status, label: message });
+    flashTimerRef.current = setTimeout(() => {
+      flashTimerRef.current = null;
+      setFlash((f) => (f && f.id === id ? null : f));
+    }, 2200);
+  }
 
   return (
     <div className="node-page">
@@ -258,8 +274,11 @@ export function NodeScreen({
             </Btn>
           </div>
           {flash && (
-            <div className="action-flash" key={flash.t}>
-              <span className="ok-tick">✓</span> {flash.label}
+            <div className={`action-flash ${flash.status}`} key={flash.id}>
+              <span className={flash.status === "error" ? "fail-cross" : "ok-tick"}>
+                {flash.status === "error" ? "×" : "✓"}
+              </span>{" "}
+              {flash.label}
             </div>
           )}
         </div>

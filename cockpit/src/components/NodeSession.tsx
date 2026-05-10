@@ -2,8 +2,10 @@
 // every "chat" surface in the app is a viewport onto this. modes only change
 // the chrome (compact vs full); the harness-authentic TUI inside is the same.
 //
-// all input goes to the daemon via postNodeInput; all output arrives over the
-// observe websocket and streams into the xterm.js terminal. no canned simulation.
+// terminal input prefers the raw attach websocket and falls back to /nodes/:id/input.
+// the textarea prompt uses the same raw terminal path when available so Codex/Claude
+// TUIs receive the same bytes they would from a real terminal.
+// output still arrives over observe websocket and streams into the xterm.js terminal.
 
 import { useEffect, useRef, useState, useCallback, type ReactElement } from "react";
 import "@xterm/xterm/css/xterm.css";
@@ -13,7 +15,7 @@ import { Btn } from "../lib/ui";
 import { ToolCall } from "../lib/ui";
 import { Icon } from "../lib/icons";
 import { isCommandCenter, shortNodeId, uptimeLabel } from "../lib/glyphs";
-import { postNodeInput, openNodeObserveSocket } from "../api";
+import { openAttachSocket, postNodeInput, requestBrowserAttach, openNodeObserveSocket } from "../api";
 import type { AsylumNode } from "../types";
 
 // ─── public types ────────────────────────────────────────────────────────────
@@ -55,6 +57,7 @@ interface NodeEvent {
 
 const WS_INIT_FRAME = "asylum.observe.ws.initialized";
 const WS_LIVE_UNAVAILABLE = "asylum.observe.ws.live_stream_unavailable";
+const PROMPT_ENTER_DELAY_MS = 25;
 
 // ─── xterm theme matching cockpit dark palette ────────────────────────────────
 const XTERM_THEME = {
@@ -81,12 +84,16 @@ const XTERM_THEME = {
   selectionBackground: "#3e4451",
 };
 
+function workspaceLabel(node: AsylumNode): string {
+  return node.workspace?.trim() || "none";
+}
+
 // ─── initial transcript (structured view) ────────────────────────────────────
 function initialTranscript(node: AsylumNode): TranscriptEntry[] {
   const isCC = isCommandCenter(node);
   const harnessId = node.harness === "claude_code" ? "claude-code" : "codex";
   const role = isCC ? "command-center" : (node.role_hint || "worker");
-  const sysLine = `attached to ${shortNodeId(node.id)} · ${harnessId} · ${node.substrate} · workspace ${node.workspace ?? "~/"} · ${role}`;
+  const sysLine = `attached to ${shortNodeId(node.id)} · ${harnessId} · ${node.substrate} · workspace ${workspaceLabel(node)} · ${role}`;
   return [
     { kind: "sys-line", text: sysLine },
     { kind: "prompt" },
@@ -117,12 +124,119 @@ export function NodeSession({
 
   const phaseRef = useRef<"history" | "live">("history");
   const liveDisabledRef = useRef<boolean>(false);
+  const nodeIdRef = useRef<string>(node.id);
+  const sendInputCapRef = useRef<boolean>(node.capabilities.send_input);
+  const attachModeRef = useRef<"inactive" | "pending" | "open" | "degraded">("inactive");
+  const pendingInputRef = useRef<string[]>([]);
+  const inputSinkRef = useRef<(data: string) => void>(() => {});
+  const attachSocketRef = useRef<WebSocket | null>(null);
+  const emitLineInputFailure = (error: unknown, data: string): void => {
+    const msg = error instanceof Error ? error.message : String(error);
+    const line = `send-input fallback failed: ${msg}`;
+    termRef.current?.write(`\r\n${line}\r\n`);
+    setEntries((p) => [...p, { kind: "sys-line", text: line }]);
+  };
 
   // track recently-sent input texts for structured-view dedupe (M3)
   // keyed by text; value is expiry timestamp
   const sentSetRef = useRef<Map<string, number>>(new Map());
 
   const harnessId = node.harness === "claude_code" ? "claude-code" : "codex";
+
+  nodeIdRef.current = node.id;
+  sendInputCapRef.current = node.capabilities.send_input;
+
+  const flushPendingInputToAttach = (): void => {
+    const attachSocket = attachSocketRef.current;
+    if (!attachSocket || attachSocket.readyState !== WebSocket.OPEN || attachModeRef.current !== "open") return;
+
+    while (pendingInputRef.current.length > 0) {
+      const data = pendingInputRef.current.shift();
+      if (data === undefined) continue;
+
+      try {
+        attachSocket.send(data);
+      } catch {
+        // If sending fails after open, fall back as if the socket is unavailable.
+        pendingInputRef.current.unshift(data);
+        degradeAttachInputToLine();
+        return;
+      }
+    }
+  };
+
+  const sendLineInput = (data: string): void => {
+    if (!sendInputCapRef.current) return;
+    try {
+      const result = postNodeInput(nodeIdRef.current, data);
+      if (result && typeof (result as Promise<unknown>).catch === "function") {
+        void result.catch((err) => emitLineInputFailure(err, data));
+      }
+    } catch (err) {
+      emitLineInputFailure(err, data);
+    }
+  };
+
+  const degradeAttachInputToLine = (force = false): void => {
+    if (!force && (attachModeRef.current === "degraded" || attachModeRef.current === "inactive")) return;
+    attachModeRef.current = "degraded";
+    inputSinkRef.current = writeRawInput;
+    attachSocketRef.current = null;
+
+    const pending = pendingInputRef.current.splice(0);
+    for (const data of pending) sendLineInput(data);
+  };
+
+  const writeRawInput = (data: string): void => {
+    if (attachModeRef.current === "open" && attachSocketRef.current?.readyState === WebSocket.OPEN) {
+      try {
+        attachSocketRef.current.send(data);
+        return;
+      } catch {
+        degradeAttachInputToLine();
+        sendLineInput(data);
+        return;
+      }
+    }
+
+    if (attachModeRef.current === "pending") {
+      pendingInputRef.current.push(data);
+      return;
+    }
+
+    sendLineInput(data);
+  };
+
+  const registerAttachOpen = (): void => {
+    if (attachModeRef.current !== "pending") return;
+    attachModeRef.current = "open";
+    inputSinkRef.current = writeRawInput;
+    flushPendingInputToAttach();
+    if (pendingInputRef.current.length > 0) {
+      degradeAttachInputToLine();
+    }
+  };
+
+  const sendPromptInput = async (text: string): Promise<void> => {
+    const attachSocket = attachSocketRef.current;
+    if (attachModeRef.current === "open" && attachSocket?.readyState === WebSocket.OPEN) {
+      try {
+        attachSocket.send(text);
+        await new Promise<void>((resolve) => {
+          window.setTimeout(resolve, PROMPT_ENTER_DELAY_MS);
+        });
+        if (attachSocket.readyState !== WebSocket.OPEN) {
+          throw new Error("attach socket closed before prompt submit");
+        }
+        attachSocket.send("\r");
+        return;
+      } catch {
+        degradeAttachInputToLine();
+      }
+    }
+
+    await postNodeInput(node.id, text);
+  };
 
   // ─── xterm setup / teardown ───────────────────────────────────────────────
 
@@ -148,11 +262,10 @@ export function NodeSession({
     termRef.current = term;
     fitAddonRef.current = fitAddon;
 
-    // raw keystrokes from the terminal go directly to the harness
+    // raw keystrokes from the terminal go directly to the current input sink.
+    inputSinkRef.current = writeRawInput;
     const dataDispose = term.onData((data: string) => {
-      void postNodeInput(node.id, data).catch(() => {
-        // swallow — the harness may not be live; errors surface via ws events
-      });
+      inputSinkRef.current(data);
     });
 
     // resize observer — refit when the container changes size
@@ -172,9 +285,91 @@ export function NodeSession({
       termRef.current = null;
       fitAddonRef.current = null;
     };
-  // node.id intentionally excluded — terminal lifecycle is per mount, ws handles node changes
+    // node.id intentionally excluded — terminal lifecycle is per mount, ws handles node changes
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    inputSinkRef.current = writeRawInput;
+    attachSocketRef.current = null;
+    pendingInputRef.current = [];
+    attachModeRef.current = node.capabilities.browser_attach ? "pending" : "degraded";
+
+    if (!node.capabilities.browser_attach) {
+      return () => {
+        inputSinkRef.current = writeRawInput;
+      };
+    }
+
+    const attachResult = requestBrowserAttach(node.id);
+    if (!attachResult || typeof (attachResult as { then?: unknown }).then !== "function") {
+      degradeAttachInputToLine(true);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    void Promise.resolve(attachResult)
+      .then((attach) => {
+        if (!attach || typeof attach !== "object") {
+          if (cancelled) return;
+          degradeAttachInputToLine();
+          return;
+        }
+        const token = attach.token ?? attach.attach_url.split("/attach/")[1]?.split(/[/?#]/)[0];
+        if (cancelled) return;
+        if (!token) {
+          degradeAttachInputToLine(true);
+          return;
+        }
+        let ws: WebSocket;
+        try {
+          ws = openAttachSocket(token, {
+            onOpen: () => {
+              if (cancelled) return;
+              registerAttachOpen();
+            },
+            onError: () => {
+              if (cancelled) return;
+              if (attachSocketRef.current === ws) degradeAttachInputToLine();
+            },
+            onClose: () => {
+              if (cancelled) return;
+              if (attachSocketRef.current === ws) degradeAttachInputToLine();
+            },
+          });
+        } catch {
+          if (cancelled) return;
+          degradeAttachInputToLine();
+          return;
+        }
+        if (cancelled) {
+          ws.close();
+          return;
+        }
+        attachSocketRef.current = ws;
+        attachModeRef.current = "pending";
+      })
+      .catch(() => {
+        if (cancelled) return;
+        degradeAttachInputToLine();
+      });
+
+    return () => {
+      cancelled = true;
+      try {
+        attachSocketRef.current?.close();
+      } catch {
+        /* no-op */
+      }
+      attachSocketRef.current = null;
+      attachModeRef.current = "inactive";
+      pendingInputRef.current = [];
+      inputSinkRef.current = writeRawInput;
+    };
+  }, [node.id, node.capabilities.browser_attach, node.capabilities.send_input]);
 
   // refit when view switches to tui (container may have been hidden)
   useEffect(() => {
@@ -212,7 +407,7 @@ export function NodeSession({
     sentSetRef.current.set(v, Date.now() + 4000);
 
     try {
-      await postNodeInput(node.id, v);
+      await sendPromptInput(v);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       termRef.current?.write(`\r\nsend-input failed: ${msg}\r\n`);
@@ -498,7 +693,7 @@ function SessionHeader({
 function SessionBanner({ node, harnessId }: { node: AsylumNode; harnessId: string }): ReactElement {
   const ctxPct = Math.round((node.ctx_pct ?? 0) * 100);
   const uptime = uptimeLabel(node);
-  const subline = `${node.workspace ?? "~/"} · ctx est. ${ctxPct}% · uptime ${uptime}`;
+  const subline = `workspace ${workspaceLabel(node)} · ctx est. ${ctxPct}% · uptime ${uptime}`;
   const dashes = "─".repeat(46);
 
   if (harnessId === "claude-code") {

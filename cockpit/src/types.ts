@@ -16,8 +16,8 @@ export type NodeLiveness =
   | "failed"
   | "archived";
 
-// the cockpit ui states ("running", "waiting", "idle", "errored", "stopped")
-export type UiState = "running" | "waiting" | "idle" | "errored" | "stopped";
+// the cockpit ui states ("running", "waiting", "idle", "errored", "stopped", "archived")
+export type UiState = "running" | "waiting" | "idle" | "errored" | "stopped" | "archived";
 
 export interface CapabilitySnapshot {
   browser_attach: boolean;
@@ -111,9 +111,11 @@ export interface NativeTargetResponse {
 
 // ─── channels ─────────────────────────────────────────────────────
 
+export type ChannelKind = "ntfy" | "webhook";
+
 export interface ChannelDescriptor {
   id: string;
-  kind: string;
+  kind: ChannelKind;
   name: string;
   label: string;
   direction: "inbound" | "outbound" | "duplex" | string;
@@ -140,7 +142,7 @@ export interface ChannelMessageRecord {
 }
 
 export interface ChannelCreateRequest {
-  kind: string;
+  kind: ChannelKind;
   name: string;
   label?: string;
   direction: string;
@@ -162,15 +164,6 @@ export interface ChannelUpdateRequest {
 export interface ChannelTestRequest {
   title: string;
   body: string;
-}
-
-export interface ChannelInboundRequest {
-  sender: string;
-  subject: string;
-  body: string;
-  replies?: string[];
-  node_id?: string;
-  correlation_token?: string;
 }
 
 // ─── hooks ────────────────────────────────────────────────────────
@@ -227,6 +220,19 @@ export interface HookEventCatalogEntry {
   label: string;
 }
 
+// ─── recipes ───────────────────────────────────────────────────────
+
+export interface RecipeDescriptor {
+  id: string;
+  title: string;
+  prompt_template: string;
+  kind: string;
+}
+
+export interface RecipeListResponse {
+  recipes: RecipeDescriptor[];
+}
+
 // ─── decisions ────────────────────────────────────────────────────
 
 export interface DecisionRecord {
@@ -249,23 +255,6 @@ export interface DecisionCreateRequest {
 
 export interface DecisionResolveRequest {
   status: "approved" | "denied";
-}
-
-// ─── recipes ──────────────────────────────────────────────────────
-
-export interface RecipeDescriptor {
-  id: string;
-  title: string;
-  prompt_template: string;
-  kind: "single" | "fanout" | string;
-}
-
-export interface RecipeSpawnRequest {
-  harness: HarnessKind;
-  substrate: SubstrateKind;
-  workspace?: string;
-  description?: string;
-  role_hint?: string;
 }
 
 // ─── fork ─────────────────────────────────────────────────────────
@@ -291,6 +280,7 @@ export interface SubstrateDescriptor {
   id: string;
   name: string;
   host: string;
+  status?: string;
   healthy: boolean;
   capacity: number;
   nodes: number;

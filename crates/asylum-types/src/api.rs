@@ -106,6 +106,7 @@ pub struct SubstrateDescriptor {
     pub id: String,
     pub name: String,
     pub host: String,
+    pub status: String,
     pub healthy: bool,
     pub capacity: f32,
     pub nodes: u64,
@@ -154,8 +155,8 @@ pub struct CapabilityCheck {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SubstrateHealth {
     pub status: String,
-    pub running_instances: usize,
-    pub harness_profiles: Vec<String>,
+    pub running_instances: Option<usize>,
+    pub harness_profiles: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
