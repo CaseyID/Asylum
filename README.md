@@ -259,6 +259,7 @@ These commands print service definitions you can save as launch artifacts.
 ./target/debug/asylum config init
 ./target/debug/asylum config show
 ./target/debug/asylum node create --harness codex --substrate local --role worker
+./target/debug/asylum node spawn <source-node-id> --role worker
 ./target/debug/asylum node list
 ./target/debug/asylum node inspect <node-id>
 ./target/debug/asylum node send <node-id> "hello"
@@ -296,7 +297,7 @@ When Loon is enabled, Asylum drives the documented `loon` CLI contract for launc
    - `asylum node send <node-id> "status"` records input and reaches the node when the harness supports input.
 5. Inspect root capabilities:
    - `asylum node inspect <node-id>` shows a node record.
-   - `asylum mcp` starts JSON-RPC stdio server and advertises `node.create`, `node.list`, `node.inspect`, `node.send_input`, `node.interrupt`, `node.stop`, `graph.get`, and relationship tools.
+   - `asylum mcp` starts JSON-RPC stdio server and advertises `node.create`, `node.spawn_peer`, `node.list`, `node.inspect`, `node.send_input`, `node.interrupt`, `node.stop`, `graph.get`, and relationship tools.
 6. Generate notifications:
    - `asylum notify send --title "hello" --body "it works"` returns `notify sent: true` when sender config is enabled.
 7. Exercise remote commands:

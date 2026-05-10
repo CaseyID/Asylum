@@ -27,6 +27,14 @@ pub trait HarnessAdapter: Send + Sync {
         node_id: Uuid,
         request: &asylum_types::api::CreateNodeRequest,
     ) -> String;
+    fn asylum_control_args(
+        &self,
+        _asylum_binary: &str,
+        _socket_path: Option<&str>,
+        _node_id: Uuid,
+    ) -> Vec<String> {
+        Vec::new()
+    }
     /// Idempotently record the workspace path as trusted in the harness's own config
     /// so the first-run trust dialog is skipped when the process spawns.
     fn pre_trust_workspace(&self, workspace: &str) -> anyhow::Result<()>;
@@ -173,5 +181,55 @@ mod tests {
         // Config-supplied args follow
         assert!(args.contains(&"--model".to_string()));
         assert!(args.contains(&"o3".to_string()));
+    }
+
+    #[test]
+    fn codex_control_args_register_asylum_mcp_per_launch() {
+        let registry = HarnessRegistry::default();
+        let codex = registry.get(&HarnessKind::Codex).unwrap();
+        let node_id = Uuid::new_v4();
+
+        let args =
+            codex.asylum_control_args("/usr/local/bin/asylum", Some("/tmp/asylum.sock"), node_id);
+        let joined = args.join("\n");
+
+        assert!(joined.contains("mcp_servers.asylum.command=\"/usr/local/bin/asylum\""));
+        assert!(joined.contains("mcp_servers.asylum.args=[\"mcp\"]"));
+        assert!(joined.contains(&format!("ASYLUM_NODE_ID=\"{}\"", node_id)));
+        assert!(joined.contains("ASYLUM_SOCKET_PATH=\"/tmp/asylum.sock\""));
+        assert!(joined.contains("mcp_servers.asylum.required=true"));
+    }
+
+    #[test]
+    fn claude_control_args_register_asylum_mcp_per_launch() -> anyhow::Result<()> {
+        let registry = HarnessRegistry::default();
+        let claude = registry.get(&HarnessKind::ClaudeCode).unwrap();
+        let node_id = Uuid::new_v4();
+
+        let args =
+            claude.asylum_control_args("/opt/asylum/bin/asylum", Some("/tmp/asylum.sock"), node_id);
+        let config_index = args
+            .iter()
+            .position(|arg| arg == "--mcp-config")
+            .expect("claude launch args should include --mcp-config");
+        let config: serde_json::Value = serde_json::from_str(&args[config_index + 1])?;
+
+        assert_eq!(
+            config["mcpServers"]["asylum"]["command"],
+            "/opt/asylum/bin/asylum"
+        );
+        assert_eq!(config["mcpServers"]["asylum"]["args"][0], "mcp");
+        assert_eq!(
+            config["mcpServers"]["asylum"]["env"]["ASYLUM_NODE_ID"],
+            node_id.to_string()
+        );
+        assert_eq!(
+            config["mcpServers"]["asylum"]["env"]["ASYLUM_SOCKET_PATH"],
+            "/tmp/asylum.sock"
+        );
+        assert!(args.contains(&"--strict-mcp-config".to_string()));
+        assert!(args.contains(&"--allowedTools".to_string()));
+        assert!(args.contains(&"mcp__asylum__*".to_string()));
+        Ok(())
     }
 }

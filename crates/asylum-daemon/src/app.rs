@@ -8,6 +8,7 @@ use asylum_types::api::{
     ChannelCreateRequest, ChannelInboundRequest, ChannelTestRequest, ChannelUpdateRequest,
     CreateNodeRequest, DecisionCreateRequest, DecisionResolveRequest, ErrorPayload,
     ForkNodeRequest, HookCreateRequest, HookUpdateRequest, LaunchPacketResponse, SendInputRequest,
+    SpawnPeerRequest,
 };
 use asylum_types::config::AsylumConfig;
 use asylum_types::node::SubstrateKind;
@@ -232,6 +233,7 @@ pub fn build_router_for_transport(state: Arc<AppState>, require_auth: bool) -> R
         .route("/api/nodes/{id}/interrupt", post(api_node_interrupt))
         .route("/api/nodes/{id}/stop", post(api_node_stop))
         .route("/api/nodes/{id}/archive", post(api_node_archive))
+        .route("/api/nodes/{id}/spawn", post(api_node_spawn_peer))
         .route("/api/nodes/{id}/observe/ws", get(api_node_observe_ws))
         .route(
             "/api/nodes/{id}/attach/browser",
@@ -1401,6 +1403,21 @@ pub async fn api_node_fork(
         .await
         .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
     Ok(Json(node))
+}
+
+pub async fn api_node_spawn_peer(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(request): Json<SpawnPeerRequest>,
+) -> Result<Json<asylum_types::api::SpawnPeerResponse>, AppError> {
+    let id = Uuid::parse_str(&id)
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    let response = state
+        .service
+        .spawn_peer(id, request)
+        .await
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    Ok(Json(response))
 }
 
 async fn api_notify_send(

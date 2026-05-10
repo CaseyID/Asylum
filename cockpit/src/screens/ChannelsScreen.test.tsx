@@ -186,7 +186,7 @@ describe("ChannelsScreen", () => {
     render(<ChannelsScreen />);
 
     expect(await screen.findByText("webhook substrate")).toBeTruthy();
-    expect(screen.getByText(/local inbound/i)).toBeTruthy();
+    expect(await screen.findByText(/local inbound/i)).toBeTruthy();
     expect(await screen.findByText(/message refresh failed/i)).toBeTruthy();
     expect(screen.getByText(/message endpoint unavailable/i)).toBeTruthy();
   });

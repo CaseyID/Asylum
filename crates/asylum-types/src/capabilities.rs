@@ -67,6 +67,7 @@ pub enum CapabilityName {
     RecipeList,
     RecipeSpawn,
     NodeFork,
+    NodeSpawnPeer,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

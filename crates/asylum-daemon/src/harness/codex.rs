@@ -65,6 +65,36 @@ impl super::HarnessAdapter for CodexHarness {
         context.instruction_prompt()
     }
 
+    fn asylum_control_args(
+        &self,
+        asylum_binary: &str,
+        socket_path: Option<&str>,
+        node_id: uuid::Uuid,
+    ) -> Vec<String> {
+        let mut env_entries = vec![format!(
+            "ASYLUM_NODE_ID={}",
+            toml_string(&node_id.to_string())
+        )];
+        if let Some(socket_path) = socket_path {
+            env_entries.push(format!("ASYLUM_SOCKET_PATH={}", toml_string(socket_path)));
+        }
+
+        vec![
+            "-c".to_string(),
+            format!("mcp_servers.asylum.command={}", toml_string(asylum_binary)),
+            "-c".to_string(),
+            "mcp_servers.asylum.args=[\"mcp\"]".to_string(),
+            "-c".to_string(),
+            format!("mcp_servers.asylum.env={{{}}}", env_entries.join(",")),
+            "-c".to_string(),
+            "mcp_servers.asylum.required=true".to_string(),
+            "-c".to_string(),
+            "mcp_servers.asylum.startup_timeout_sec=10".to_string(),
+            "-c".to_string(),
+            "mcp_servers.asylum.tool_timeout_sec=60".to_string(),
+        ]
+    }
+
     fn pre_trust_workspace(&self, workspace: &str) -> anyhow::Result<()> {
         // Upsert ~/.codex/config.toml so codex skips the "Do you trust this directory?"
         // dialog. The key is [projects."<absolute-workspace-path>"] trust_level = "trusted".
@@ -147,4 +177,8 @@ impl super::HarnessAdapter for CodexHarness {
         tracing::debug!(workspace = workspace, paths = ?paths_to_trust, "pre-trusted codex workspace");
         Ok(())
     }
+}
+
+fn toml_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }

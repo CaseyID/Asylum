@@ -66,6 +66,43 @@ impl super::HarnessAdapter for ClaudeHarness {
         context.instruction_prompt()
     }
 
+    fn asylum_control_args(
+        &self,
+        asylum_binary: &str,
+        socket_path: Option<&str>,
+        node_id: uuid::Uuid,
+    ) -> Vec<String> {
+        let mut env = serde_json::Map::new();
+        env.insert(
+            "ASYLUM_NODE_ID".to_string(),
+            Value::String(node_id.to_string()),
+        );
+        if let Some(socket_path) = socket_path {
+            env.insert(
+                "ASYLUM_SOCKET_PATH".to_string(),
+                Value::String(socket_path.to_string()),
+            );
+        }
+        let mcp_config = serde_json::json!({
+            "mcpServers": {
+                "asylum": {
+                    "type": "stdio",
+                    "command": asylum_binary,
+                    "args": ["mcp"],
+                    "env": env,
+                }
+            }
+        })
+        .to_string();
+        vec![
+            "--mcp-config".to_string(),
+            mcp_config,
+            "--strict-mcp-config".to_string(),
+            "--allowedTools".to_string(),
+            "mcp__asylum__*".to_string(),
+        ]
+    }
+
     fn pre_trust_workspace(&self, workspace: &str) -> anyhow::Result<()> {
         // Upsert ~/.claude.json so claude skips the workspace trust dialog.
         // The key is projects[<absolute-workspace-path>].hasTrustDialogAccepted = true.

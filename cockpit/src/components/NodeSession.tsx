@@ -808,7 +808,7 @@ function SessionInput({
 }): ReactElement {
   const isCC = isCommandCenter(node);
   const placeholder = isCC
-      ? `send to ${node.id} · try: spawn 2 workers, status, summarize progress`
+      ? `send to ${node.id} · try: spawn a worker node, status, summarize progress`
       : `send input to ${node.id} · this writes directly to its harness stdin`;
 
   return (

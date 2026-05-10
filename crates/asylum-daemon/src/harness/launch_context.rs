@@ -27,7 +27,7 @@ impl LaunchContext {
             .as_deref()
             .map_or_else(|| "<none>".to_string(), |path| path.display().to_string());
         format!(
-            "You are node {} with role '{}'.\nWorkspace: {}\nCapabilities: {:?}\nSystem map: {}",
+            "You are node {} with role '{}'.\nWorkspace: {}\nCapabilities: {:?}\nSystem map: {}\n\nAsylum control: use the configured Asylum MCP tools for node and graph operations. To create or supervise other Asylum nodes, call tools such as node.spawn_peer, node.create, graph.get, relationship.create, and node.send_input. Do not simulate worker nodes inside your own harness session.",
             self.node_id,
             self.role_hint,
             workspace_display,

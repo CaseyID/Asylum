@@ -63,7 +63,7 @@ The two supported build hosts are **macOS Apple Silicon** and **Linux x86_64**. 
 
 ## Open release-side action items
 
-_(no open items.)_
+- `harness-asylum-control`: on main, validated, not released. Adds real `node.spawn_peer` API/CLI/MCP capability plus local Codex/Claude Code Asylum MCP launch injection so command-center nodes can create peer nodes through the daemon. Recommend cutting v0.1.11 after release packaging validation.
 
 Release signing is wired up: the public key is embedded in `scripts/install.sh` as `ASYLUM_RELEASE_PUBKEY_DEFAULT`. The maintainer's private key lives outside the repo at `~/.config/asylum/release-signing.key` (chmod 600) and is referenced by `ASYLUM_RELEASE_SIGNING_KEY` (exported from the maintainer's shell rc). Lose that key and no future release can be signed under the same identity — back it up. Rotating the embedded pubkey would break every existing user's installer.
 
