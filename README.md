@@ -135,44 +135,9 @@ four-archive matrix:
   ARM builds in an arm64 Docker container, and Linux x86_64 is cross-compiled
   from that arm64 Linux container.
 
-### Trust model
-
-The installer pulls the release archive and checksum file from
-`https://github.com/CaseyID/Asylum/releases/download/<tag>/...` over HTTPS,
-which pins the host's TLS identity to GitHub. On top of that:
-
-1. **Checksum verification (mandatory by default).** The installer downloads
-   `checksums.txt` (falling back to `<archive>.sha256`) and verifies the
-   archive's SHA-256 against it.
-   - If neither `sha256sum` nor `shasum` is on PATH, the installer
-     **hard-fails** with a clear error rather than silently skipping. Install
-     one of those tools and re-run.
-   - To bypass verification deliberately (NOT RECOMMENDED — used only for
-     local rescue when no hash tool is reachable), set
-     `ASYLUM_SKIP_CHECKSUM=1`. The installer prints a loud warning and
-     proceeds.
-
-2. **Detached signature on the checksum file (optional today, mandatory
-   once a key is published).** If `checksums.txt.minisig` exists in the
-   release, `minisign` is on PATH, and a public key is configured (env
-   `ASYLUM_RELEASE_PUBKEY`, or the embedded `ASYLUM_RELEASE_PUBKEY_DEFAULT`
-   constant in `scripts/install.sh`), the installer verifies the signature
-   before trusting the checksum file. Until the maintainer publishes a
-   release-signing pubkey, the embedded constant is empty and the installer
-   prints `warning: checksum file is unsigned` and proceeds with checksum-only
-   verification. Once the maintainer pastes the pubkey into that constant,
-   every existing installer download upgrades to verified-mode automatically.
-
-3. **Publisher signing.** `scripts/publish-release.sh` produces
-   `checksums.txt.minisig` alongside `checksums.txt` when
-   `ASYLUM_RELEASE_SIGNING_KEY` is set in the publisher's environment and
-   `minisign` is on PATH. Until that env var is set, no signature is
-   produced and behavior matches the pre-signing flow.
-
-Legacy fallback: if `checksums.txt` is unavailable from the release, the
-installer falls back to `<archive>.sha256`. If neither artifact is reachable,
-verification fails the same way as the missing-tool path (use
-`ASYLUM_SKIP_CHECKSUM=1` to override).
+Installers fetch release archives from GitHub Releases over HTTPS and verify
+the archive checksum before installing. If release signing is configured,
+`checksums.txt.minisig` is published and verified as well.
 
 ## Source Development With Cargo
 
