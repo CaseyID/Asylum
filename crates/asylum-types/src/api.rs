@@ -34,6 +34,31 @@ pub struct NodeCreateResponse {
     pub node_id: String,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SpawnPeerRequest {
+    #[serde(default)]
+    pub harness: Option<String>,
+    #[serde(default)]
+    pub substrate: Option<String>,
+    #[serde(default)]
+    pub role_hint: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub relationship_kind: Option<String>,
+    #[serde(default)]
+    pub relationship_label: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SpawnPeerResponse {
+    pub node_id: String,
+    pub node: NodeRecord,
+    pub relationship: RelationshipRecord,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeInspectResponse {
     pub node: NodeRecord,

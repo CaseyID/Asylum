@@ -17,7 +17,7 @@ use asylum_types::api::{
     NodeCreateResponse, NodeEventsResponse, NodeInspectResponse, NodeListResponse,
     NotificationsResponse, RecipeListResponse, RecipeSpawnRequest, RecipeSpawnResponse,
     RelationshipCreateRequest, RelationshipResponse, RemoteCommandRequest, RemoteCommandResponse,
-    SendInputRequest, TokenIssueResponse,
+    SendInputRequest, SpawnPeerRequest, SpawnPeerResponse, TokenIssueResponse,
 };
 use asylum_types::node::NodeRecord;
 use asylum_types::relationship::RelationshipRecord;
@@ -161,6 +161,16 @@ impl AsylumClient {
 
     pub async fn fork_node(&self, id: Uuid, request: ForkNodeRequest) -> Result<NodeRecord> {
         let path = format!("/api/nodes/{id}/fork");
+        self.send_request(reqwest::Method::POST, &path, Some(&request))
+            .await
+    }
+
+    pub async fn spawn_peer(
+        &self,
+        source_id: Uuid,
+        request: SpawnPeerRequest,
+    ) -> Result<SpawnPeerResponse> {
+        let path = format!("/api/nodes/{source_id}/spawn");
         self.send_request(reqwest::Method::POST, &path, Some(&request))
             .await
     }

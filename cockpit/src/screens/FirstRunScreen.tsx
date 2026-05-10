@@ -13,7 +13,7 @@ export interface FirstRunScreenProps {
 const STEPS: [string, string][] = [
   ["open cockpit", "this screen — fleet view, command center, inspector"],
   ["start a command-center", "codex or claude code, with asylum context preloaded"],
-  ["ask it to run another node", "launch a second local node with a fresh context"],
+  ["ask it to start a worker node", "uses asylum tools to launch another real node"],
   ["watch the graph", "spawned nodes appear as supervisor / worker cards with explicit edges"],
   ["inspect any node", "live transcript, capability matrix"],
   ["open node session", "real harness ui or terminal from the node workspace"],
@@ -32,6 +32,7 @@ const CLI_COMMANDS: [string, string][] = [
   ["asylum doctor", "diagnose PATH, harness binaries, and config issues"],
   ["asylum logs", "tail the daemon log"],
   ["asylum node list", "list all nodes"],
+  ["asylum node spawn <id>", "spawn a peer node from an existing node"],
   ["asylum node stop <id>", "stop a running node"],
 ];
 

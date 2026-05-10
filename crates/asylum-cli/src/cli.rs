@@ -24,6 +24,7 @@ use asylum_types::api::{
     ChannelCreateRequest, ChannelInboundRequest, ChannelTestRequest, ChannelUpdateRequest,
     CreateNodeRequest, DecisionCreateRequest, DecisionResolveRequest, ForkNodeRequest,
     HealthResponse, HookAction, HookCreateRequest, RelationshipCreateRequest, RemoteCommandRequest,
+    SpawnPeerRequest,
 };
 use asylum_types::config::{AsylumConfig, AsylumFileConfig};
 use asylum_types::security::TokenRequest;
@@ -145,6 +146,20 @@ pub async fn run(action: CliAction) -> Result<()> {
                 let (node_id, request) = args.into_request();
                 let node = client.fork_node(node_id, request).await?;
                 println!("forked node {}", node.id);
+            }
+            NodeCommand::Spawn(args) => {
+                let (source_id, request) = args.into_request();
+                let response = client.spawn_peer(source_id, request).await?;
+                let relationship_kind = serde_json::to_string(&response.relationship.kind)?
+                    .trim_matches('"')
+                    .to_string();
+                println!("spawned node {}", response.node_id);
+                println!(
+                    "relationship {} {} -> {}",
+                    relationship_kind,
+                    response.relationship.source_node_id,
+                    response.relationship.target_node_id
+                );
             }
             NodeCommand::List => {
                 let response = client.list_nodes().await?;
@@ -1055,6 +1070,7 @@ fn remote_command_value(name: &str, value: String) -> Result<String> {
 enum NodeCommand {
     Create(NodeCreateArgs),
     Fork(NodeForkArgs),
+    Spawn(NodeSpawnArgs),
     List,
     Inspect { node_id: Uuid },
     Send { node_id: Uuid, text: String },
@@ -1088,6 +1104,25 @@ struct NodeForkArgs {
     description: Option<String>,
 }
 
+#[derive(Args)]
+struct NodeSpawnArgs {
+    source_node_id: Uuid,
+    #[arg(long)]
+    harness: Option<String>,
+    #[arg(long)]
+    substrate: Option<String>,
+    #[arg(long, alias = "role_hint")]
+    role: Option<String>,
+    #[arg(long)]
+    workspace: Option<String>,
+    #[arg(long)]
+    description: Option<String>,
+    #[arg(long, default_value = "spawned_for")]
+    relationship_kind: String,
+    #[arg(long)]
+    relationship_label: Option<String>,
+}
+
 impl NodeForkArgs {
     fn into_request(self) -> (Uuid, ForkNodeRequest) {
         (
@@ -1096,6 +1131,23 @@ impl NodeForkArgs {
                 role_hint: self.role,
                 workspace: self.workspace,
                 description: self.description,
+            },
+        )
+    }
+}
+
+impl NodeSpawnArgs {
+    fn into_request(self) -> (Uuid, SpawnPeerRequest) {
+        (
+            self.source_node_id,
+            SpawnPeerRequest {
+                harness: self.harness,
+                substrate: self.substrate,
+                role_hint: self.role,
+                workspace: self.workspace,
+                description: self.description,
+                relationship_kind: Some(self.relationship_kind),
+                relationship_label: self.relationship_label,
             },
         )
     }
@@ -1287,7 +1339,9 @@ fn effective_service_bind(paths: &RuntimePaths) -> Result<SocketAddr> {
 }
 
 fn runtime_client(paths: &RuntimePaths) -> Result<AsylumClient> {
-    if env::var_os("ASYLUM_BASE_URL").is_some() || env::var_os("ASYLUM_TOKEN").is_some() {
+    if env::var_os("ASYLUM_SOCKET_PATH").is_none()
+        && (env::var_os("ASYLUM_TOKEN").is_some() || env::var_os("ASYLUM_BASE_URL").is_some())
+    {
         let bind = effective_service_bind(paths)?;
         return Ok(AsylumClient::new(
             effective_runtime_base_url(env::var("ASYLUM_BASE_URL").ok(), bind),
@@ -2849,6 +2903,34 @@ mod tests {
 
         restore_env("ASYLUM_BIND", prev_bind);
         restore_env("ASYLUM_BASE_URL", prev_base_url);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_client_prefers_socket_override_over_inherited_base_url() -> Result<()> {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let tempdir = tempfile::tempdir()?;
+        let socket_path = tempdir.path().join("run").join("injected-asylum.sock");
+
+        let prev_bind = env::var_os("ASYLUM_BIND");
+        let prev_base_url = env::var_os("ASYLUM_BASE_URL");
+        let prev_token = env::var_os("ASYLUM_TOKEN");
+        let prev_socket = env::var_os("ASYLUM_SOCKET_PATH");
+        env::set_var("ASYLUM_BIND", "127.0.0.1:9022");
+        env::set_var("ASYLUM_BASE_URL", "http://example.test:9900");
+        env::set_var("ASYLUM_TOKEN", "inherited-token");
+        env::set_var("ASYLUM_SOCKET_PATH", &socket_path);
+
+        let paths = RuntimePaths::from_values(Some(tempdir.path().to_path_buf()), None, None, None);
+        write_config_with_listen(&paths, "127.0.0.1:9021")?;
+
+        let client = runtime_client(&paths)?;
+        assert_eq!(client.socket_path(), Some(socket_path.as_path()));
+
+        restore_env("ASYLUM_BIND", prev_bind);
+        restore_env("ASYLUM_BASE_URL", prev_base_url);
+        restore_env("ASYLUM_TOKEN", prev_token);
+        restore_env("ASYLUM_SOCKET_PATH", prev_socket);
         Ok(())
     }
 

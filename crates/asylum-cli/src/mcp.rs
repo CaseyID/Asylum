@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::client::AsylumClient;
 use asylum_types::api::{
     ChannelCreateRequest, ChannelInboundRequest, ChannelTestRequest, ChannelUpdateRequest,
-    CreateNodeRequest,
+    CreateNodeRequest, SpawnPeerRequest,
 };
 
 #[derive(Deserialize)]
@@ -192,6 +192,23 @@ fn tool_definitions() -> Vec<ToolSpec> {
                     "description":{"type":"string"},
                 },
                 "required":["node_id"]
+            }),
+        },
+        ToolSpec {
+            name: "node.spawn_peer",
+            description: "Spawn a peer node from this or another Asylum node and record an explicit graph relationship",
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "node_id":{"type":"string","description":"Source node; defaults to ASYLUM_NODE_ID when the MCP server runs inside an Asylum node"},
+                    "harness":{"type":"string"},
+                    "substrate":{"type":"string"},
+                    "role_hint":{"type":"string"},
+                    "workspace":{"type":"string"},
+                    "description":{"type":"string"},
+                    "relationship_kind":{"type":"string","description":"spawned_for or supervises; defaults to spawned_for"},
+                    "relationship_label":{"type":"string"},
+                }
             }),
         },
         ToolSpec {
@@ -693,6 +710,57 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
             {
                 Ok(v) => content_result(v),
                 Err(err) => rpc_error(-32000, &format!("node.fork failed: {err}")),
+            }
+        }
+        "node.spawn_peer" => {
+            #[derive(Deserialize)]
+            struct SpawnPeerArgs {
+                node_id: Option<String>,
+                harness: Option<String>,
+                substrate: Option<String>,
+                role_hint: Option<String>,
+                workspace: Option<String>,
+                description: Option<String>,
+                relationship_kind: Option<String>,
+                relationship_label: Option<String>,
+            }
+            let args: SpawnPeerArgs = match serde_json::from_value(params.arguments) {
+                Ok(args) => args,
+                Err(err) => {
+                    return rpc_error(-32602, &format!("node.spawn_peer: invalid args: {err}"));
+                }
+            };
+            let source_node = match args
+                .node_id
+                .or_else(|| std::env::var("ASYLUM_NODE_ID").ok())
+            {
+                Some(node_id) => match parse_node_id_str(&node_id) {
+                    Ok(id) => id,
+                    Err(err) => return rpc_error(-32602, &err),
+                },
+                None => {
+                    return rpc_error(
+                        -32602,
+                        "node.spawn_peer: missing node_id and ASYLUM_NODE_ID",
+                    )
+                }
+            };
+            let request = SpawnPeerRequest {
+                harness: args.harness,
+                substrate: args.substrate,
+                role_hint: args.role_hint,
+                workspace: args.workspace,
+                description: args.description,
+                relationship_kind: args.relationship_kind,
+                relationship_label: args.relationship_label,
+            };
+            match client.spawn_peer(source_node, request).await {
+                Ok(response) => content_result(json!({
+                    "node_id": response.node_id,
+                    "node": response.node,
+                    "relationship": response.relationship,
+                })),
+                Err(err) => rpc_error(-32000, &format!("node.spawn_peer failed: {err}")),
             }
         }
         "node.attach_url" | "attach_url.issue" => {
@@ -1261,6 +1329,7 @@ mod tests {
         assert!(names.contains(&"graph.get"));
         assert!(names.contains(&"attach_url.issue"));
         assert!(names.contains(&"node.fork"));
+        assert!(names.contains(&"node.spawn_peer"));
         assert!(names.contains(&"hook.list"));
         assert!(names.contains(&"channel.inspect"));
         assert!(names.contains(&"channel.create"));

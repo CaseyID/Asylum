@@ -12,8 +12,8 @@ use asylum_types::api::{
     HealthResponse, LaunchPacketResponse, NativeAttachResponse, NodeCreateResponse,
     NodeEventsResponse, NodeInspectResponse, NodeListResponse, Notification, NotificationsResponse,
     RelationshipCreateRequest, RelationshipResponse, RemoteCommandResponse, SendInputRequest,
-    SubstrateDescriptor, SubstrateDescriptorResponse, SubstrateHealth, SubstrateListResponse,
-    TokenIssueResponse,
+    SpawnPeerRequest, SpawnPeerResponse, SubstrateDescriptor, SubstrateDescriptorResponse,
+    SubstrateHealth, SubstrateListResponse, TokenIssueResponse,
 };
 use asylum_types::capabilities::CapabilityDescriptor;
 use asylum_types::capabilities::CapabilityName;
@@ -1024,6 +1024,13 @@ impl CapabilityService {
                 "Fork a node",
                 true,
             ),
+            descriptor(
+                CapabilityName::NodeSpawnPeer,
+                "/api/nodes/{id}/spawn",
+                "POST",
+                "Spawn a peer node from an existing node",
+                true,
+            ),
         ];
         CapabilityListResponse { capabilities }
     }
@@ -1314,6 +1321,14 @@ impl CapabilityService {
 
         let launch_prompt = launch_prompt_for_runtime(adapter.as_ref(), node.id, &request);
         let mut launch_args = adapter.launch_args().to_vec();
+        if matches!(substrate, SubstrateKind::Local) {
+            let asylum_binary = current_asylum_binary();
+            launch_args.extend(adapter.asylum_control_args(
+                &asylum_binary,
+                self.config.socket_path.as_deref(),
+                node.id,
+            ));
+        }
         launch_args.extend(request.launch_args.clone());
         // Append a single positional prompt argument so both local harness command lines and
         // Loon `--prompt` receive the same runtime launch intent.
@@ -2515,6 +2530,74 @@ impl CapabilityService {
         ))
     }
 
+    pub async fn spawn_peer(
+        &self,
+        source_id: Uuid,
+        request: SpawnPeerRequest,
+    ) -> Result<SpawnPeerResponse> {
+        let source = self
+            .store
+            .get_node(source_id)?
+            .ok_or_else(|| anyhow!("source node not found"))?;
+        let harness = request
+            .harness
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| source.harness.to_string());
+        let substrate = request
+            .substrate
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| source.substrate.to_string());
+        let role_hint = request
+            .role_hint
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "worker".to_string());
+        let workspace = request.workspace.or(source.workspace.clone());
+        let description = request
+            .description
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| Some(format!("Spawned by Asylum node {source_id}.")));
+        let relationship_kind = parse_relationship_kind(
+            request
+                .relationship_kind
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("spawned_for"),
+        )?;
+        let relationship_label = request
+            .relationship_label
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| Some("spawn_peer".to_string()));
+
+        let response = self
+            .create_node(CreateNodeRequest {
+                harness,
+                substrate,
+                role_hint,
+                workspace,
+                description,
+                created_by: Some(source_id.to_string()),
+                launch_args: Vec::new(),
+            })
+            .await?;
+        let new_id = Uuid::parse_str(&response.node_id)?;
+        let relationship = self.store.create_relationship(
+            source_id,
+            new_id,
+            relationship_kind,
+            relationship_label,
+        )?;
+        let node = self
+            .store
+            .get_node(new_id)?
+            .ok_or_else(|| anyhow!("spawned node not found"))?;
+
+        Ok(SpawnPeerResponse {
+            node_id: response.node_id,
+            node,
+            relationship,
+        })
+    }
+
     pub async fn fork_node(&self, source_id: Uuid, request: ForkNodeRequest) -> Result<NodeRecord> {
         let source = self
             .store
@@ -2602,6 +2685,13 @@ fn command_available(command: &str) -> bool {
 fn resolve_command(command: &str) -> Option<String> {
     let login_path = LOGIN_SHELL_PATH.get().cloned().flatten();
     resolve_command_with_login_path(command, login_path.as_deref())
+}
+
+fn current_asylum_binary() -> String {
+    env::current_exe()
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "asylum".to_string())
 }
 
 fn resolve_command_with_login_path(command: &str, login_path: Option<&str>) -> Option<String> {
@@ -3225,6 +3315,83 @@ mod tests {
         let response = service.graph().await?;
         assert!(response.graph.nodes.is_empty());
         assert!(response.graph.relationships.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spawn_peer_creates_real_node_and_explicit_relationship(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let workspace_string = workspace.display().to_string();
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let argv_path = workdir.path().join("codex-argv.txt");
+        let script_path = workdir.path().join("fake-codex.sh");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 0\n",
+            argv_path.display()
+        );
+        write_executable_script(&script_path, &script)?;
+
+        let _home = EnvVarGuard::set_var("HOME", &home);
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.socket_path = Some("/tmp/asylum-test.sock".to_string());
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+        let source = store.insert_node(
+            HarnessKind::Codex,
+            SubstrateKind::Local,
+            "command-center",
+            Some(&workspace_string),
+            Some("source node"),
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+
+        let response = service
+            .spawn_peer(
+                source.id,
+                SpawnPeerRequest {
+                    description: Some("do useful worker task".to_string()),
+                    ..SpawnPeerRequest::default()
+                },
+            )
+            .await?;
+        let child_id = Uuid::parse_str(&response.node_id)?;
+        wait_for_liveness(&store, child_id, NodeLiveness::Stopped).await?;
+
+        let child = store
+            .get_node(child_id)?
+            .expect("spawned node should exist");
+        assert_eq!(child.harness, HarnessKind::Codex);
+        assert_eq!(child.substrate, SubstrateKind::Local);
+        assert_eq!(child.role_hint, "worker");
+        assert_eq!(child.workspace.as_deref(), Some(workspace_string.as_str()));
+        assert_eq!(child.description, "do useful worker task");
+
+        let relationships = store.list_relationships()?;
+        let relationship = relationships
+            .iter()
+            .find(|relationship| {
+                relationship.source_node_id == source.id && relationship.target_node_id == child_id
+            })
+            .expect("spawn_peer should record an explicit edge");
+        assert_eq!(relationship.kind, RelationshipKind::SpawnedFor);
+        assert_eq!(relationship.label.as_deref(), Some("spawn_peer"));
+        assert_eq!(response.relationship.id, relationship.id);
+
+        let argv = std::fs::read_to_string(&argv_path)?;
+        assert!(argv.contains("mcp_servers.asylum.args=[\"mcp\"]"));
+        assert!(argv.contains(&format!("ASYLUM_NODE_ID=\"{}\"", child_id)));
+        assert!(argv.contains("ASYLUM_SOCKET_PATH=\"/tmp/asylum-test.sock\""));
+        assert!(argv.contains("node.spawn_peer"));
+        assert!(argv.contains("Do not simulate worker nodes inside your own harness session."));
         Ok(())
     }
 

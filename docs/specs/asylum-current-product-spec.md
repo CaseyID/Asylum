@@ -51,6 +51,7 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
 - Provide Cockpit as the primary first-party UI.
 - Provide CLI, HTTP/WebSocket, MCP, hooks, notifications, and remote-command entrypoints over the same root capabilities.
 - Let humans open node sessions, inspect, send input, interrupt, stop, archive, fork, and relate nodes.
+- Let nodes create and coordinate peer nodes through the same daemon-owned capabilities operators use.
 - Let nodes and operators send notifications, receive inbound channel messages, and route explicit remote commands.
 - Keep Asylum single-user, localhost-first, and Loon-independent.
 
@@ -176,6 +177,7 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
 | NODE-010 | Native attach target remains available for CLI/API compatibility. | CLI, API | Native target returns command, args, and env needed to connect to the same daemon/node. Cockpit does not expose this as a normal workflow. |
 | NODE-011 | Node capabilities are visible and honest. | API, Cockpit, MCP | Capability flags describe what this harness/substrate can do now. Missing optional capabilities degrade gracefully. |
 | NODE-012 | Command-center is a normal real node with a role hint. | Cockpit, CLI, API, MCP | Launching a command center creates a real Codex/Claude node with `role_hint=command-center`, appears in the graph, and uses the same input/observe/session controls as other nodes. |
+| NODE-013 | Nodes can spawn peer nodes through Asylum. | API, CLI, MCP | A running node with Asylum MCP access can create a real peer node, inherit sane defaults from the source node, and record an explicit relationship such as `spawned_for`. |
 | GRAPH-001 | The graph shows explicit relationships only. | API, Cockpit, MCP | Relationships in graph responses come from stored relationship records, not inferred workspace/substrate correlation. |
 | GRAPH-002 | Operators can create, list, and remove relationships. | CLI, API, MCP, Cockpit | Relationship kinds include `supervises`, `spawned_for`, `user_created`, and `platform_responsibility`; invalid kinds are rejected. |
 | GRAPH-003 | Correlations are distinct from edges. | Cockpit, API | Same workspace, same substrate, same harness, and similar metadata may be filters/groups/facts but not graph edges. |
@@ -186,7 +188,7 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
 |---|---|---|
 | HARN-001 | Codex and Claude Code are supported harnesses. | Config exposes the command for each; descriptors show availability/capabilities; create-node can launch both when commands exist. |
 | HARN-002 | Harness adapters are real process/control adapters, not simulations. | Local launch starts the configured CLI process in a PTY; Loon launch uses Loon control contracts. |
-| HARN-003 | Launch context is Asylum-aware. | New nodes receive node ID, role hint, graph/capability context, session/control instructions, and relevant workspace/substrate metadata in the best supported way for that harness/substrate. |
+| HARN-003 | Launch context is Asylum-aware. | New nodes receive node ID, role hint, graph/capability context, session/control instructions, and relevant workspace/substrate metadata in the best supported way for that harness/substrate. Local Codex and Claude Code launches also receive per-process Asylum MCP configuration so they can call daemon capabilities directly. |
 | HARN-004 | Optional harness capabilities are advertised per adapter. | Structured events, tool-call telemetry, transcript export, native resume, subagent visibility, permission prompts, and context telemetry are shown only when actually supported. |
 | SUB-001 | Local substrate supports real PTY launch/control. | Local nodes can launch, stream output, receive input, interrupt, stop, and connect through browser/native compatibility paths. |
 | SUB-002 | Loon is optional and independent. | Asylum works without Loon; enabling Loon uses configured endpoint/CLI/auth/cert settings without coupling Asylum core to Loon internals. |
@@ -201,7 +203,7 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
 | CAP-001 | Every product affordance maps to a daemon-owned root capability. | Capability descriptors list the endpoint, method/transport, description, and availability. |
 | CAP-002 | Capability semantics are shared across clients. | CLI, MCP, Cockpit, hooks, notifications, and remote commands call the same daemon behavior rather than parallel implementations. |
 | CAP-003 | The HTTP API exposes typed JSON contracts. | Routes return stable request/response shapes from `asylum-types` or Cockpit-mirrored equivalents. |
-| CAP-004 | Core node capabilities exist. | `node.create`, `node.list`, `node.inspect`, `node.observe`, `node.events`, `node.send_input`, `node.interrupt`, `node.stop`, `node.archive`, `node.fork`, `node.attach.browser`, and `node.attach.native_target` are implemented or explicitly unavailable per node. |
+| CAP-004 | Core node capabilities exist. | `node.create`, `node.spawn_peer`, `node.list`, `node.inspect`, `node.observe`, `node.events`, `node.send_input`, `node.interrupt`, `node.stop`, `node.archive`, `node.fork`, `node.attach.browser`, and `node.attach.native_target` are implemented or explicitly unavailable per node. |
 | CAP-005 | Graph capabilities exist. | `graph.get`, `relationship.create`, `relationship.list`, and `relationship.remove` are available. |
 | CAP-006 | Harness/substrate descriptor capabilities exist. | Clients can list harnesses, substrates, descriptors, health, and capability flags. |
 | CAP-007 | Context capabilities exist. | Clients can read current system map/graph and generate launch packets for nodes. |
@@ -217,7 +219,7 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
 |---|---|---|
 | CLI-001 | The CLI is the primary local operator interface. | A user can operate Asylum from `asylum` without needing Cockpit. |
 | CLI-002 | CLI lifecycle commands are complete. | `setup`, `cockpit`, `start`, `stop`, `restart`, `status`, `doctor`, `logs`, `update`, `uninstall`, `daemon run`, `config init`, `config show`, and `service generate` work and are documented in help. |
-| CLI-003 | CLI node commands cover core node operations. | Create/list/inspect/send/interrupt/stop/archive and session compatibility commands work through daemon capabilities. |
+| CLI-003 | CLI node commands cover core node operations. | Create/spawn/fork/list/inspect/send/interrupt/stop/archive and session compatibility commands work through daemon capabilities. |
 | CLI-004 | CLI graph commands expose graph state and relationship management. | `graph get` and relationship create/list/remove commands work through daemon capabilities. |
 | CLI-005 | CLI token and notification commands exist. | Operators can issue tokens and send notifications from terminal. |
 | CLI-006 | CLI can reach all root capabilities practical for a terminal. | Terminal commands exist for channels, hooks, recipes, relationships, fork, and remote commands, or the capability has a clear terminal-inapplicable rationale in this spec. |
@@ -229,7 +231,7 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
 | ID | Requirement | Acceptance |
 |---|---|---|
 | MCP-001 | `asylum mcp` is a stdio JSON-RPC MCP bridge into the daemon. | It initializes, lists tools, handles notifications correctly, and calls daemon capabilities. |
-| MCP-002 | MCP exposes core node and graph capabilities. | Required tools include `node.create`, `node.list`, `node.inspect`, `node.send_input`, `node.interrupt`, `node.stop`, `node.archive`, `node.events`, `node.fork`, `attach_url.issue`, `graph.get`, `relationship.create`, and `relationship.list`. |
+| MCP-002 | MCP exposes core node and graph capabilities. | Required tools include `node.create`, `node.spawn_peer`, `node.list`, `node.inspect`, `node.send_input`, `node.interrupt`, `node.stop`, `node.archive`, `node.events`, `node.fork`, `attach_url.issue`, `graph.get`, `relationship.create`, and `relationship.list`. |
 | MCP-003 | MCP exposes safe automation capabilities. | Required tools include `hook.list`, `hook.create`, `hook.delete`, `hook.firings`, `channel.list`, `notify.send`, and `health.get`. |
 | MCP-004 | MCP does not expose token management by default. | Token issuance/revocation stays out of MCP unless a separate security review changes this spec. |
 | MCP-005 | MCP tool names and routes match daemon capabilities. | Tool handlers call real daemon routes; no MCP tool may point at a non-existent or wrong endpoint. |
