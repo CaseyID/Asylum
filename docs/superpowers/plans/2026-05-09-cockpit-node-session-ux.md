@@ -857,12 +857,12 @@ cargo test -p asylum-daemon attach
 
 Expected: PASS. Backend attach token plumbing should remain stable even though Cockpit no longer exposes attach as normal UX.
 
-- [x] **Step 4: Start the dev stack for rendered validation**
+- [x] **Step 4: Start the source dev loop for rendered validation**
 
 Run in a long-lived terminal:
 
 ```bash
-cargo dev
+cargo run-asylum-dev
 ```
 
 Expected: daemon and Cockpit become available at `http://127.0.0.1:7788/`.

@@ -48,7 +48,7 @@ Test fixtures and unit-test mocks are fine. The principle applies to behavior de
 
 - **Commit style:** lowercase, terse, action verb first. Match recent history (`Fix H1: <one-line>`, `cockpit: drop simSpeed and Tweaks`, etc.).
 - **No AI attribution** in commits, PRs, issues, or code unless explicitly asked.
-- **TDD where testable:** write the failing test first, implement, verify, commit. Existing patterns: `cargo test --workspace` for Rust-only changes; `cargo test-stack` for full-stack Rust + Cockpit verification.
+- **TDD where testable:** write the failing test first, implement, verify, commit. Existing patterns: `cargo test-rust` for Rust-only changes; `cargo test-asylum` for full source Rust + Cockpit verification.
 - **Each PR ships working software.** No land-broken-fix-later patterns.
 - **Branch per PR.** Use the branch names listed in the plan (`cockpit-strip-prototype-scaffolding`, `daemon-ntfy-inbound`, etc.).
 - **Update progress.** When you complete a checkbox task in the plan, mark `- [x]` and commit the file change with the code change.
@@ -57,22 +57,21 @@ Test fixtures and unit-test mocks are fine. The principle applies to behavior de
 
 ```bash
 # source dev: daemon + Cockpit hot reload
-cargo dev
+cargo run-asylum-dev
 
-# source build/test/run for the whole stack
-cargo build-stack
-cargo test-stack
-cargo run-stack
+# source build/test/run for the whole checkout
+cargo build-asylum
+cargo test-asylum
+cargo run-asylum
 
-# source dev for one side of the stack
-cargo dev-daemon
-cargo dev-cockpit
+# source dev for one side of the product
+cargo run-daemon-dev
+cargo run-cockpit-dev
 
-# installed product lifecycle through the installed `asylum` on PATH
-cargo start-stack
-cargo stop-stack
-cargo restart-stack
-cargo status-stack
+# source-dev lifecycle helpers
+cargo status-asylum-dev
+cargo stop-asylum-dev
+cargo reset-asylum-dev
 
 # lower-level Rust-only escape hatch
 cargo run -p asylum -- daemon run

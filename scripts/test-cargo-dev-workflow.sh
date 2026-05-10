@@ -19,7 +19,28 @@ fail() {
 [[ -f "$xtask_source" ]] || fail "missing xtask/src/main.rs"
 grep -q '"xtask"' "$workspace_manifest" || fail "xtask must be a workspace member"
 
-for alias in dev dev-daemon dev-cockpit build-stack test-stack run-stack start-stack stop-stack restart-stack status-stack doctor-stack logs-stack; do
+required_aliases=(
+  run-asylum-dev
+  run-daemon-dev
+  run-cockpit-dev
+  run-asylum
+  run-daemon
+  build-asylum
+  build-rust
+  build-cockpit
+  build-asylum-release
+  test-asylum
+  test-rust
+  test-cockpit
+  test-asylum-release
+  check-asylum
+  status-asylum-dev
+  stop-asylum-dev
+  reset-asylum-dev
+  publish-asylum-release
+)
+
+for alias in "${required_aliases[@]}"; do
   grep -Eq "^${alias}[[:space:]]*=[[:space:]]*\"run -p xtask --" "$config" \
     || fail "cargo alias must route through xtask: $alias"
 done
@@ -40,9 +61,9 @@ grep -q -- '--strictPort' "$xtask_source" || fail "xtask must not silently move 
 grep -q '^.asylum-dev/' "${repo_root}/.gitignore" || fail "repo-local source runtime must be ignored"
 
 help_output="$(cargo run -p xtask -- help)"
-for command in dev dev-daemon dev-cockpit build-stack test-stack run-stack start-stack stop-stack restart-stack status-stack doctor-stack logs-stack help; do
+for command in "${required_aliases[@]}" help; do
   grep -Eq "(^|[[:space:]])${command}([[:space:]]|$)" <<<"$help_output" \
     || fail "help output does not mention $command"
 done
 
-echo "cargo dev workflow checks passed"
+echo "cargo source workflow checks passed"

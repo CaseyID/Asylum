@@ -77,6 +77,10 @@ When configured, the daemon subscribes to the topic at startup. Inbound ntfy mes
 
 ## Release Artifact Expectations
 
+Asylum releases are built locally from this checkout. There is no GitHub
+Actions release pipeline. Use the Cargo release commands for the normal path;
+they wrap the release scripts behind the scenes.
+
 Local release packaging produces archives named:
 
 - `asylum-darwin-arm64.tar.gz`
@@ -86,93 +90,141 @@ Local release packaging produces archives named:
 
 Each archive should contain exactly one executable `asylum` binary.
 
-Build artifacts locally from a MacBook with Docker running:
+Normal release flow:
 
 ```bash
-scripts/build-release-artifacts.sh --version v0.1.1
-scripts/publish-release.sh --version v0.1.1 --dry-run
-scripts/publish-release.sh --version v0.1.1
-scripts/test-release-install.sh --version v0.1.1
+# after version/changelog/release-ledger updates are committed
+git tag -a vX.Y.Z -m "vX.Y.Z"
+cargo build-asylum-release -- --version vX.Y.Z
+cargo test-asylum-release -- --version vX.Y.Z
+cargo publish-asylum-release -- --version vX.Y.Z --dry-run
+cargo publish-asylum-release -- --version vX.Y.Z
 ```
 
-The local release builder uses native macOS Rust targets for `darwin-arm64` and `darwin-x86_64`, and Docker for `linux-arm64` and `linux-x86_64`. On Apple Silicon, `linux-x86_64` is cross-compiled from a native arm64 Linux container so the compiler does not run under amd64 emulation. The release build runs the Cockpit production build before compiling the release binaries so Cockpit is embedded into each archive.
-
-### Trust model
-
-The installer pulls the release archive and checksum file from
-`https://github.com/CaseyID/Asylum/releases/download/<tag>/...` over HTTPS,
-which pins the host's TLS identity to GitHub. On top of that:
-
-1. **Checksum verification (mandatory by default).** The installer downloads
-   `checksums.txt` (falling back to `<archive>.sha256`) and verifies the
-   archive's SHA-256 against it.
-   - If neither `sha256sum` nor `shasum` is on PATH, the installer
-     **hard-fails** with a clear error rather than silently skipping. Install
-     one of those tools and re-run.
-   - To bypass verification deliberately (NOT RECOMMENDED — used only for
-     local rescue when no hash tool is reachable), set
-     `ASYLUM_SKIP_CHECKSUM=1`. The installer prints a loud warning and
-     proceeds.
-
-2. **Detached signature on the checksum file (optional today, mandatory
-   once a key is published).** If `checksums.txt.minisig` exists in the
-   release, `minisign` is on PATH, and a public key is configured (env
-   `ASYLUM_RELEASE_PUBKEY`, or the embedded `ASYLUM_RELEASE_PUBKEY_DEFAULT`
-   constant in `scripts/install.sh`), the installer verifies the signature
-   before trusting the checksum file. Until the maintainer publishes a
-   release-signing pubkey, the embedded constant is empty and the installer
-   prints `warning: checksum file is unsigned` and proceeds with checksum-only
-   verification. Once the maintainer pastes the pubkey into that constant,
-   every existing installer download upgrades to verified-mode automatically.
-
-3. **Publisher signing.** `scripts/publish-release.sh` produces
-   `checksums.txt.minisig` alongside `checksums.txt` when
-   `ASYLUM_RELEASE_SIGNING_KEY` is set in the publisher's environment and
-   `minisign` is on PATH. Until that env var is set, no signature is
-   produced and behavior matches the pre-signing flow.
-
-Legacy fallback: if `checksums.txt` is unavailable from the release, the
-installer falls back to `<archive>.sha256`. If neither artifact is reachable,
-verification fails the same way as the missing-tool path (use
-`ASYLUM_SKIP_CHECKSUM=1` to override).
-
-For release binaries, use the release scripts. For source builds, prefer the
-Cargo stack commands below; they run the Cockpit build behind the scenes before
-building Rust when needed.
-
-## Source and Advanced CLI (below product path)
-
-### Source Build
+If you omit `--version`, the commands use the workspace version in
+`Cargo.toml`. Build/test/publish read and write `dist/release/vX.Y.Z/`. To
+pass release-script options, put them after `--`:
 
 ```bash
-cargo build-stack
+cargo build-asylum-release -- --version v0.1.11 --targets linux-x86_64,darwin-arm64
+cargo test-asylum-release -- --version v0.1.11
+cargo publish-asylum-release -- --version v0.1.11 --targets linux-x86_64,darwin-arm64 --dry-run
 ```
 
-### Source Run
+`cargo publish-asylum-release` expects a clean working tree and a local tag
+for the release version pointing at `HEAD`. It preserves existing GitHub
+Release assets unless you explicitly pass `--allow-clobber`.
+
+The underlying scripts are still available for lower-level work:
+
+- `scripts/build-release-artifacts.sh`
+- `scripts/publish-release.sh`
+- `scripts/test-release-install.sh`
+
+The release builder runs `npm --prefix cockpit ci`, builds Cockpit production
+assets, then compiles the release binaries so Cockpit is embedded into each
+archive. Both Apple Silicon macOS and Linux x86_64 hosts can build the full
+four-archive matrix:
+
+- On Linux x86_64, `linux-x86_64` builds natively in Docker, while
+  `darwin-arm64`, `darwin-x86_64`, and `linux-arm64` build through the pinned
+  `ghcr.io/rust-cross/cargo-zigbuild` Docker image. That image provides
+  cargo-zigbuild, zig, and the macOS SDK; no QEMU, osxcross, or extra apt
+  setup is required beyond Docker.
+- On Apple Silicon macOS, Darwin targets use native/cross Rust targets, Linux
+  ARM builds in an arm64 Docker container, and Linux x86_64 is cross-compiled
+  from that arm64 Linux container.
+
+Installers fetch release archives from GitHub Releases over HTTPS and verify
+the archive checksum before installing. If release signing is configured,
+`checksums.txt.minisig` is published and verified as well.
+
+## Source Development With Cargo
+
+Cargo commands operate on this source checkout only. They do not manage the
+installed `asylum` binary or user service. The repo-local `xtask` crate backs
+these aliases so day-to-day source work does not require typing direct
+`npm --prefix cockpit ...` or release-script commands.
+
+Naming:
+
+- `run-*` starts a source-built process.
+- `build-*` produces artifacts and exits.
+- `test-*` runs tests and exits.
+- `check-*` runs fast validation and exits.
+- `status-*` reports source-dev runtime state.
+- `stop-*` stops source-dev runtime processes.
+- `reset-*` stops source-dev processes and removes source-dev runtime state.
+- `*-dev` means watch/hot reload/source-dev runtime state.
+
+| Command                         | Meaning |
+|---------------------------------|---------|
+| `cargo run-asylum-dev`          | Full source dev loop: daemon + Cockpit hot reload. Long-running. |
+| `cargo run-daemon-dev`          | Source daemon only, watched/restarted on Rust changes, `.asylum-dev`, `127.0.0.1:7788`. |
+| `cargo run-cockpit-dev`         | Cockpit/Vite only, hot reload, proxies to source daemon. |
+| `cargo run-asylum`              | Product-like source run: build Cockpit once, then run daemon serving built UI. No hot reload. |
+| `cargo run-daemon`              | Source daemon only, no watch/hot reload. |
+| `cargo build-asylum`            | Full source product build: Cockpit assets + Rust workspace. |
+| `cargo build-rust`              | Rust workspace only. |
+| `cargo build-cockpit`           | Cockpit production assets only. |
+| `cargo build-asylum-release`    | Build release artifacts into `dist/release/vX.Y.Z/`; wraps the release build script internally. |
+| `cargo test-asylum`             | Full repo test pass: Rust + Cockpit. |
+| `cargo test-rust`               | Rust workspace tests only. |
+| `cargo test-cockpit`            | Cockpit/Vitest only. |
+| `cargo test-asylum-release`     | Smoke-test the host release archive from `dist/release/vX.Y.Z/`. |
+| `cargo check-asylum`            | Fast preflight: format/check/build-style validation, no long-running server. |
+| `cargo status-asylum-dev`       | Show source-dev daemon/Vite processes, ports, and `.asylum-dev` state. |
+| `cargo stop-asylum-dev`         | Stop source-dev daemon/Vite processes for this checkout. |
+| `cargo reset-asylum-dev`        | Stop source-dev processes and clear `.asylum-dev`. |
+| `cargo publish-asylum-release`  | Publish already-built release artifacts to GitHub Releases; wraps the release publish script internally. |
+
+Runtime and artifact paths:
+
+| Path                    | Purpose |
+|-------------------------|---------|
+| `target/debug/`         | Source-built Rust binaries and debug artifacts. |
+| `target/release/`       | Source-built Rust release artifacts. |
+| `cockpit/dist/`         | Cockpit production build used by product-like source runs and releases. |
+| `.asylum-dev/`          | Source-dev runtime state: config, DB, socket, logs. Safe to delete via `cargo reset-asylum-dev`. |
+| `dist/release/vX.Y.Z/`  | Local release archives/checksums before publishing. |
+
+Common workflows:
 
 ```bash
-cargo run-stack
+# Full source dev loop
+cargo run-asylum-dev
+
+# Backend-only work
+cargo run-daemon-dev
+
+# Frontend-only work
+cargo run-cockpit-dev
+
+# Check what source dev left running
+cargo status-asylum-dev
+
+# Stop source dev processes
+cargo stop-asylum-dev
+
+# Product-like run from the checkout, no hot reload
+cargo run-asylum
+
+# Full build and test
+cargo build-asylum
+cargo test-asylum
 ```
 
-For hot-reload development:
+Release workflow from source:
 
 ```bash
-cargo dev          # daemon + Cockpit Vite dev server
-cargo dev-daemon   # daemon only; rebuilds/restarts on Rust changes
-cargo dev-cockpit  # Cockpit only; proxies /api to the daemon
-cargo test-stack   # Rust tests + Cockpit tests
+cargo build-asylum-release
+cargo test-asylum-release
+cargo publish-asylum-release
 ```
 
-These are Cargo aliases defined in `.cargo/config.toml`. They run the repo-local
-`xtask` tooling crate; they are not `asylum` product CLI subcommands.
-The frontend still uses Node/Vite internally, but normal source work should not
-require typing `npm --prefix cockpit ...` directly.
-Source dev/runtime commands default to `.asylum-dev/` under the checkout and
-`127.0.0.1:7788`, which keeps them separate from an installed daemon using
-`~/.asylum` and `127.0.0.1:7717`.
-
-Useful overrides: `ASYLUM_DEV_BIND=127.0.0.1:7790` changes the daemon bind,
-and `ASYLUM_COCKPIT_DEV_PORT=5174` changes the Vite dev-server port.
+Useful source-dev overrides: `ASYLUM_DEV_BIND=127.0.0.1:7790` changes the
+daemon bind, and `ASYLUM_COCKPIT_DEV_PORT=5174` changes the Vite dev-server
+port.
 
 For protected mode, bootstrap with an owner token and point CLI/Cockpit at it:
 
@@ -186,9 +238,9 @@ ASYLUM_TOKEN="$ASYLUM_OWNER_TOKEN" ./target/debug/asylum graph get
 open "http://127.0.0.1:7717/?token=$ASYLUM_OWNER_TOKEN"
 ```
 
-The debug daemon exposes:
-- `~/.asylum/run/asylum.sock` for local CLI/MCP control
-- `http://127.0.0.1:7717/api/...` for Cockpit HTTP APIs
+The source daemon exposes:
+- `.asylum-dev/run/asylum.sock` for local CLI/MCP control when using the Cargo source workflow
+- `http://127.0.0.1:7788/api/...` for Cockpit HTTP APIs by default
 - `/` for the Cockpit single-page UI when `cockpit/dist/index.html` exists
 - `/assets/*` for static assets from `cockpit/dist/assets`
 
