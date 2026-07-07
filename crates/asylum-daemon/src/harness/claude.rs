@@ -6,6 +6,7 @@ use asylum_types::node::HarnessKind;
 use serde_json::Value;
 
 use crate::harness::launch_context::LaunchContext;
+use crate::harness::DaemonResolution;
 
 pub struct ClaudeHarness {
     command: String,
@@ -80,7 +81,7 @@ impl super::HarnessAdapter for ClaudeHarness {
     fn asylum_control_args(
         &self,
         asylum_binary: &str,
-        socket_path: Option<&str>,
+        resolution: &DaemonResolution,
         node_id: uuid::Uuid,
         session_id: Option<uuid::Uuid>,
     ) -> Vec<String> {
@@ -89,11 +90,24 @@ impl super::HarnessAdapter for ClaudeHarness {
             "ASYLUM_NODE_ID".to_string(),
             Value::String(node_id.to_string()),
         );
-        if let Some(socket_path) = socket_path {
-            env.insert(
-                "ASYLUM_SOCKET_PATH".to_string(),
-                Value::String(socket_path.to_string()),
-            );
+        match resolution {
+            DaemonResolution::Socket(Some(socket_path)) => {
+                env.insert(
+                    "ASYLUM_SOCKET_PATH".to_string(),
+                    Value::String(socket_path.to_string()),
+                );
+            }
+            DaemonResolution::Socket(None) => {}
+            DaemonResolution::Http { base_url, token } => {
+                env.insert(
+                    "ASYLUM_BASE_URL".to_string(),
+                    Value::String(base_url.to_string()),
+                );
+                env.insert(
+                    "ASYLUM_TOKEN".to_string(),
+                    Value::String(token.to_string()),
+                );
+            }
         }
         let mcp_config = serde_json::json!({
             "mcpServers": {
