@@ -80,6 +80,7 @@ pub fn event_catalog() -> Vec<HookEventCatalogEntry> {
     //   tool_call/session_end: the harness-event bridge (claude hooks/statusline,
     //   codex notify) plus the daemon quiescence timer for node.idle
     // - node.exited/node.errored: the exit sink on clean / abnormal exit
+    // - node.resumed: resume_node relaunches a stopped session's harness
     // - channel.inbound: inbound channel messages (ntfy subscriber, HTTP inbound)
     // - schedule.5m/schedule.30m: the periodic timers
     static ENTRIES: &[(&str, &str)] = &[
@@ -93,6 +94,7 @@ pub fn event_catalog() -> Vec<HookEventCatalogEntry> {
         ("node.session_end", "Node session ended"),
         ("node.exited", "Node exited"),
         ("node.errored", "Node errored"),
+        ("node.resumed", "Node session resumed"),
         ("channel.inbound", "Inbound channel message"),
         ("schedule.5m", "Every five minutes"),
         ("schedule.30m", "Every thirty minutes"),

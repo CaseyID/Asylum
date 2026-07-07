@@ -41,7 +41,11 @@ impl super::HarnessAdapter for CodexHarness {
             send_input: true,
             interrupt: true,
             stop: true,
-            resume: false,
+            // Resume is real on Local (claude --resume / codex resume from the
+            // recorded session id + surviving workspace). create_node overrides
+            // this to false for Loon nodes, whose in-guest workspace does not
+            // survive a daemon restart.
+            resume: true,
             structured_events: false,
             transcript_export: false,
         }
@@ -116,6 +120,25 @@ impl super::HarnessAdapter for CodexHarness {
                 toml_string("codex-notify")
             ),
         ]
+    }
+
+    fn resume_args(
+        &self,
+        session_id: &str,
+        asylum_binary: &str,
+        resolution: &DaemonResolution,
+        node_id: uuid::Uuid,
+    ) -> Option<Vec<String>> {
+        // Codex resumes via a `resume <thread-id>` subcommand (not a flag), so the
+        // subcommand + id lead the argv. `codex resume` accepts both the
+        // trust-bypass flag and the `-c` config overrides (verified against
+        // codex-cli 0.132.0), so the standard launch args and the Asylum MCP +
+        // notify injection are reused unchanged -- the resumed session keeps its
+        // control surface and its per-turn notify bridge.
+        let mut args = vec!["resume".to_string(), session_id.to_string()];
+        args.extend(self.launch_args.iter().cloned());
+        args.extend(self.asylum_control_args(asylum_binary, resolution, node_id, None));
+        Some(args)
     }
 
     fn pre_trust_workspace(&self, workspace: &str) -> anyhow::Result<()> {

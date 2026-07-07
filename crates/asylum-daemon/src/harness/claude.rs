@@ -47,7 +47,11 @@ impl super::HarnessAdapter for ClaudeHarness {
             send_input: true,
             interrupt: true,
             stop: true,
-            resume: false,
+            // Resume is real on Local (claude --resume / codex resume from the
+            // recorded session id + surviving workspace). create_node overrides
+            // this to false for Loon nodes, whose in-guest workspace does not
+            // survive a daemon restart.
+            resume: true,
             structured_events: false,
             transcript_export: false,
         }
@@ -109,38 +113,60 @@ impl super::HarnessAdapter for ClaudeHarness {
                 );
             }
         }
-        let mcp_config = serde_json::json!({
-            "mcpServers": {
-                "asylum": {
-                    "type": "stdio",
-                    "command": asylum_binary,
-                    "args": ["mcp"],
-                    "env": env,
-                }
-            }
-        })
-        .to_string();
-        let mut args = vec![
-            "--mcp-config".to_string(),
-            mcp_config,
-            "--strict-mcp-config".to_string(),
-            "--allowedTools".to_string(),
-            "mcp__asylum__*".to_string(),
-        ];
+        let mut args = claude_injection_args(asylum_binary, env);
         // Pre-assigned resume key (Phase C `claude --resume <id>`). Recorded on the
         // node row at create time; the SessionStart hook posts the same id back, so
-        // W1's ingestion is a no-op confirm.
+        // W1's ingestion is a no-op confirm. On the create path this is a fresh
+        // `--session-id`; the RESUME path (`resume_args`) uses `--resume <id>`
+        // instead against the same recorded id.
         if let Some(session_id) = session_id {
             args.push("--session-id".to_string());
             args.push(session_id.to_string());
         }
-        // Inject reporting hooks + statusline inline for this run only. The commands
-        // invoke the same asylum binary as the MCP injection; ASYLUM_NODE_ID and
-        // ASYLUM_SOCKET_PATH are already set on the launched process environment, so
-        // the hook child processes inherit them and the bridge can resolve the node.
-        args.push("--settings".to_string());
-        args.push(claude_settings_json(asylum_binary));
         args
+    }
+
+    fn resume_args(
+        &self,
+        session_id: &str,
+        asylum_binary: &str,
+        resolution: &DaemonResolution,
+        node_id: uuid::Uuid,
+    ) -> Option<Vec<String>> {
+        let mut env = serde_json::Map::new();
+        env.insert(
+            "ASYLUM_NODE_ID".to_string(),
+            Value::String(node_id.to_string()),
+        );
+        match resolution {
+            DaemonResolution::Socket(Some(socket_path)) => {
+                env.insert(
+                    "ASYLUM_SOCKET_PATH".to_string(),
+                    Value::String(socket_path.to_string()),
+                );
+            }
+            DaemonResolution::Socket(None) => {}
+            DaemonResolution::Http { base_url, token } => {
+                env.insert(
+                    "ASYLUM_BASE_URL".to_string(),
+                    Value::String(base_url.to_string()),
+                );
+                env.insert("ASYLUM_TOKEN".to_string(), Value::String(token.to_string()));
+            }
+        }
+        // Full resume argv. `--dangerously-skip-permissions` (from launch_args)
+        // must lead when combined with `--resume` (documented claude routing
+        // quirk), so it goes first. `--resume <id>` replaces the create path's
+        // `--session-id <id>`: passing both is contradictory (one resumes an
+        // existing session, the other opens a new session under a chosen id).
+        // The MCP + hook/statusline injection is unchanged, so the resumed
+        // session keeps its Asylum control surface and the SessionStart hook
+        // posts source=resume.
+        let mut args = self.launch_args.clone();
+        args.push("--resume".to_string());
+        args.push(session_id.to_string());
+        args.extend(claude_injection_args(asylum_binary, env));
+        Some(args)
     }
 
     fn pre_trust_workspace(&self, workspace: &str) -> anyhow::Result<()> {
@@ -221,6 +247,36 @@ impl super::HarnessAdapter for ClaudeHarness {
         tracing::debug!(workspace = workspace, paths = ?paths_to_trust, "pre-trusted claude workspace");
         Ok(())
     }
+}
+
+/// The Asylum control-surface injection shared by the create (`asylum_control_args`)
+/// and resume (`resume_args`) paths: the strict MCP registration plus the inline
+/// reporting hooks + statusline `--settings`. Session handling (`--session-id` on
+/// create, `--resume` on resume) is added by the caller around this block. The
+/// hook/statusline commands invoke the same asylum binary as the MCP injection;
+/// ASYLUM_NODE_ID / ASYLUM_SOCKET_PATH are already on the launched process
+/// environment so the hook children inherit them and resolve the node.
+fn claude_injection_args(asylum_binary: &str, env: serde_json::Map<String, Value>) -> Vec<String> {
+    let mcp_config = serde_json::json!({
+        "mcpServers": {
+            "asylum": {
+                "type": "stdio",
+                "command": asylum_binary,
+                "args": ["mcp"],
+                "env": env,
+            }
+        }
+    })
+    .to_string();
+    vec![
+        "--mcp-config".to_string(),
+        mcp_config,
+        "--strict-mcp-config".to_string(),
+        "--allowedTools".to_string(),
+        "mcp__asylum__*".to_string(),
+        "--settings".to_string(),
+        claude_settings_json(asylum_binary),
+    ]
 }
 
 /// POSIX single-quote a string so it survives being embedded in a shell command

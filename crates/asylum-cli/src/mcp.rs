@@ -157,6 +157,15 @@ fn tool_definitions() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "node.resume",
+            description: "Resume a stopped node's harness session in place (same row/workspace, recorded session id)",
+            input_schema: json!({
+                "type":"object",
+                "properties":{"node_id":{"type":"string"}},
+                "required":["node_id"]
+            }),
+        },
+        ToolSpec {
             name: "node.stop",
             description: "Stop a node gracefully",
             input_schema: json!({
@@ -640,6 +649,16 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
             match client.interrupt_node(node_id).await {
                 Ok(()) => content_result(json!({"ok":true})),
                 Err(err) => rpc_error(-32000, &format!("node.interrupt failed: {err}")),
+            }
+        }
+        "node.resume" => {
+            let node_id = match parse_node_id(&params.arguments) {
+                Ok(node_id) => node_id,
+                Err(err) => return rpc_error(-32602, &err),
+            };
+            match client.resume_node(node_id).await {
+                Ok(()) => content_result(json!({"ok":true})),
+                Err(err) => rpc_error(-32000, &format!("node.resume failed: {err}")),
             }
         }
         "node.stop" => {
@@ -1308,6 +1327,7 @@ mod tests {
         assert!(names.contains(&"graph.get"));
         assert!(names.contains(&"attach_url.issue"));
         assert!(names.contains(&"node.fork"));
+        assert!(names.contains(&"node.resume"));
         assert!(names.contains(&"node.spawn_peer"));
         assert!(names.contains(&"hook.list"));
         assert!(names.contains(&"channel.inspect"));

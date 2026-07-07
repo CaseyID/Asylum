@@ -174,6 +174,10 @@ pub async fn run(action: CliAction) -> Result<()> {
                 client.send_input(node_id, text).await?;
                 println!("input sent");
             }
+            NodeCommand::Resume { node_id } => {
+                client.resume_node(node_id).await?;
+                println!("node resumed");
+            }
             NodeCommand::Interrupt { node_id } => {
                 client.interrupt_node(node_id).await?;
                 println!("node interrupted");
@@ -1103,6 +1107,8 @@ enum NodeCommand {
     Inspect { node_id: Uuid },
     Send { node_id: Uuid, text: String },
     Interrupt { node_id: Uuid },
+    /// Resume a stopped node's harness session in place (same row/workspace).
+    Resume { node_id: Uuid },
     Stop { node_id: Uuid },
     Archive { node_id: Uuid },
 }
