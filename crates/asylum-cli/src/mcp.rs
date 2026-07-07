@@ -164,7 +164,7 @@ fn tool_definitions() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "node.archive",
-            description: "Archive a node and export its transcript",
+            description: "Stop a node's session and mark it archived",
             input_schema: json!({
                 "type":"object",
                 "properties":{"node_id":{"type":"string"}},
