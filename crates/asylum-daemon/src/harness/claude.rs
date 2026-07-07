@@ -71,11 +71,18 @@ impl super::HarnessAdapter for ClaudeHarness {
         context.instruction_prompt()
     }
 
+    fn preassign_session_id(&self) -> Option<uuid::Uuid> {
+        // claude accepts a caller-chosen session id via `--session-id`. Pre-assigning
+        // it makes the resume key known at create time (recorded on the node row).
+        Some(uuid::Uuid::new_v4())
+    }
+
     fn asylum_control_args(
         &self,
         asylum_binary: &str,
         socket_path: Option<&str>,
         node_id: uuid::Uuid,
+        session_id: Option<uuid::Uuid>,
     ) -> Vec<String> {
         let mut env = serde_json::Map::new();
         env.insert(
@@ -99,13 +106,27 @@ impl super::HarnessAdapter for ClaudeHarness {
             }
         })
         .to_string();
-        vec![
+        let mut args = vec![
             "--mcp-config".to_string(),
             mcp_config,
             "--strict-mcp-config".to_string(),
             "--allowedTools".to_string(),
             "mcp__asylum__*".to_string(),
-        ]
+        ];
+        // Pre-assigned resume key (Phase C `claude --resume <id>`). Recorded on the
+        // node row at create time; the SessionStart hook posts the same id back, so
+        // W1's ingestion is a no-op confirm.
+        if let Some(session_id) = session_id {
+            args.push("--session-id".to_string());
+            args.push(session_id.to_string());
+        }
+        // Inject reporting hooks + statusline inline for this run only. The commands
+        // invoke the same asylum binary as the MCP injection; ASYLUM_NODE_ID and
+        // ASYLUM_SOCKET_PATH are already set on the launched process environment, so
+        // the hook child processes inherit them and the bridge can resolve the node.
+        args.push("--settings".to_string());
+        args.push(claude_settings_json(asylum_binary));
+        args
     }
 
     fn pre_trust_workspace(&self, workspace: &str) -> anyhow::Result<()> {
@@ -186,4 +207,49 @@ impl super::HarnessAdapter for ClaudeHarness {
         tracing::debug!(workspace = workspace, paths = ?paths_to_trust, "pre-trusted claude workspace");
         Ok(())
     }
+}
+
+/// POSIX single-quote a string so it survives being embedded in a shell command
+/// line (claude runs hook / statusline `command` values via the shell).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Build the inline `--settings` JSON that wires claude's reporting hooks and
+/// statusline through the asylum bridge. Every hook invokes
+/// `<asylum-binary> harness-event claude-hook`; the statusline invokes
+/// `<asylum-binary> harness-event claude-statusline`. The daemon maps each event
+/// by payload content (hook_event_name / Notification `type` / SessionStart
+/// `source`), so no matchers are set — every occurrence is forwarded.
+fn claude_settings_json(asylum_binary: &str) -> String {
+    let bin = shell_quote(asylum_binary);
+    let hook_cmd = format!("{bin} harness-event claude-hook");
+    let statusline_cmd = format!("{bin} harness-event claude-statusline");
+
+    // A single matcher-group forwarding one event to the bridge. `async_tool` marks
+    // the PostToolUse group fire-and-forget so tool execution is never blocked. A
+    // short 10s timeout keeps a slow/unreachable daemon from stalling the session
+    // near claude's 600s hook default.
+    let group = |async_tool: bool| -> Value {
+        let mut entry = serde_json::Map::new();
+        entry.insert("type".to_string(), Value::String("command".to_string()));
+        entry.insert("command".to_string(), Value::String(hook_cmd.clone()));
+        entry.insert("timeout".to_string(), Value::from(10));
+        if async_tool {
+            entry.insert("async".to_string(), Value::Bool(true));
+        }
+        serde_json::json!({ "hooks": [Value::Object(entry)] })
+    };
+
+    serde_json::json!({
+        "hooks": {
+            "Stop": [group(false)],
+            "Notification": [group(false)],
+            "SessionStart": [group(false)],
+            "SessionEnd": [group(false)],
+            "PostToolUse": [group(true)],
+        },
+        "statusLine": { "type": "command", "command": statusline_cmd }
+    })
+    .to_string()
 }

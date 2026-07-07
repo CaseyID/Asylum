@@ -70,6 +70,9 @@ impl super::HarnessAdapter for CodexHarness {
         asylum_binary: &str,
         socket_path: Option<&str>,
         node_id: uuid::Uuid,
+        // Codex session ids are not pre-assignable (`codex` has no --session-id);
+        // W1 records the thread-id from the first notify post instead.
+        _session_id: Option<uuid::Uuid>,
     ) -> Vec<String> {
         let mut env_entries = vec![format!(
             "ASYLUM_NODE_ID={}",
@@ -92,6 +95,18 @@ impl super::HarnessAdapter for CodexHarness {
             "mcp_servers.asylum.startup_timeout_sec=10".to_string(),
             "-c".to_string(),
             "mcp_servers.asylum.tool_timeout_sec=60".to_string(),
+            // Route codex's per-turn `agent-turn-complete` notification through the
+            // asylum bridge. Codex appends one argv element of JSON to this command;
+            // the bridge reads it from argv (never stdin) and POSTs the mapped event.
+            // Value is a TOML array of strings, matching how `-c mcp_servers.*.args`
+            // is formatted above.
+            "-c".to_string(),
+            format!(
+                "notify=[{},{},{}]",
+                toml_string(asylum_binary),
+                toml_string("harness-event"),
+                toml_string("codex-notify")
+            ),
         ]
     }
 
