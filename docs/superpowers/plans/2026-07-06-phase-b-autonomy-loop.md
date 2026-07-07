@@ -84,7 +84,14 @@ W2/W3 build against this:
 - Interrupt now sends Ctrl-C only (no forced Stopped/exited). Exit sink: clean exit→Stopped+node.exited(exit_code); abnormal→Failed+node.errored. Quiescence idle: 30s sweep fires node.idle for Running Local nodes with native_idle_signal()==false (codex) after autonomy.idle_quiescence_seconds (default 120); claude skipped (native idle via Notification).
 - Schema: nullable nodes.harness_session_id (ensure_column migration). New config `[autonomy]`.
 
-## W2 delivered contract (branch phase-b-w2, not yet merged, 2026-07-06)
+## W0 delivered contract (merged to main, 2026-07-06)
+
+- Launch prompt is no longer passed as a positional argv for Local nodes. It flows via `SubstrateContext.launch_prompt`; `LocalSubstrate::launch` spawns a background task that waits for readiness (first PTY frame, then 600ms output-quiet, bounded 20s first-output / 10s overall — timing only, no output parsing) and delivers the prompt as a submitted message. Loon path unchanged (`LoonContext.prompt`).
+- The type-and-submit contract lives in `LocalSubstrate::submit_over_writer`: body write, 50ms gap, then a lone `\r` as a DISTINCT write (claude's TUI absorbs a bundled CR as pasted content). `send_input` uses it — one call both enters AND submits; use it for hook `send_input` actions, `resolve_decision` feedback, supervisor-drives-worker. `send_input_raw` stays truly raw (no appended Enter) and is reserved for the interactive attach WS path.
+- Live-verified against real claude 2.1.202 (isolated daemon, one session): launch prompt auto-submitted (LAUNCH-OK) and a single send delivered+submitted (SEND-OK).
+- Readiness is a fixed timing heuristic (no config knob); a continuously-rendering harness gets its prompt at the 10s cap.
+
+## W2 delivered contract (merged to main 329761c, 2026-07-06)
 
 W3/W4 build against this:
 - New CLI subcommand family in `crates/asylum-cli`: `asylum harness-event <source>` where `<source>` is `claude-hook`, `claude-statusline`, or `codex-notify`. Stays thin — no interpretation of the payload; forwards verbatim JSON as `POST /api/nodes/{id}/harness-event` with body `{"source": "claude_hook"|"claude_statusline"|"codex_notify", "payload": <verbatim JSON>}` (W1's endpoint).
@@ -96,13 +103,10 @@ W3/W4 build against this:
 
 ## Status
 
-- W0: not started (input delivery bugs from E2E; note: interrupt/exit already fixed in W1, so W0 is now just the two send_input/launch-submit bugs, both in substrate/local.rs + harness launch)
+- W0: COMPLETE — merged to main (branch phase-b-w0); live-verified launch-submit and send-submit; 139 daemon-lib tests green (+3). See delivered contract above.
 - W1: COMPLETE — merged to main f7186bb; 136 daemon-lib tests green (+12).
-- W2 (CLI bridge `asylum harness-event`): COMPLETE on branch phase-b-w2 (not yet merged) — see delivered contract above.
-- W3 (launch injection: --session-id, --settings hooks+statusLine for claude; -c notify for codex): not started.
+- W2 (CLI bridge `asylum harness-event`): COMPLETE — merged to main 329761c; 69 cli tests green (+23). See delivered contract above.
+- W3 (launch injection: --session-id, --settings hooks+statusLine for claude; -c notify for codex): in progress.
 - W4 (hook actions send_input + honest spawn, delete recipes; decision producer from awaiting_input; resolve_decision feedback injection): not started.
 - W5 (cockpit: catalog-matched pickers, decision surfacing, liveness chips): not started.
-- W3: not started
-- W4: not started
-- W5: not started
 - Gate: not run
