@@ -1738,11 +1738,25 @@ impl CapabilityService {
         let launch_prompt = launch_prompt_for_runtime(adapter.as_ref(), node.id, &request);
         let mut launch_args = adapter.launch_args().to_vec();
         if matches!(substrate, SubstrateKind::Local) {
+            // Pre-assign the harness session id where the harness supports it (claude
+            // `--session-id`). Recorded on the node row now so it is the Phase C resume
+            // key even before the first SessionStart post confirms it. Codex returns
+            // None (its thread-id is discovered from the first notify post, W1).
+            let pre_session_id = adapter.preassign_session_id();
+            if let Some(session_id) = pre_session_id {
+                if let Err(e) = self
+                    .store
+                    .set_node_harness_session_id(node.id, Some(&session_id.to_string()))
+                {
+                    tracing::warn!(error = %e, node_id = %node.id, "failed to record pre-assigned harness session id");
+                }
+            }
             let asylum_binary = current_asylum_binary();
             launch_args.extend(adapter.asylum_control_args(
                 &asylum_binary,
                 self.config.socket_path.as_deref(),
                 node.id,
+                pre_session_id,
             ));
         }
         launch_args.extend(request.launch_args.clone());
