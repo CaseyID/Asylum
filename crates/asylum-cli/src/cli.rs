@@ -13,6 +13,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::client::AsylumClient;
+use crate::harness_event;
 use crate::host::{
     command_exists, config_dir_path, require_binary, select_backend, service_state_from_health,
     HostState, PortInUse, ServiceBackend, ServiceManager, ServiceState,
@@ -400,6 +401,15 @@ pub async fn run(action: CliAction) -> Result<()> {
         Command::Mcp => {
             mcp::run_stdio_server(Arc::new(client)).await?;
         }
+        Command::HarnessEvent { command } => match command {
+            HarnessEventCommand::ClaudeHook => harness_event::run_claude_hook(&paths).await,
+            HarnessEventCommand::ClaudeStatusline => {
+                harness_event::run_claude_statusline(&paths).await
+            }
+            HarnessEventCommand::CodexNotify { payload } => {
+                harness_event::run_codex_notify(payload, &paths).await
+            }
+        },
     }
 
     Ok(())
@@ -545,6 +555,32 @@ enum Command {
     },
     /// Run the MCP server over stdio (for editor integrations).
     Mcp,
+    /// Bridge harness-native signals (claude hooks/statusline, codex notify) to the daemon.
+    /// Invoked by injected Claude Code hooks/statusline and Codex's `notify` config from
+    /// inside a running node's environment; never interprets the payload, just forwards it.
+    #[command(name = "harness-event")]
+    HarnessEvent {
+        #[command(subcommand)]
+        command: HarnessEventCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum HarnessEventCommand {
+    /// Claude Code hook payload (Stop, Notification, SessionStart, SessionEnd,
+    /// PostToolUse) piped on stdin.
+    #[command(name = "claude-hook")]
+    ClaudeHook,
+    /// Claude Code statusLine payload piped on stdin; always prints a single
+    /// status line to stdout afterward (Claude Code renders that stdout as the
+    /// status bar text), regardless of whether forwarding to the daemon succeeded.
+    #[command(name = "claude-statusline")]
+    ClaudeStatusline,
+    /// Codex `notify` payload, appended by Codex as a single trailing argv
+    /// element (Codex nulls stdin/stdout/stderr for the notify subprocess, so
+    /// this must never be read from stdin).
+    #[command(name = "codex-notify")]
+    CodexNotify { payload: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -2762,6 +2798,56 @@ mod tests {
             Cli::try_parse_from(["asylum", "recipe", "spawn"]).is_err(),
             "recipe spawn command should be hidden while disabled"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn harness_event_subcommands_parse_expected_shapes() -> Result<()> {
+        let cli = Cli::try_parse_from(["asylum", "harness-event", "claude-hook"])?;
+        assert!(matches!(
+            cli.command,
+            Some(Command::HarnessEvent {
+                command: HarnessEventCommand::ClaudeHook
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["asylum", "harness-event", "claude-statusline"])?;
+        assert!(matches!(
+            cli.command,
+            Some(Command::HarnessEvent {
+                command: HarnessEventCommand::ClaudeStatusline
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "asylum",
+            "harness-event",
+            "codex-notify",
+            r#"{"type":"agent-turn-complete","thread-id":"abc"}"#,
+        ])?;
+        let payload = match cli.command {
+            Some(Command::HarnessEvent {
+                command: HarnessEventCommand::CodexNotify { payload },
+            }) => payload,
+            _ => panic!("expected a HarnessEvent(CodexNotify) command"),
+        };
+        assert_eq!(
+            payload.as_deref(),
+            Some(r#"{"type":"agent-turn-complete","thread-id":"abc"}"#)
+        );
+
+        // Codex always appends exactly one argv element, but the CLI stays
+        // defensive: a missing trailing payload must still parse (not a clap
+        // hard-error / nonzero exit) so a misconfigured launch never breaks
+        // the harness process that invokes it.
+        let cli = Cli::try_parse_from(["asylum", "harness-event", "codex-notify"])?;
+        assert!(matches!(
+            cli.command,
+            Some(Command::HarnessEvent {
+                command: HarnessEventCommand::CodexNotify { payload: None }
+            })
+        ));
+
         Ok(())
     }
 
