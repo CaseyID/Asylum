@@ -43,4 +43,22 @@ describe("node liveness display", () => {
     expect(uiStateLabel(state)).toBe("archived");
     expect(previewFor(node())).toBe("— archived");
   });
+
+  it("renders waiting_for_input as a distinct 'waiting' chip (W5 liveness truth)", () => {
+    const state = uiStateForLiveness("waiting_for_input");
+
+    expect(state).toBe("waiting");
+    expect(uiStateLabel(state)).toBe("waiting");
+    expect(previewFor(node({ liveness: "waiting_for_input" }))).toBe("? waiting on input");
+    // distinct from a plain running node
+    expect(state).not.toBe(uiStateForLiveness("running"));
+  });
+
+  it("keeps failed nodes reading as errored, not a generic stopped state", () => {
+    const state = uiStateForLiveness("failed");
+
+    expect(state).toBe("errored");
+    expect(previewFor(node({ liveness: "failed" }))).toBe("! errored");
+    expect(state).not.toBe(uiStateForLiveness("stopped"));
+  });
 });

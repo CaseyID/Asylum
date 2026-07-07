@@ -23,6 +23,9 @@ export interface CockpitScreenProps {
   onLaunchCC: () => void;
   substrates: { id: string; name: string; healthy: boolean; capacity: number }[];
   relationships: GraphRelationship[];
+  // node ids with an unresolved pending decision (W5 decision surfacing).
+  pendingDecisionNodeIds?: Set<string>;
+  onOpenDecisions?: () => void;
 }
 
 const LAYOUT_OPTIONS: [GraphLayout, string][] = [
@@ -45,6 +48,8 @@ export function CockpitScreen({
   onLaunchCC,
   substrates,
   relationships,
+  pendingDecisionNodeIds,
+  onOpenDecisions,
 }: CockpitScreenProps): JSX.Element {
   const panelNode = selected ?? ccNode;
 
@@ -58,6 +63,7 @@ export function CockpitScreen({
             selectedId={selected?.id}
             onSelect={(gn) => onSelect(gn.node)}
             substrates={substrates}
+            pendingDecisionNodeIds={pendingDecisionNodeIds}
           />
           <div className="graph-controls">
             {LAYOUT_OPTIONS.map(([id, glyph]) => (
@@ -113,7 +119,14 @@ export function CockpitScreen({
           )}
         </div>
       </div>
-      <Inspector node={selected} onAction={onAction} onOpen={onOpen} relationships={relationships} />
+      <Inspector
+        node={selected}
+        onAction={onAction}
+        onOpen={onOpen}
+        relationships={relationships}
+        hasPendingDecision={selected ? pendingDecisionNodeIds?.has(selected.id) : false}
+        onOpenDecisions={onOpenDecisions}
+      />
     </div>
   );
 }

@@ -1,8 +1,10 @@
-import { describe, it, expect, vi } from "vitest";
-import { render } from "@testing-library/react";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { cleanup, render } from "@testing-library/react";
 import { Inspector } from "./Inspector";
 import { shortNodeId } from "../lib/glyphs";
 import type { AsylumNode, GraphRelationship } from "../types";
+
+afterEach(() => cleanup());
 
 // Minimal node fixture — only fields Inspector reads.
 function makeNode(id: string): AsylumNode {
@@ -105,5 +107,43 @@ describe("Inspector parent display", () => {
     );
 
     expect(queryByText(/^attach$/i)).toBeNull();
+  });
+});
+
+describe("Inspector W5 decision + session surfacing", () => {
+  it("shows a pending-decision affordance that opens the decisions screen", () => {
+    const node = makeNode("worker-abc123");
+    const onOpenDecisions = vi.fn();
+    const { getByRole } = render(
+      <Inspector
+        node={node}
+        onAction={vi.fn()}
+        onOpen={vi.fn()}
+        hasPendingDecision
+        onOpenDecisions={onOpenDecisions}
+      />,
+    );
+
+    const btn = getByRole("button", { name: "pending decision" });
+    btn.click();
+    expect(onOpenDecisions).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not show a pending-decision affordance when there is none pending", () => {
+    const node = makeNode("worker-abc123");
+    const { queryByRole } = render(
+      <Inspector node={node} onAction={vi.fn()} onOpen={vi.fn()} />,
+    );
+
+    expect(queryByRole("button", { name: "pending decision" })).toBeNull();
+  });
+
+  it("shows the harness session id in the overview when present", () => {
+    const node = { ...makeNode("worker-abc123"), harness_session_id: "sess-xyz" };
+    const { container } = render(
+      <Inspector node={node} onAction={vi.fn()} onOpen={vi.fn()} />,
+    );
+
+    expect(container.textContent).toContain("sess-xyz");
   });
 });

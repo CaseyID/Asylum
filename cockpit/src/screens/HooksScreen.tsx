@@ -8,9 +8,12 @@ import {
   fetchHookEvents,
   fetchHookFirings,
   fetchHooks,
+  fetchNodes,
   updateHook,
 } from "../api";
+import { shortNodeId } from "../lib/glyphs";
 import type {
+  AsylumNode,
   HookAction,
   HookEventCatalogEntry,
   HookFiringRecord,
@@ -105,7 +108,13 @@ function HookCard({
             <li key={i}>
               <span className="step">{i + 1}</span>
               <span className="kind">{a.kind}</span>
-              <code className="trg">{a.target}</code>
+              {a.kind === "spawn" ? (
+                <code className="trg">
+                  {String(a.args?.harness ?? "?")} on {String(a.args?.substrate ?? "?")}
+                </code>
+              ) : (
+                <code className="trg">{a.target || "(event's node)"}</code>
+              )}
               {a.template && <span className="tpl">{`"${a.template}"`}</span>}
             </li>
           ))}
@@ -140,11 +149,65 @@ function HookCard({
 // send_input and spawn are honest, always-available hook actions (W4).
 const ACTION_KINDS = ["channel", "send_input", "spawn", "tool", "pause_node", "archive"];
 
+// Target values that mean "the event's own node" for a send_input action
+// (see resolve_action_node_id in capability_service.rs). The select renders
+// these all as the same "(event's node)" option.
+const EVENT_NODE_TARGET_SENTINELS = ["", "event", "node", "event.node"];
+
+function isEventNodeTarget(target: string): boolean {
+  return EVENT_NODE_TARGET_SENTINELS.includes(target.trim());
+}
+
+function defaultActionForKind(kind: string, previous: HookAction): HookAction {
+  if (kind === "spawn") {
+    return {
+      kind,
+      target: "",
+      template: undefined,
+      args: { harness: "claude_code", substrate: "local", role: "worker" },
+    };
+  }
+  if (kind === "send_input") {
+    return { kind, target: "", template: previous.template ?? "" };
+  }
+  if (kind === "channel") {
+    return { kind, target: previous.kind === "channel" ? previous.target : "", template: previous.template ?? "" };
+  }
+  return { kind, target: previous.kind === kind ? previous.target : "" };
+}
+
+// Strip blank optional fields from a spawn action's args and force the
+// target/template to the W4 wire shape (target "", template omitted) right
+// before a hook is saved, so a hook never persists e.g. role: "".
+function sanitizeActionForSave(a: HookAction): HookAction {
+  if (a.kind === "spawn") {
+    const args = (a.args ?? {}) as Record<string, unknown>;
+    const clean: Record<string, unknown> = {
+      harness: typeof args.harness === "string" && args.harness ? args.harness : "claude_code",
+      substrate: typeof args.substrate === "string" && args.substrate ? args.substrate : "local",
+    };
+    const role = typeof args.role === "string" ? args.role.trim() : "";
+    if (role) clean.role = role;
+    const workspace = typeof args.workspace === "string" ? args.workspace.trim() : "";
+    if (workspace) clean.workspace = workspace;
+    const description = typeof args.description === "string" ? args.description.trim() : "";
+    if (description) clean.description = description;
+    const prompt = typeof args.prompt === "string" ? args.prompt.trim() : "";
+    if (prompt) clean.prompt = prompt;
+    return { kind: "spawn", target: "", template: undefined, args: clean };
+  }
+  if (a.kind === "send_input") {
+    return { ...a, args: a.args ?? {} };
+  }
+  return a;
+}
+
 function HookEditor({
   hookId,
   presetEvent,
   hooks,
   events,
+  nodes,
   onClose,
   onSaved,
 }: {
@@ -152,6 +215,7 @@ function HookEditor({
   presetEvent?: string;
   hooks: HookRule[];
   events: HookEventCatalogEntry[];
+  nodes: AsylumNode[];
   onClose: () => void;
   onSaved: () => Promise<void> | void;
 }) {
@@ -175,6 +239,14 @@ function HookEditor({
   function setAction(i: number, patch: Partial<HookAction>) {
     setActions((cur) => cur.map((a, idx) => (idx === i ? { ...a, ...patch } : a)));
   }
+  function setActionArgs(i: number, patch: Record<string, unknown>) {
+    setActions((cur) =>
+      cur.map((a, idx) => (idx === i ? { ...a, args: { ...(a.args ?? {}), ...patch } } : a)),
+    );
+  }
+  function onKindChange(i: number, kind: string) {
+    setActions((cur) => cur.map((a, idx) => (idx === i ? defaultActionForKind(kind, a) : a)));
+  }
   function addAction() {
     setActions((cur) => [...cur, { kind: "channel", target: "" }]);
   }
@@ -186,10 +258,11 @@ function HookEditor({
     setBusy(true);
     setError(null);
     try {
+      const cleanActions = actions.map(sanitizeActionForSave);
       if (isNew) {
-        await createHook({ name, enabled: true, event, filter, actions });
+        await createHook({ name, enabled: true, event, filter, actions: cleanActions });
       } else {
-        await updateHook(hookId, { name, event, filter, actions });
+        await updateHook(hookId, { name, event, filter, actions: cleanActions });
       }
       await onSaved();
       onClose();
@@ -278,7 +351,7 @@ function HookEditor({
                 <select
                   className="input mono"
                   value={a.kind}
-                  onChange={(e) => setAction(i, { kind: e.target.value })}
+                  onChange={(e) => onKindChange(i, e.target.value)}
                   disabled={!allowedActionKinds.includes(a.kind)}
                   style={{ width: 120 }}
                 >
@@ -293,12 +366,36 @@ function HookEditor({
                     </option>
                   ))}
                 </select>
-                <input
-                  className="input mono"
-                  value={a.target}
-                  onChange={(e) => setAction(i, { target: e.target.value })}
-                  style={{ flex: 1 }}
-                />
+                {a.kind === "send_input" ? (
+                  <select
+                    className="input mono"
+                    aria-label="send_input target node"
+                    value={isEventNodeTarget(a.target) ? "" : a.target}
+                    onChange={(e) => setAction(i, { target: e.target.value })}
+                    style={{ flex: 1 }}
+                  >
+                    <option value="">(event&apos;s node)</option>
+                    {nodes.map((n) => (
+                      <option key={n.id} value={n.id}>
+                        {shortNodeId(n.id)} · {n.role_hint}
+                      </option>
+                    ))}
+                  </select>
+                ) : a.kind === "spawn" ? (
+                  <span
+                    className="muted mono"
+                    style={{ flex: 1, fontSize: 11, alignSelf: "center", opacity: 0.7 }}
+                  >
+                    spawns a new node — target unused
+                  </span>
+                ) : (
+                  <input
+                    className="input mono"
+                    value={a.target}
+                    onChange={(e) => setAction(i, { target: e.target.value })}
+                    style={{ flex: 1 }}
+                  />
+                )}
                 <Btn
                   size="sm"
                   kind="ghost"
@@ -319,6 +416,58 @@ function HookEditor({
                   }
                   style={{ marginLeft: 28 }}
                 />
+              )}
+              {a.kind === "spawn" && (
+                <div
+                  className="spawn-action-fields"
+                  style={{ marginLeft: 28, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}
+                >
+                  <select
+                    className="input mono"
+                    value={String(a.args?.harness ?? "claude_code")}
+                    onChange={(e) => setActionArgs(i, { harness: e.target.value })}
+                    aria-label="spawn harness"
+                  >
+                    <option value="claude_code">claude_code</option>
+                    <option value="codex">codex</option>
+                  </select>
+                  <select
+                    className="input mono"
+                    value={String(a.args?.substrate ?? "local")}
+                    onChange={(e) => setActionArgs(i, { substrate: e.target.value })}
+                    aria-label="spawn substrate"
+                  >
+                    <option value="local">local</option>
+                    <option value="loon">loon</option>
+                  </select>
+                  <input
+                    className="input mono"
+                    value={String(a.args?.role ?? "")}
+                    onChange={(e) => setActionArgs(i, { role: e.target.value })}
+                    placeholder="role (default worker)"
+                  />
+                  <input
+                    className="input mono"
+                    value={String(a.args?.workspace ?? "")}
+                    onChange={(e) => setActionArgs(i, { workspace: e.target.value })}
+                    placeholder="workspace (optional path)"
+                  />
+                  <input
+                    className="input mono"
+                    value={String(a.args?.description ?? "")}
+                    onChange={(e) => setActionArgs(i, { description: e.target.value })}
+                    placeholder="description (optional)"
+                    style={{ gridColumn: "1 / -1" }}
+                  />
+                  <textarea
+                    className="input mono"
+                    value={String(a.args?.prompt ?? "")}
+                    onChange={(e) => setActionArgs(i, { prompt: e.target.value })}
+                    placeholder="prompt — first instruction (optional, template-rendered)"
+                    style={{ gridColumn: "1 / -1", minHeight: 44 }}
+                    rows={2}
+                  />
+                </div>
               )}
             </div>
 
@@ -366,6 +515,7 @@ export function HooksScreen(): JSX.Element {
   const [hooks, setHooks] = useState<HookRule[]>([]);
   const [firings, setFirings] = useState<HookFiringRecord[]>([]);
   const [events, setEvents] = useState<HookEventCatalogEntry[]>([]);
+  const [nodes, setNodes] = useState<AsylumNode[]>([]);
   const [tab, setTab] = useState<string>("rules");
 
   const [drawer, setDrawer] = useState<DrawerState | null>(null);
@@ -405,6 +555,12 @@ export function HooksScreen(): JSX.Element {
       .catch((err) => {
         setLoadError(formatError("failed to load event catalog", err));
       });
+    // Best-effort: the node picker for send_input degrades to "(event's
+    // node)" only if this fails, so a load error here does not block the
+    // rest of the screen.
+    fetchNodes()
+      .then(setNodes)
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -576,6 +732,7 @@ export function HooksScreen(): JSX.Element {
                 presetEvent={drawer.presetEvent}
                 hooks={hooks}
                 events={events}
+                nodes={nodes}
                 onClose={() => setDrawer(null)}
 
                 onSaved={reloadHooks}
