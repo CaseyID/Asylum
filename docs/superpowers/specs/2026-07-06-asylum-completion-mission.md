@@ -63,7 +63,9 @@ Gate: the north-star scenario, witnessed end-to-end.
 
 ## Open questions for Casey
 
-1. (2026-07-06) One-time passwordless-sudo setup so the run never blocks on a password. Run in the Claude session: `! echo 'casey ALL=(ALL:ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/99-casey-nopasswd && sudo chmod 0440 /etc/sudoers.d/99-casey-nopasswd`. Once done, the Loon host install proceeds unattended: `sudo env PATH=/home/casey/Projects/LoonV2/target/release:$PATH /home/casey/Projects/LoonV2/target/release/loon-host install --storage auto --yes` (creates a 20 GiB btrfs loopback at /var/lib/loon.btrfs.img, installs systemd units, binds https://127.0.0.1:7777).
+(none open)
+
+Resolved: passwordless sudo configured 2026-07-06 via /etc/sudoers.d/99-casey-nopasswd (remove with `sudo rm /etc/sudoers.d/99-casey-nopasswd` when the mission is over).
 
 ## Status
 
