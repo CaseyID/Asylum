@@ -21,6 +21,7 @@ fn test_app_config() -> AppConfig {
         ntfy_poll_interval_seconds: Some(core.ntfy.poll_interval_seconds),
         harness: core.harness,
         loon: core.loon,
+        autonomy: core.autonomy,
     }
 }
 

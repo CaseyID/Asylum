@@ -1,19 +1,22 @@
 use std::{
+    collections::HashMap,
     env,
     path::Path,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
 use asylum_types::api::{
     AttachResponse, CapabilityListResponse, ClientConfigResponse, CreateNodeRequest,
     DecisionCreateRequest, DecisionListResponse, DecisionRecord, DecisionResolveRequest,
-    GraphGetResponse, HarnessDescriptor, HarnessDescriptorResponse, HarnessListResponse,
-    HealthResponse, LaunchPacketResponse, NativeAttachResponse, NodeCreateResponse,
-    NodeEventsResponse, NodeInspectResponse, NodeListResponse, Notification, NotificationsResponse,
-    RelationshipCreateRequest, RelationshipResponse, RemoteCommandResponse, SendInputRequest,
-    SpawnPeerRequest, SpawnPeerResponse, SubstrateDescriptor, SubstrateDescriptorResponse,
-    SubstrateHealth, SubstrateListResponse, TokenIssueResponse,
+    GraphGetResponse, HarnessDescriptor, HarnessDescriptorResponse, HarnessEventRequest,
+    HarnessEventResponse, HarnessListResponse, HealthResponse, LaunchPacketResponse,
+    NativeAttachResponse, NodeCreateResponse, NodeEventsResponse, NodeInspectResponse,
+    NodeListResponse, Notification, NotificationsResponse, RelationshipCreateRequest,
+    RelationshipResponse, RemoteCommandResponse, SendInputRequest, SpawnPeerRequest,
+    SpawnPeerResponse, SubstrateDescriptor, SubstrateDescriptorResponse, SubstrateHealth,
+    SubstrateListResponse, TokenIssueResponse,
 };
 use asylum_types::capabilities::CapabilityDescriptor;
 use asylum_types::capabilities::CapabilityName;
@@ -43,7 +46,7 @@ use crate::recipes;
 use crate::remote_commands::{parse_remote_command, ParsedRemoteCommand, RemoteCommandKind};
 use crate::storage::Store;
 use crate::substrate::loon::{capability_flags_from_health, LoonHealth, LoonSubstrate};
-use crate::substrate::{LocalSubstrate, SubstrateContext};
+use crate::substrate::{ExitOutcome, LocalSubstrate, SubstrateContext};
 use asylum_types::api::{
     ChannelCreateRequest, ChannelDescriptor, ChannelInboundRequest, ChannelListResponse,
     ChannelMessagesResponse, ChannelTestRequest, ChannelTestResponse, ChannelUpdateRequest,
@@ -51,12 +54,14 @@ use asylum_types::api::{
     HookListResponse, HookRule, HookTestResponse, HookUpdateRequest, RecipeListResponse,
     RecipeSpawnRequest, RecipeSpawnResponse,
 };
-use asylum_types::config::{HarnessConfig, LoonConfig};
+use asylum_types::config::{AutonomyConfig, HarnessConfig, LoonConfig};
 use asylum_types::node::NodeRecord;
 
 const CHANNEL_REPLY_TOKEN_LENGTH: usize = 5;
 const CHANNEL_REPLY_CORRELATION_TTL_SECONDS: i64 = 60 * 30;
-const NODE_PERMISSION_REQUESTED_HOOK_EVENT: &str = "node.permission_requested";
+// Awaiting-input / permission-prompt decisions surface under the single
+// `node.awaiting_input` catalog event (permission_requested was merged in).
+const NODE_AWAITING_INPUT_HOOK_EVENT: &str = "node.awaiting_input";
 
 #[derive(Clone)]
 struct LocalDecisionIngestion {
@@ -104,11 +109,12 @@ impl LocalDecisionIngestion {
         }
         if hook_event_is_supported() {
             self.hook_engine.post(HookEvent {
-                event: NODE_PERMISSION_REQUESTED_HOOK_EVENT.to_string(),
+                event: NODE_AWAITING_INPUT_HOOK_EVENT.to_string(),
                 node_id: Some(node.id),
                 payload: json!({
                     "decision": decision.id,
                     "node": {"id": node.id.to_string()},
+                    "type": "permission_prompt",
                     "source": source,
                     "actions": actions,
                 }),
@@ -121,7 +127,152 @@ impl LocalDecisionIngestion {
 fn hook_event_is_supported() -> bool {
     event_catalog()
         .iter()
-        .any(|event| event.id == NODE_PERMISSION_REQUESTED_HOOK_EVENT)
+        .any(|event| event.id == NODE_AWAITING_INPUT_HOOK_EVENT)
+}
+
+/// A live node still owns its process and can accept harness signals; terminal
+/// nodes are never resurrected by an ingested event.
+fn is_active_liveness(liveness: &NodeLiveness) -> bool {
+    matches!(
+        liveness,
+        NodeLiveness::Starting | NodeLiveness::Running | NodeLiveness::WaitingForInput
+    )
+}
+
+/// The result of mapping a raw harness payload to Asylum's event model. All
+/// interpretation lives here (daemon-side) so the CLI bridge stays thin.
+#[derive(Default)]
+struct MappedHarnessEvent {
+    /// Catalog event kind to store + fire, if any.
+    event: Option<&'static str>,
+    /// Liveness the node should move to as a result, if the event implies one.
+    liveness: Option<NodeLiveness>,
+    /// Extra fields merged into the stored and posted payload.
+    detail: JsonValue,
+    /// Harness session id carried by the payload (claude `session_id`,
+    /// codex `thread-id`), recorded on the node row.
+    session_id: Option<String>,
+    /// Statusline posts are handled via the telemetry/ctx_pressure path rather
+    /// than a single direct catalog event.
+    telemetry: bool,
+}
+
+fn payload_str(payload: &JsonValue, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn truncate_for_detail(value: &JsonValue, max: usize) -> JsonValue {
+    let rendered = match value {
+        JsonValue::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    if rendered.chars().count() <= max {
+        json!(rendered)
+    } else {
+        let truncated: String = rendered.chars().take(max).collect();
+        json!(format!("{truncated}…"))
+    }
+}
+
+/// Map `(source, payload)` to Asylum's event model. Pure and unit-tested.
+fn map_harness_event(source: &str, payload: &JsonValue) -> MappedHarnessEvent {
+    let mut mapped = MappedHarnessEvent::default();
+    match source {
+        "claude_hook" => {
+            mapped.session_id = payload_str(payload, "session_id");
+            let hook = payload
+                .get("hook_event_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            match hook {
+                "Stop" => {
+                    mapped.event = Some("node.turn_complete");
+                    mapped.liveness = Some(NodeLiveness::Running);
+                }
+                "SessionStart" => {
+                    mapped.event = Some("node.session_started");
+                    mapped.liveness = Some(NodeLiveness::Running);
+                    if let Some(src) = payload.get("source") {
+                        mapped.detail = json!({ "source": src });
+                    }
+                }
+                "SessionEnd" => {
+                    mapped.event = Some("node.session_end");
+                    if let Some(reason) = payload.get("reason") {
+                        mapped.detail = json!({ "reason": reason });
+                    }
+                }
+                "PostToolUse" => {
+                    mapped.event = Some("node.tool_call");
+                    mapped.liveness = Some(NodeLiveness::Running);
+                    mapped.detail = json!({
+                        "tool_name": payload.get("tool_name").cloned().unwrap_or(JsonValue::Null),
+                        "tool_input": payload
+                            .get("tool_input")
+                            .map(|v| truncate_for_detail(v, 200))
+                            .unwrap_or(JsonValue::Null),
+                    });
+                }
+                "Notification" => {
+                    let ntype = payload
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let message = payload.get("message").cloned().unwrap_or(JsonValue::Null);
+                    match ntype {
+                        "permission_prompt" | "agent_needs_input" => {
+                            mapped.event = Some("node.awaiting_input");
+                            mapped.liveness = Some(NodeLiveness::WaitingForInput);
+                            mapped.detail = json!({ "type": ntype, "message": message });
+                        }
+                        "idle_prompt" => {
+                            mapped.event = Some("node.idle");
+                            mapped.liveness = Some(NodeLiveness::Running);
+                            mapped.detail = json!({ "type": ntype, "message": message, "idle_source": "notification" });
+                        }
+                        "agent_completed" => {
+                            mapped.event = Some("node.turn_complete");
+                            mapped.liveness = Some(NodeLiveness::Running);
+                        }
+                        other if other.starts_with("elicitation") => {
+                            mapped.event = Some("node.awaiting_input");
+                            mapped.liveness = Some(NodeLiveness::WaitingForInput);
+                            mapped.detail = json!({ "type": other, "message": message });
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        "codex_notify" => {
+            mapped.session_id = payload_str(payload, "thread-id");
+            let ntype = payload
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if ntype == "agent-turn-complete" {
+                mapped.event = Some("node.turn_complete");
+                mapped.liveness = Some(NodeLiveness::Running);
+                mapped.detail = json!({
+                    "last_assistant_message": payload
+                        .get("last-assistant-message")
+                        .cloned()
+                        .unwrap_or(JsonValue::Null),
+                    "turn_id": payload.get("turn-id").cloned().unwrap_or(JsonValue::Null),
+                });
+            }
+        }
+        "claude_statusline" => {
+            mapped.telemetry = true;
+            mapped.session_id = payload_str(payload, "session_id");
+        }
+        _ => {}
+    }
+    mapped
 }
 
 #[derive(Clone)]
@@ -137,6 +288,7 @@ pub struct AppConfig {
     pub ntfy_poll_interval_seconds: Option<u64>,
     pub harness: HarnessConfig,
     pub loon: LoonConfig,
+    pub autonomy: AutonomyConfig,
 }
 
 #[derive(Clone)]
@@ -149,6 +301,9 @@ pub struct CapabilityService {
     attach_issuer: Arc<AttachTokenIssuer>,
     pub config: AppConfig,
     pub hook_engine: Arc<HookEngine>,
+    /// Quiescence-timer dedup: last PTY-output epoch a `node.idle` was fired
+    /// against, per node. Prevents repeat idle events until fresh output arrives.
+    idle_fired: Arc<Mutex<HashMap<Uuid, i64>>>,
 }
 
 impl CapabilityService {
@@ -163,6 +318,7 @@ impl CapabilityService {
             hook_engine: hook_engine.clone(),
         };
         let exit_store = store.clone();
+        let exit_engine = hook_engine.clone();
         let local_substrate = LocalSubstrate::new_with_sinks(
             move |node_id, chunk| {
                 if let Err(e) = sink_store.append_transcript_chunk(node_id, chunk) {
@@ -174,15 +330,44 @@ impl CapabilityService {
                     tracing::warn!(error = %e, node_id = %node_id, "failed to ingest decision request");
                 }
             },
-            move |node_id| {
+            move |node_id, outcome: ExitOutcome| {
                 let store = exit_store.clone();
+                let engine = exit_engine.clone();
                 tokio::runtime::Handle::current().spawn(async move {
+                    // The exit sink is the sole owner of process-termination truth.
+                    // Only act when the process died while the daemon still
+                    // considered it live; user stop/archive already set a terminal
+                    // liveness and posted node.exited, so those are left untouched.
                     if let Ok(Some(node)) = store.get_node(node_id) {
                         if matches!(
                             node.liveness,
-                            NodeLiveness::Running | NodeLiveness::Starting
+                            NodeLiveness::Running
+                                | NodeLiveness::Starting
+                                | NodeLiveness::WaitingForInput
                         ) {
-                            let _ = store.set_node_liveness(node_id, NodeLiveness::Stopped);
+                            if outcome.success {
+                                let _ = store.set_node_liveness(node_id, NodeLiveness::Stopped);
+                                engine.post(HookEvent {
+                                    event: "node.exited".to_string(),
+                                    node_id: Some(node_id),
+                                    payload: json!({
+                                        "node": {"id": node_id.to_string()},
+                                        "reason": "exited",
+                                        "exit_code": outcome.code,
+                                    }),
+                                });
+                            } else {
+                                let _ = store.set_node_liveness(node_id, NodeLiveness::Failed);
+                                engine.post(HookEvent {
+                                    event: "node.errored".to_string(),
+                                    node_id: Some(node_id),
+                                    payload: json!({
+                                        "node": {"id": node_id.to_string()},
+                                        "reason": "abnormal_exit",
+                                        "exit_code": outcome.code,
+                                    }),
+                                });
+                            }
                         }
                     }
                 });
@@ -216,6 +401,7 @@ impl CapabilityService {
             attach_issuer: Arc::new(issuer),
             config,
             hook_engine,
+            idle_fired: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -271,6 +457,19 @@ impl CapabilityService {
                     node_id: None,
                     payload: serde_json::json!({}),
                 });
+            }
+        });
+
+        // Quiescence idle fallback: fire node.idle for Running local nodes whose
+        // harness has no native idle signal (codex) after a configurable window
+        // of no PTY output. Claude reports idle natively via hooks and is skipped.
+        let quiescence_service = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                quiescence_service.sweep_quiescent_nodes();
             }
         });
 
@@ -332,6 +531,223 @@ impl CapabilityService {
             }),
         );
         Ok(())
+    }
+
+    /// Ingest a harness-native signal for a node: map it, store it, post it to
+    /// the hook engine, update liveness where meaningful, and record the harness
+    /// session id. This is the single producer for the new node.* events.
+    pub async fn post_harness_event(
+        &self,
+        node_id: Uuid,
+        request: HarnessEventRequest,
+    ) -> Result<HarnessEventResponse> {
+        let node = self.store.get_node(node_id)?.context("node not found")?;
+        let mapped = map_harness_event(&request.source, &request.payload);
+
+        // Record the harness session id (resume key) whenever it is present and
+        // has changed. Done even for terminal nodes so a late SessionStart still
+        // lands the id.
+        if let Some(session_id) = mapped.session_id.as_deref() {
+            if node.harness_session_id.as_deref() != Some(session_id) {
+                if let Err(e) = self
+                    .store
+                    .set_node_harness_session_id(node_id, Some(session_id))
+                {
+                    tracing::warn!(error = %e, node_id = %node_id, "failed to record harness session id");
+                }
+            }
+        }
+
+        // Only live nodes accept behavioural events; terminal nodes are inert.
+        if !is_active_liveness(&node.liveness) {
+            return Ok(HarnessEventResponse {
+                accepted: false,
+                event: None,
+                session_id: mapped.session_id,
+            });
+        }
+
+        // Statusline posts drive telemetry + threshold-based ctx_pressure.
+        if mapped.telemetry {
+            let event =
+                self.ingest_statusline(node_id, &request.payload, mapped.session_id.as_deref())?;
+            return Ok(HarnessEventResponse {
+                accepted: true,
+                event,
+                session_id: mapped.session_id,
+            });
+        }
+
+        let Some(kind) = mapped.event else {
+            // Recognised source but no mapped event (e.g. auth_success). Accept.
+            return Ok(HarnessEventResponse {
+                accepted: true,
+                event: None,
+                session_id: mapped.session_id,
+            });
+        };
+
+        let mut payload = json!({
+            "event": kind,
+            "source": request.source,
+            "node": { "id": node_id.to_string() },
+        });
+        if let (Some(target), Some(obj)) = (payload.as_object_mut(), mapped.detail.as_object()) {
+            for (key, value) in obj {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        if let Some(session_id) = mapped.session_id.as_deref() {
+            if let Some(target) = payload.as_object_mut() {
+                target.insert("session_id".to_string(), json!(session_id));
+            }
+        }
+
+        self.store
+            .record_event(node_id, NodeEventKind::HarnessEvent, payload.clone())?;
+        self.post_hook_event(kind, Some(node_id), payload);
+
+        // Liveness update, guarded so we don't spam LivenessChanged events for a
+        // no-op transition (e.g. repeated tool_call while already Running).
+        if let Some(target) = mapped.liveness {
+            if node.liveness != target {
+                if let Err(e) = self.store.set_node_liveness(node_id, target) {
+                    tracing::warn!(error = %e, node_id = %node_id, "failed to update liveness from harness event");
+                }
+            }
+        }
+
+        Ok(HarnessEventResponse {
+            accepted: true,
+            event: Some(kind.to_string()),
+            session_id: mapped.session_id,
+        })
+    }
+
+    /// Persist a statusline telemetry datapoint and fire `node.ctx_pressure`
+    /// when `used_percentage` crosses a configured threshold for the first time
+    /// in this session. Returns the mapped event kind if a threshold fired.
+    fn ingest_statusline(
+        &self,
+        node_id: Uuid,
+        payload: &JsonValue,
+        session_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let Some(used) = payload
+            .get("context_window")
+            .and_then(|c| c.get("used_percentage"))
+            .and_then(|v| v.as_f64())
+        else {
+            return Ok(None);
+        };
+
+        // Persist the telemetry datapoint; hydrate_node_telemetry prefers this
+        // harness-reported value for the displayed ctx_pct.
+        let telemetry_body = json!({
+            "event": "node.telemetry",
+            "source": "claude_statusline",
+            "node": { "id": node_id.to_string() },
+            "used_percentage": used,
+            "session_id": session_id,
+        });
+        self.store
+            .record_event(node_id, NodeEventKind::HarnessEvent, telemetry_body)?;
+
+        let prior = self.store.harness_event_bodies(node_id).unwrap_or_default();
+        let mut thresholds = self.config.autonomy.ctx_pressure_thresholds.clone();
+        thresholds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut fired: Option<String> = None;
+        for threshold in thresholds {
+            if used < threshold {
+                continue;
+            }
+            let already_fired = prior.iter().any(|body| {
+                body.get("event").and_then(|v| v.as_str()) == Some("node.ctx_pressure")
+                    && body
+                        .get("threshold")
+                        .and_then(|v| v.as_f64())
+                        .map(|t| (t - threshold).abs() < f64::EPSILON)
+                        .unwrap_or(false)
+                    && body.get("session_id").and_then(|v| v.as_str()) == session_id
+            });
+            if already_fired {
+                continue;
+            }
+            let body = json!({
+                "event": "node.ctx_pressure",
+                "source": "claude_statusline",
+                "node": { "id": node_id.to_string() },
+                "used_percentage": used,
+                "threshold": threshold,
+                "session_id": session_id,
+            });
+            self.store
+                .record_event(node_id, NodeEventKind::HarnessEvent, body.clone())?;
+            self.post_hook_event("node.ctx_pressure", Some(node_id), body);
+            fired = Some("node.ctx_pressure".to_string());
+        }
+        Ok(fired)
+    }
+
+    /// Fire `node.idle` for Running local nodes whose harness has no native idle
+    /// signal after the configured quiescence window of no PTY output. Deduped
+    /// so it fires once per quiet period and refires only after fresh output.
+    fn sweep_quiescent_nodes(&self) {
+        let window = self.config.autonomy.idle_quiescence_seconds as i64;
+        if window <= 0 {
+            return;
+        }
+        let running = match self.store.list_nodes_by_liveness(NodeLiveness::Running) {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                tracing::warn!(error = %e, "quiescence sweep failed to list running nodes");
+                return;
+            }
+        };
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        for node in running {
+            if node.substrate != SubstrateKind::Local {
+                continue;
+            }
+            let native_idle = self
+                .harnesses
+                .get(&node.harness)
+                .map(|h| h.native_idle_signal())
+                .unwrap_or(false);
+            if native_idle {
+                continue;
+            }
+            let last_output = self.store.last_output_chunk_epoch(node.id).ok().flatten();
+            let reference = last_output.unwrap_or_else(|| node.created_at.unix_timestamp());
+            if now - reference < window {
+                continue;
+            }
+            {
+                let mut fired = match self.idle_fired.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => continue,
+                };
+                if fired.get(&node.id) == Some(&reference) {
+                    continue;
+                }
+                fired.insert(node.id, reference);
+            }
+            let body = json!({
+                "event": "node.idle",
+                "source": "daemon",
+                "node": { "id": node.id.to_string() },
+                "idle_source": "quiescence",
+                "idle_seconds": now - reference,
+            });
+            if let Err(e) =
+                self.store
+                    .record_event(node.id, NodeEventKind::HarnessEvent, body.clone())
+            {
+                tracing::warn!(error = %e, node_id = %node.id, "quiescence sweep failed to record idle");
+            }
+            self.post_hook_event("node.idle", Some(node.id), body);
+        }
     }
 
     async fn process_hook_event(&self, event: HookEvent) -> Result<()> {
@@ -1523,13 +1939,14 @@ impl CapabilityService {
                 loon.interrupt(external_id).await?;
             }
         }
-        self.store
-            .set_node_liveness(node_id, NodeLiveness::Stopped)?;
-        self.post_hook_event(
-            "node.exited",
-            Some(node_id),
-            json!({"node": {"id": node_id.to_string()}, "reason": "interrupted"}),
-        );
+        // Ctrl-C cancels the current turn; it does NOT terminate the node. The
+        // exit sink owns termination truth, so liveness follows the real process
+        // signal (or a subsequent harness event) rather than being forced here.
+        self.store.record_event(
+            node_id,
+            NodeEventKind::RemoteCommandReceived,
+            json!({"action": "interrupt", "reason": "ctrl_c"}),
+        )?;
         Ok(())
     }
 
@@ -2920,6 +3337,7 @@ mod tests {
             ntfy_poll_interval_seconds: Some(core.ntfy.poll_interval_seconds),
             harness: core.harness,
             loon: core.loon,
+            autonomy: core.autonomy,
         }
     }
 
@@ -4144,7 +4562,11 @@ mod tests {
     #[tokio::test]
     async fn local_launch_delivers_description_as_prompt_and_persists_early_tui_output(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let _env = env_lock();
         let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let _home = EnvVarGuard::set_var("HOME", &home);
         let path = workdir.path().join("asylum.sqlite3").display().to_string();
         let argv_path = workdir.path().join("argv.txt");
         let release_marker = workdir.path().join("codex-run-release");
@@ -5102,6 +5524,391 @@ mod tests {
         assert!(error
             .to_string()
             .contains("recipe-based spawning is disabled"));
+        Ok(())
+    }
+
+    // ---- W1: harness-event ingestion ----------------------------------------
+
+    fn open_test_store() -> (tempfile::TempDir, Store) {
+        let workdir = tempfile::tempdir().expect("tempdir");
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path).expect("open store");
+        (workdir, store)
+    }
+
+    fn insert_active_node(store: &Store, harness: HarnessKind) -> NodeRecord {
+        store
+            .insert_node(
+                harness,
+                SubstrateKind::Local,
+                "worker",
+                None,
+                Some("harness-event target"),
+                None,
+                CapabilitySnapshot::default(),
+                None,
+            )
+            .expect("insert node")
+    }
+
+    #[test]
+    fn map_harness_event_maps_claude_stop_to_turn_complete() {
+        let payload = json!({
+            "hook_event_name": "Stop",
+            "session_id": "sess-stop",
+            "transcript_path": "/tmp/t.jsonl",
+            "cwd": "/work"
+        });
+        let mapped = map_harness_event("claude_hook", &payload);
+        assert_eq!(mapped.event, Some("node.turn_complete"));
+        assert_eq!(mapped.liveness, Some(NodeLiveness::Running));
+        assert_eq!(mapped.session_id.as_deref(), Some("sess-stop"));
+        assert!(!mapped.telemetry);
+    }
+
+    #[test]
+    fn map_harness_event_maps_claude_notification_permission_to_awaiting_input() {
+        let payload = json!({
+            "hook_event_name": "Notification",
+            "type": "permission_prompt",
+            "message": "Claude needs your permission to use Bash",
+            "session_id": "sess-perm"
+        });
+        let mapped = map_harness_event("claude_hook", &payload);
+        assert_eq!(mapped.event, Some("node.awaiting_input"));
+        assert_eq!(mapped.liveness, Some(NodeLiveness::WaitingForInput));
+        assert_eq!(mapped.detail["type"], json!("permission_prompt"));
+    }
+
+    #[test]
+    fn map_harness_event_maps_claude_notification_idle() {
+        let payload = json!({
+            "hook_event_name": "Notification",
+            "type": "idle_prompt",
+            "message": "Claude is waiting for your input",
+            "session_id": "sess-idle"
+        });
+        let mapped = map_harness_event("claude_hook", &payload);
+        assert_eq!(mapped.event, Some("node.idle"));
+        assert_eq!(mapped.liveness, Some(NodeLiveness::Running));
+    }
+
+    #[test]
+    fn map_harness_event_maps_claude_session_start() {
+        let payload = json!({
+            "hook_event_name": "SessionStart",
+            "source": "startup",
+            "model": "claude-opus",
+            "session_id": "sess-start"
+        });
+        let mapped = map_harness_event("claude_hook", &payload);
+        assert_eq!(mapped.event, Some("node.session_started"));
+        assert_eq!(mapped.liveness, Some(NodeLiveness::Running));
+        assert_eq!(mapped.detail["source"], json!("startup"));
+        assert_eq!(mapped.session_id.as_deref(), Some("sess-start"));
+    }
+
+    #[test]
+    fn map_harness_event_maps_codex_agent_turn_complete() {
+        let payload = json!({
+            "type": "agent-turn-complete",
+            "thread-id": "6a1f-thread",
+            "turn-id": "turn-9",
+            "cwd": "/work",
+            "input-messages": ["do the thing"],
+            "last-assistant-message": "did the thing"
+        });
+        let mapped = map_harness_event("codex_notify", &payload);
+        assert_eq!(mapped.event, Some("node.turn_complete"));
+        assert_eq!(mapped.liveness, Some(NodeLiveness::Running));
+        assert_eq!(mapped.session_id.as_deref(), Some("6a1f-thread"));
+        assert_eq!(
+            mapped.detail["last_assistant_message"],
+            json!("did the thing")
+        );
+    }
+
+    #[test]
+    fn map_harness_event_marks_statusline_as_telemetry() {
+        let payload = json!({
+            "session_id": "sess-line",
+            "context_window": { "used_percentage": 42.0, "remaining_percentage": 58.0 }
+        });
+        let mapped = map_harness_event("claude_statusline", &payload);
+        assert!(mapped.telemetry);
+        assert_eq!(mapped.event, None);
+        assert_eq!(mapped.session_id.as_deref(), Some("sess-line"));
+    }
+
+    #[tokio::test]
+    async fn post_harness_event_records_session_and_transitions_liveness(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_workdir, store) = open_test_store();
+        let node = insert_active_node(&store, HarnessKind::ClaudeCode);
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        // SessionStart records the harness session id and keeps the node live.
+        let response = service
+            .post_harness_event(
+                node.id,
+                HarnessEventRequest {
+                    source: "claude_hook".to_string(),
+                    payload: json!({
+                        "hook_event_name": "SessionStart",
+                        "source": "startup",
+                        "session_id": "sess-abc"
+                    }),
+                },
+            )
+            .await?;
+        assert!(response.accepted);
+        assert_eq!(response.event.as_deref(), Some("node.session_started"));
+        let refreshed = store.get_node(node.id)?.expect("node exists");
+        assert_eq!(refreshed.harness_session_id.as_deref(), Some("sess-abc"));
+
+        // Awaiting-input moves liveness to WaitingForInput.
+        service
+            .post_harness_event(
+                node.id,
+                HarnessEventRequest {
+                    source: "claude_hook".to_string(),
+                    payload: json!({
+                        "hook_event_name": "Notification",
+                        "type": "agent_needs_input",
+                        "message": "need a decision",
+                        "session_id": "sess-abc"
+                    }),
+                },
+            )
+            .await?;
+        assert_eq!(
+            store.get_node(node.id)?.expect("node").liveness,
+            NodeLiveness::WaitingForInput
+        );
+
+        // Turn-complete returns it to a truthful non-busy Running state.
+        service
+            .post_harness_event(
+                node.id,
+                HarnessEventRequest {
+                    source: "claude_hook".to_string(),
+                    payload: json!({"hook_event_name": "Stop", "session_id": "sess-abc"}),
+                },
+            )
+            .await?;
+        assert_eq!(
+            store.get_node(node.id)?.expect("node").liveness,
+            NodeLiveness::Running
+        );
+
+        // The mapped events were stored as harness_event rows.
+        let bodies = store.harness_event_bodies(node.id)?;
+        let kinds: Vec<&str> = bodies
+            .iter()
+            .filter_map(|b| b.get("event").and_then(|v| v.as_str()))
+            .collect();
+        assert!(kinds.contains(&"node.session_started"));
+        assert!(kinds.contains(&"node.awaiting_input"));
+        assert!(kinds.contains(&"node.turn_complete"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn post_harness_event_rejects_terminal_nodes() -> Result<(), Box<dyn std::error::Error>> {
+        let (_workdir, store) = open_test_store();
+        let node = insert_active_node(&store, HarnessKind::ClaudeCode);
+        store.set_node_liveness(node.id, NodeLiveness::Stopped)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let response = service
+            .post_harness_event(
+                node.id,
+                HarnessEventRequest {
+                    source: "claude_hook".to_string(),
+                    payload: json!({"hook_event_name": "Stop", "session_id": "s"}),
+                },
+            )
+            .await?;
+        assert!(!response.accepted);
+        assert_eq!(response.event, None);
+        // No harness_event row was recorded for the inert node.
+        assert!(store.harness_event_bodies(node.id)?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn statusline_updates_ctx_pct_and_fires_thresholds_once(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_workdir, store) = open_test_store();
+        let node = insert_active_node(&store, HarnessKind::ClaudeCode);
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let post = |used: f64| {
+            let service = service.clone();
+            let node_id = node.id;
+            async move {
+                service
+                    .post_harness_event(
+                        node_id,
+                        HarnessEventRequest {
+                            source: "claude_statusline".to_string(),
+                            payload: json!({
+                                "session_id": "line-sess",
+                                "context_window": { "used_percentage": used }
+                            }),
+                        },
+                    )
+                    .await
+            }
+        };
+
+        // Crosses 75 -> one ctx_pressure event; ctx_pct reflects harness value.
+        let r1 = post(80.0).await?;
+        assert_eq!(r1.event.as_deref(), Some("node.ctx_pressure"));
+        let node_after = store.get_node(node.id)?.expect("node");
+        assert!((node_after.ctx_pct - 0.80).abs() < 0.001);
+
+        // Same threshold again -> no refire.
+        let r2 = post(82.0).await?;
+        assert_eq!(r2.event, None);
+
+        // Crosses 90 -> fires the 90 threshold only.
+        let r3 = post(95.0).await?;
+        assert_eq!(r3.event.as_deref(), Some("node.ctx_pressure"));
+
+        let pressure_thresholds: Vec<f64> = store
+            .harness_event_bodies(node.id)?
+            .iter()
+            .filter(|b| b.get("event").and_then(|v| v.as_str()) == Some("node.ctx_pressure"))
+            .filter_map(|b| b.get("threshold").and_then(|v| v.as_f64()))
+            .collect();
+        assert_eq!(pressure_thresholds, vec![75.0, 90.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn event_catalog_is_exactly_the_firable_set() {
+        let ids: std::collections::BTreeSet<String> =
+            event_catalog().into_iter().map(|entry| entry.id).collect();
+        let expected: std::collections::BTreeSet<String> = [
+            "graph.spawn",
+            "node.session_started",
+            "node.turn_complete",
+            "node.awaiting_input",
+            "node.idle",
+            "node.ctx_pressure",
+            "node.tool_call",
+            "node.session_end",
+            "node.exited",
+            "node.errored",
+            "channel.inbound",
+            "schedule.5m",
+            "schedule.30m",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(ids, expected);
+        // Removed / merged events must not reappear.
+        assert!(!ids.contains("node.permission_requested"));
+        assert!(!ids.contains("substrate.unreachable"));
+        assert!(!ids.contains("schedule.cron"));
+    }
+
+    #[tokio::test]
+    async fn interrupt_records_event_without_forcing_stopped(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        // A harness that ignores SIGINT and stays alive, so a Ctrl-C does not
+        // terminate it — mirroring claude, where Ctrl-C cancels the turn only.
+        let script_path = workdir.path().join("fake-harness.sh");
+        write_executable_script(
+            &script_path,
+            "#!/bin/sh\ntrap '' INT\nwhile true; do sleep 1; done\n",
+        )?;
+
+        let _home = EnvVarGuard::set_var("HOME", &home);
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let response = service
+            .create_node(local_create_request_with_workspace(
+                "interrupt semantics",
+                &workspace.display().to_string(),
+            ))
+            .await?;
+        let node_id = Uuid::parse_str(&response.node_id)?;
+        wait_for_liveness(&store, node_id, NodeLiveness::Running).await?;
+
+        service.interrupt_node(node_id).await?;
+
+        // Liveness stays Running (Ctrl-C is not a stop); an interrupt event is
+        // recorded, and no node.exited was forced.
+        let node = store.get_node(node_id)?.expect("node exists");
+        assert_eq!(node.liveness, NodeLiveness::Running);
+        let events = store.list_events(node_id)?;
+        assert!(events.iter().any(|e| {
+            e.kind == NodeEventKind::RemoteCommandReceived
+                && e.body.get("action").and_then(|v| v.as_str()) == Some("interrupt")
+        }));
+
+        let _ = service.stop_node(node_id).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abnormal_exit_marks_failed_and_fires_node_errored(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let script_path = workdir.path().join("fake-harness.sh");
+        write_executable_script(&script_path, "#!/bin/sh\nexit 3\n")?;
+
+        let _home = EnvVarGuard::set_var("HOME", &home);
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let mut hooks = service.hook_engine.subscribe();
+        let response = service
+            .create_node(local_create_request_with_workspace(
+                "abnormal exit",
+                &workspace.display().to_string(),
+            ))
+            .await?;
+        let node_id = Uuid::parse_str(&response.node_id)?;
+
+        wait_for_liveness(&store, node_id, NodeLiveness::Failed).await?;
+
+        let mut saw_errored = false;
+        for _ in 0..200 {
+            match hooks.try_recv() {
+                Ok(event) if event.event == "node.errored" && event.node_id == Some(node_id) => {
+                    saw_errored = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    sleep(Duration::from_millis(10)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(saw_errored, "expected node.errored on nonzero exit");
         Ok(())
     }
 }

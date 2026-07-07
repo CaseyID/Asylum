@@ -241,6 +241,7 @@ impl Store {
         )?;
         ensure_column(&conn, "channel_messages", "node_id", "TEXT")?;
         ensure_column(&conn, "channel_messages", "correlation_token", "TEXT")?;
+        ensure_column(&conn, "nodes", "harness_session_id", "TEXT")?;
         Ok(())
     }
 
@@ -248,7 +249,7 @@ impl Store {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "
-            SELECT id,harness,substrate,role_hint,liveness,workspace,description,created_at,updated_at,external_id,capabilities_json
+            SELECT id,harness,substrate,role_hint,liveness,workspace,description,created_at,updated_at,external_id,capabilities_json,harness_session_id
             FROM nodes
             ORDER BY created_at DESC
             ",
@@ -267,7 +268,7 @@ impl Store {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "
-            SELECT id,harness,substrate,role_hint,liveness,workspace,description,created_at,updated_at,external_id,capabilities_json
+            SELECT id,harness,substrate,role_hint,liveness,workspace,description,created_at,updated_at,external_id,capabilities_json,harness_session_id
             FROM nodes
             WHERE liveness = ?1
             ORDER BY created_at DESC
@@ -335,7 +336,7 @@ impl Store {
         let id_string = id.to_string();
         let mut stmt = conn.prepare(
             "
-            SELECT id,harness,substrate,role_hint,liveness,workspace,description,created_at,updated_at,external_id,capabilities_json
+            SELECT id,harness,substrate,role_hint,liveness,workspace,description,created_at,updated_at,external_id,capabilities_json,harness_session_id
             FROM nodes
             WHERE id = ?1
             ",
@@ -415,6 +416,54 @@ impl Store {
             params![external_id, id.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Record the harness-native session id (claude `session_id`, codex
+    /// `thread-id`) on the node row. Used by the harness-event bridge so the
+    /// session can later be resumed.
+    pub fn set_node_harness_session_id(
+        &self,
+        id: Uuid,
+        harness_session_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE nodes SET harness_session_id = ?1 WHERE id = ?2",
+            params![harness_session_id, id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Epoch seconds of the most recent PTY output chunk for a node, or None if
+    /// the node has emitted no output yet. Used by the quiescence idle timer.
+    pub fn last_output_chunk_epoch(&self, node_id: Uuid) -> Result<Option<i64>> {
+        let conn = self.conn()?;
+        let kind = serde_json::to_string(&NodeEventKind::OutputChunk)?;
+        let value: Option<i64> = conn.query_row(
+            "SELECT MAX(created_at) FROM events WHERE node_id = ?1 AND kind = ?2",
+            params![node_id.to_string(), kind],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        Ok(value)
+    }
+
+    /// Bodies of all ingested harness-event records for a node, oldest first.
+    /// Used to dedup `node.ctx_pressure` threshold crossings per session.
+    pub fn harness_event_bodies(&self, node_id: Uuid) -> Result<Vec<JsonValue>> {
+        let conn = self.conn()?;
+        let kind = serde_json::to_string(&NodeEventKind::HarnessEvent)?;
+        let mut stmt = conn.prepare(
+            "SELECT body FROM events WHERE node_id = ?1 AND kind = ?2 ORDER BY created_at ASC",
+        )?;
+        let mut rows = stmt.query(params![node_id.to_string(), kind])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let body_text: String = row.get(0)?;
+            if let Ok(value) = serde_json::from_str::<JsonValue>(&body_text) {
+                out.push(value);
+            }
+        }
+        Ok(out)
     }
 
     pub fn update_node_description(&self, id: Uuid, description: &str) -> Result<()> {
@@ -1379,6 +1428,7 @@ fn row_to_node_record(row: &rusqlite::Row<'_>) -> Result<NodeRecord> {
     let capabilities_json = row.get::<_, String>(10)?;
     let capabilities: CapabilitySnapshot =
         serde_json::from_str(&capabilities_json).context("failed to decode capabilities")?;
+    let harness_session_id = row.get::<_, Option<String>>(11)?;
     Ok(NodeRecord {
         id,
         harness,
@@ -1390,6 +1440,7 @@ fn row_to_node_record(row: &rusqlite::Row<'_>) -> Result<NodeRecord> {
         created_at,
         updated_at,
         external_id,
+        harness_session_id,
         capabilities,
         tokens_in: 0,
         tokens_out: 0,
@@ -1412,6 +1463,9 @@ fn hydrate_node_telemetry(conn: &Connection, node: &mut NodeRecord) -> Result<()
     let mut tool_calls: u64 = 0;
     let mut last_event_created_at: Option<i64> = None;
     let mut last_output_chunk_at: Option<i64> = None;
+    // Harness-reported context usage (claude statusline `used_percentage`),
+    // authoritative over the crude token estimate below when present.
+    let mut harness_used_percentage: Option<f64> = None;
 
     while let Some(row) = rows.next()? {
         let kind_text: String = row.get(0)?;
@@ -1420,6 +1474,16 @@ fn hydrate_node_telemetry(conn: &Connection, node: &mut NodeRecord) -> Result<()
         last_event_created_at = Some(created_at);
 
         let kind = parse_event_kind(&kind_text)?;
+        if matches!(kind, NodeEventKind::HarnessEvent) {
+            if let Some(pct) = serde_json::from_str::<JsonValue>(&body_text)
+                .ok()
+                .as_ref()
+                .and_then(|value| value.get("used_percentage"))
+                .and_then(|value| value.as_f64())
+            {
+                harness_used_percentage = Some(pct);
+            }
+        }
         let text_len = match serde_json::from_str::<JsonValue>(&body_text)
             .ok()
             .as_ref()
@@ -1460,8 +1524,13 @@ fn hydrate_node_telemetry(conn: &Connection, node: &mut NodeRecord) -> Result<()
     node.tokens_in = tokens_in;
     node.tokens_out = tokens_out;
     node.tool_calls = tool_calls;
-    let total = (tokens_in + tokens_out) as f32;
-    node.ctx_pct = (total / 200_000.0).clamp(0.0, 1.0);
+    node.ctx_pct = match harness_used_percentage {
+        Some(pct) => (pct as f32 / 100.0).clamp(0.0, 1.0),
+        None => {
+            let total = (tokens_in + tokens_out) as f32;
+            (total / 200_000.0).clamp(0.0, 1.0)
+        }
+    };
 
     let now = OffsetDateTime::now_utc().unix_timestamp();
     node.idle_seconds = match last_event_created_at {
@@ -1665,6 +1734,7 @@ fn parse_event_kind(raw: &str) -> Result<NodeEventKind> {
             "notification_sent" => NodeEventKind::NotificationSent,
             "remote_command_received" => NodeEventKind::RemoteCommandReceived,
             "attach_issued" => NodeEventKind::AttachIssued,
+            "harness_event" => NodeEventKind::HarnessEvent,
             other => return Err(anyhow::anyhow!("unknown event kind: {other}")),
         })
     })

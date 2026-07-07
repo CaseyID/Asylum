@@ -74,19 +74,28 @@ pub fn firing_record_from_row(row: HookFiringRow) -> HookFiringRecord {
 }
 
 pub fn event_catalog() -> Vec<HookEventCatalogEntry> {
+    // Exactly the events that can actually fire. Producers:
+    // - graph.spawn: spawn_peer / create_node
+    // - node.session_started/turn_complete/awaiting_input/idle/ctx_pressure/
+    //   tool_call/session_end: the harness-event bridge (claude hooks/statusline,
+    //   codex notify) plus the daemon quiescence timer for node.idle
+    // - node.exited/node.errored: the exit sink on clean / abnormal exit
+    // - channel.inbound: inbound channel messages (ntfy subscriber, HTTP inbound)
+    // - schedule.5m/schedule.30m: the periodic timers
     static ENTRIES: &[(&str, &str)] = &[
-        ("node.permission_requested", "Node requested human input"),
-        ("node.exited", "Node exited"),
-        ("node.errored", "Node errored"),
+        ("graph.spawn", "Node spawned"),
+        ("node.session_started", "Node session started"),
+        ("node.turn_complete", "Node finished a turn"),
+        ("node.awaiting_input", "Node awaiting human input"),
         ("node.idle", "Node idle"),
         ("node.ctx_pressure", "Node context pressure"),
         ("node.tool_call", "Node tool call"),
-        ("graph.spawn", "Node spawned"),
-        ("substrate.unreachable", "Substrate unreachable"),
+        ("node.session_end", "Node session ended"),
+        ("node.exited", "Node exited"),
+        ("node.errored", "Node errored"),
         ("channel.inbound", "Inbound channel message"),
         ("schedule.5m", "Every five minutes"),
         ("schedule.30m", "Every thirty minutes"),
-        ("schedule.cron", "Custom cron schedule"),
     ];
     ENTRIES
         .iter()
@@ -377,7 +386,7 @@ mod tests {
             id: "hook-bad".to_string(),
             name: "corrupt".to_string(),
             enabled: true,
-            event: "node.permission_requested".to_string(),
+            event: "node.awaiting_input".to_string(),
             filter: "any".to_string(),
             actions_json: "{".to_string(),
             future: false,
