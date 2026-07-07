@@ -69,8 +69,9 @@ Resolved: passwordless sudo configured 2026-07-06 via /etc/sudoers.d/99-casey-no
 
 ## Status
 
-- Phase A: in progress (2026-07-06). Done: baseline green (181 Rust + 64 cockpit tests); phase-a-truth merged at b336d05 (flake fix, doc truth, prototype/dead-api removal); harness contracts researched and recorded in 2026-07-06-harness-contract-notes.md; loon CLI v0.1.5 on PATH at ~/.local/bin/loon. Pending: Loon host install (blocked on passwordless sudo setup; exact command in Open Questions), live spawn-peer E2E check.
-- Phase B: not started
+- Phase A: COMPLETE (2026-07-06). Gate met: clean tree + green tests (181 Rust + 64 cockpit); phase-a-truth merged at b336d05 (flake fix, doc truth, prototype/dead-api removal); harness contracts recorded (2026-07-06-harness-contract-notes.md); live spawn-peer E2E confirmed a real second worker session + spawned_for edge via injected MCP (two bugs found → Phase B W0: launch prompt not auto-submitted, send_input CR not registering as Enter); Loon host installed and operational at https://127.0.0.1:7777 (btrfs loopback storage, systemd units active, client profile for casey, busybox microVM ran echo ok). TLS fp 53b9f879...; admin key at /etc/loon/admin.key, client config ~/.config/loon/config.toml.
+  - Two LoonV2 upstream gaps to address in Phase C (repo editable): (1) PATH-based `loon-host install` does not stage the kernel vmlinux into <state>/kernel/ despite listing it in install-journal.json — had to stage manually; real install bug. (2) Destroyed VMs remain as un-purgeable `destroyed` tombstones in `loon vm ls` (v0.1.5 by-design, loon-daemon store.rs list_instances has no filter) — the Loon-side analog of the eternal-Running problem; the substrate rewrite must filter destroyed rows when enumerating, and ideally add a prune path upstream.
+- Phase B: in progress. Plan: plans/2026-07-06-phase-b-autonomy-loop.md. W1 (event ingestion) building in worktree branch phase-b-w1-event-ingestion. W0 (input-delivery bugs from E2E) queued to fold in at W1 merge. W2-W5 gated on W1's ingestion contract.
 - Phase C: not started
 - Phase D: not started
 
