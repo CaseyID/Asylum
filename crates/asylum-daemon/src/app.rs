@@ -7,8 +7,8 @@ use anyhow::{bail, Context, Result};
 use asylum_types::api::{
     ChannelCreateRequest, ChannelInboundRequest, ChannelTestRequest, ChannelUpdateRequest,
     CreateNodeRequest, DecisionCreateRequest, DecisionResolveRequest, ErrorPayload,
-    ForkNodeRequest, HookCreateRequest, HookUpdateRequest, LaunchPacketResponse, SendInputRequest,
-    SpawnPeerRequest,
+    ForkNodeRequest, HarnessEventRequest, HookCreateRequest, HookUpdateRequest,
+    LaunchPacketResponse, SendInputRequest, SpawnPeerRequest,
 };
 use asylum_types::config::AsylumConfig;
 use asylum_types::node::SubstrateKind;
@@ -179,6 +179,7 @@ fn build_state(
             ntfy_poll_interval_seconds: Some(config.ntfy.poll_interval_seconds),
             harness: config.harness,
             loon: config.loon,
+            autonomy: config.autonomy,
         },
     );
 
@@ -230,6 +231,10 @@ pub fn build_router_for_transport(state: Arc<AppState>, require_auth: bool) -> R
         .route("/api/nodes/{id}/events", get(api_node_events))
         .route("/api/graph", get(api_graph))
         .route("/api/nodes/{id}/input", post(api_node_send_input))
+        .route(
+            "/api/nodes/{id}/harness-event",
+            post(api_node_harness_event),
+        )
         .route("/api/nodes/{id}/interrupt", post(api_node_interrupt))
         .route("/api/nodes/{id}/stop", post(api_node_stop))
         .route("/api/nodes/{id}/archive", post(api_node_archive))
@@ -418,6 +423,21 @@ pub async fn api_node_send_input(
         .await
         .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn api_node_harness_event(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(request): Json<HarnessEventRequest>,
+) -> Result<Json<asylum_types::api::HarnessEventResponse>, AppError> {
+    let id = Uuid::parse_str(&id)
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    let response = state
+        .service
+        .post_harness_event(id, request)
+        .await
+        .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(response))
 }
 
 pub async fn api_node_interrupt(
@@ -1580,6 +1600,7 @@ mod tests {
             ntfy_poll_interval_seconds: Some(core.ntfy.poll_interval_seconds),
             harness: core.harness,
             loon: core.loon,
+            autonomy: core.autonomy,
         }
     }
 
