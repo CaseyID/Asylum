@@ -19,6 +19,13 @@ fresh agents do not treat stale development records as product truth.
 |---|---|
 | [superpowers/specs/2026-05-09-cockpit-node-session-ux-design.md](superpowers/specs/2026-05-09-cockpit-node-session-ux-design.md) | Session-first Cockpit UX intent. |
 | [superpowers/plans/2026-05-09-cockpit-node-session-ux.md](superpowers/plans/2026-05-09-cockpit-node-session-ux.md) | Implementation checklist and verification evidence for this branch. |
+| [superpowers/plans/2026-05-10-harness-asylum-control.md](superpowers/plans/2026-05-10-harness-asylum-control.md) | `node.spawn_peer` + local harness MCP injection plan. Delivered on main; not yet released. |
+
+## Active Mission
+
+| Doc | Purpose |
+|---|---|
+| [superpowers/specs/2026-07-06-asylum-completion-mission.md](superpowers/specs/2026-07-06-asylum-completion-mission.md) | Current mission document driving Asylum to a genuinely working autonomous-supervision state. |
 
 ## Rule Of Thumb
 

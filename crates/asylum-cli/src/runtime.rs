@@ -15,19 +15,41 @@ pub struct RuntimePaths {
 
 impl RuntimePaths {
     pub fn from_env(config_override: Option<PathBuf>) -> Result<Self> {
-        Ok(Self::from_values(
+        Ok(Self::from_values_with_socket_override(
             env::var_os("ASYLUM_HOME").map(PathBuf::from),
             config_override.or_else(|| env::var_os("ASYLUM_CONFIG").map(PathBuf::from)),
             env::var_os("ASYLUM_DATABASE").map(PathBuf::from),
             env::var_os("HOME").map(PathBuf::from),
+            env::var_os("ASYLUM_SOCKET_PATH").map(PathBuf::from),
         ))
     }
 
+    /// Builds `RuntimePaths` from explicit values only; never reads process
+    /// environment. Callers that want the socket path to honor
+    /// `ASYLUM_SOCKET_PATH` should use `from_env` or
+    /// `from_values_with_socket_override` and pass the value in directly, so
+    /// tests can inject overrides instead of mutating process-global env.
     pub fn from_values(
         asylum_home: Option<PathBuf>,
         config_override: Option<PathBuf>,
         database_override: Option<PathBuf>,
         user_home: Option<PathBuf>,
+    ) -> Self {
+        Self::from_values_with_socket_override(
+            asylum_home,
+            config_override,
+            database_override,
+            user_home,
+            None,
+        )
+    }
+
+    pub fn from_values_with_socket_override(
+        asylum_home: Option<PathBuf>,
+        config_override: Option<PathBuf>,
+        database_override: Option<PathBuf>,
+        user_home: Option<PathBuf>,
+        socket_override: Option<PathBuf>,
     ) -> Self {
         let home = asylum_home.unwrap_or_else(|| {
             user_home
@@ -36,9 +58,7 @@ impl RuntimePaths {
         });
         let config = config_override.unwrap_or_else(|| home.join("config.toml"));
         let database = database_override.unwrap_or_else(|| home.join("asylum.sqlite3"));
-        let socket = env::var_os("ASYLUM_SOCKET_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join("run").join("asylum.sock"));
+        let socket = socket_override.unwrap_or_else(|| home.join("run").join("asylum.sock"));
         Self {
             log: home.join("logs").join("asylum.log"),
             pid: home.join("run").join("asylum.pid"),

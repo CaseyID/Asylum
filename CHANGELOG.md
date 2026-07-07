@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Added
+
+- Added a real `node.spawn_peer` capability (API route, CLI `asylum node spawn`, MCP tool) so command-center nodes can create peer nodes through the daemon, recording an explicit source-to-child graph relationship.
+- Local Claude Code and Codex launches now inject a per-node Asylum MCP server (current socket, current `asylum` executable), so nodes can call Asylum tools like `node.spawn_peer` directly instead of simulating child workers.
+
 ### Changed
 
 - Replaced the Cargo source workflow aliases with explicit `run-*`, `build-*`, `test-*`, `check-*`, `status-*`, `stop-*`, and `reset-*` naming.

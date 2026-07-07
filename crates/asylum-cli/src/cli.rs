@@ -2921,7 +2921,13 @@ mod tests {
         env::set_var("ASYLUM_TOKEN", "inherited-token");
         env::set_var("ASYLUM_SOCKET_PATH", &socket_path);
 
-        let paths = RuntimePaths::from_values(Some(tempdir.path().to_path_buf()), None, None, None);
+        let paths = RuntimePaths::from_values_with_socket_override(
+            Some(tempdir.path().to_path_buf()),
+            None,
+            None,
+            None,
+            Some(socket_path.clone()),
+        );
         write_config_with_listen(&paths, "127.0.0.1:9021")?;
 
         let client = runtime_client(&paths)?;
