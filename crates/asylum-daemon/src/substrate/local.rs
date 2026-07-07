@@ -12,7 +12,13 @@ use uuid::Uuid;
 /// Long enough that the interactive TUI processes them as two separate keystroke
 /// events (so the CR is not absorbed into a paste), short enough to stay
 /// imperceptible.
-const SUBMIT_GAP: Duration = Duration::from_millis(50);
+// Gap between the typed body and the submitting CR. Must clear codex's
+// paste-burst Enter suppression: after a paste-like burst, codex treats an
+// Enter arriving within PASTE_ENTER_SUPPRESS_WINDOW (120ms in codex-rs
+// tui/src/bottom_pane/paste_burst.rs, rust-v0.132.0) as a newline inside the
+// paste rather than submit. 250ms clears that window with margin; claude only
+// needs the CR to be a distinct write. Timing only — no output parsing.
+const SUBMIT_GAP: Duration = Duration::from_millis(250);
 
 /// Readiness gating for launch-prompt delivery. Wait for the harness to emit its
 /// first PTY frame, then for its output to go quiet (the initial render
@@ -23,12 +29,19 @@ const LAUNCH_FIRST_OUTPUT_TIMEOUT: Duration = Duration::from_secs(20);
 const LAUNCH_QUIET_WINDOW: Duration = Duration::from_millis(600);
 const LAUNCH_READY_MAX: Duration = Duration::from_secs(10);
 
+/// Follow-up lone-Enter nudges after launch-prompt delivery, for harnesses that
+/// swallow the submitting CR while still starting up (codex during MCP client
+/// startup). Harmless when the prompt already submitted: Enter on an empty
+/// composer does nothing in both claude and codex.
+const LAUNCH_SUBMIT_NUDGES: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(10)];
+
 /// Deliver `text` to a writer as a SUBMITTED message: write the body, pause, then
 /// write a lone carriage return as a DISTINCT write. Claude's TUI uses auto-paste
 /// / bracketed-paste detection, so a CR bundled into the same write as the body
 /// is absorbed as pasted content and never submits; only a CR arriving as its own
-/// keystroke submits. codex submits on the lone CR the same way, so this sequence
-/// is correct for both harnesses.
+/// keystroke submits. codex additionally suppresses Enter-as-submit for 120ms
+/// after a paste burst ends, so the gap before the CR must exceed that window
+/// (live-verified: 50ms left the prompt sitting in codex's composer).
 async fn submit_over_writer(writer: &Arc<Mutex<Box<dyn Write + Send>>>, text: &str) -> Result<()> {
     {
         let mut w = writer.lock().await;
@@ -53,6 +66,7 @@ async fn await_ready_and_deliver(
     mut rx: broadcast::Receiver<String>,
     prompt: String,
     node_id: Uuid,
+    submit_nudges: bool,
 ) {
     // First frame (bounded: deliver anyway if the harness never prints).
     let _ = tokio::time::timeout(LAUNCH_FIRST_OUTPUT_TIMEOUT, rx.recv()).await;
@@ -76,6 +90,22 @@ async fn await_ready_and_deliver(
         Ok(()) => tracing::debug!(node_id = %node_id, "delivered launch prompt"),
         Err(e) => {
             tracing::warn!(node_id = %node_id, error = %e, "launch prompt delivery failed")
+        }
+    }
+    // Launch-only submit nudges: codex swallows Enter-as-submit while its MCP
+    // startup phase is still running (live-verified: the typed packet sits in
+    // the composer if the CR lands during startup, and submits fine after).
+    // Codex-only: a lone CR on codex's empty composer is a no-op, but claude
+    // may already be showing a tool dialog (e.g. AskUserQuestion) this early,
+    // and a stray Enter would select its default (live-verified regression).
+    if !submit_nudges {
+        return;
+    }
+    for delay in LAUNCH_SUBMIT_NUDGES {
+        tokio::time::sleep(delay).await;
+        let mut w = writer.lock().await;
+        if w.write_all(b"\r").and_then(|_| w.flush()).is_err() {
+            break;
         }
     }
 }
@@ -207,7 +237,17 @@ impl LocalSubstrate {
         );
 
         if let Some((prompt, rx, writer)) = launch_delivery {
-            tokio::spawn(await_ready_and_deliver(writer, rx, prompt, node_id));
+            // Submit nudges only for harnesses that swallow the submitting CR
+            // during startup (codex). Claude submits reliably on delivery and
+            // may already be mid-dialog when a nudge would land.
+            let submit_nudges = matches!(ctx.harness, HarnessKind::Codex);
+            tokio::spawn(await_ready_and_deliver(
+                writer,
+                rx,
+                prompt,
+                node_id,
+                submit_nudges,
+            ));
         }
 
         tokio::task::spawn_blocking(move || {
