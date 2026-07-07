@@ -19,12 +19,21 @@ struct LocalRuntime {
     killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
 }
 
+/// How a local harness process ended, reported to the exit sink so the
+/// capability service can distinguish a clean exit (`node.exited`) from an
+/// abnormal one (`node.errored`).
+#[derive(Clone, Copy, Debug)]
+pub struct ExitOutcome {
+    pub success: bool,
+    pub code: Option<u32>,
+}
+
 #[derive(Clone)]
 pub struct LocalSubstrate {
     runtimes: Arc<RwLock<HashMap<Uuid, LocalRuntime>>>,
     output_sink: Arc<dyn Fn(Uuid, &str) + Send + Sync>,
     decision_sink: Arc<dyn Fn(Uuid, DecisionProtocolRequest) + Send + Sync>,
-    exit_sink: Arc<dyn Fn(Uuid) + Send + Sync>,
+    exit_sink: Arc<dyn Fn(Uuid, ExitOutcome) + Send + Sync>,
 }
 
 impl LocalSubstrate {
@@ -36,7 +45,7 @@ impl LocalSubstrate {
             runtimes: Arc::new(RwLock::new(HashMap::new())),
             output_sink: Arc::new(output_sink),
             decision_sink: Arc::new(|_, _| {}),
-            exit_sink: Arc::new(|_| {}),
+            exit_sink: Arc::new(|_, _| {}),
         }
     }
 
@@ -49,7 +58,7 @@ impl LocalSubstrate {
             runtimes: Arc::new(RwLock::new(HashMap::new())),
             output_sink: Arc::new(output_sink),
             decision_sink: Arc::new(decision_sink),
-            exit_sink: Arc::new(|_| {}),
+            exit_sink: Arc::new(|_, _| {}),
         }
     }
 
@@ -57,7 +66,7 @@ impl LocalSubstrate {
     where
         F: Fn(Uuid, &str) + Send + Sync + 'static,
         D: Fn(Uuid, DecisionProtocolRequest) + Send + Sync + 'static,
-        E: Fn(Uuid) + Send + Sync + 'static,
+        E: Fn(Uuid, ExitOutcome) + Send + Sync + 'static,
     {
         Self {
             runtimes: Arc::new(RwLock::new(HashMap::new())),
@@ -152,7 +161,16 @@ impl LocalSubstrate {
                     }
                 }
             }
-            let _ = local_child.wait();
+            let outcome = match local_child.wait() {
+                Ok(status) => ExitOutcome {
+                    success: status.success(),
+                    code: Some(status.exit_code()),
+                },
+                Err(_) => ExitOutcome {
+                    success: false,
+                    code: None,
+                },
+            };
             // Harness exited (either on its own or via stop()); drop the runtime
             // so the daemon's view stays consistent and notify the capability
             // service so it can transition liveness.
@@ -160,7 +178,7 @@ impl LocalSubstrate {
             tokio::runtime::Handle::current().spawn(async move {
                 runtimes_clone.write().await.remove(&node_id);
             });
-            (exit_sink)(node_id);
+            (exit_sink)(node_id, outcome);
         });
 
         Ok(())

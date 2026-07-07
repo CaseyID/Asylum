@@ -26,6 +26,11 @@ impl super::HarnessAdapter for ClaudeHarness {
         HarnessKind::ClaudeCode
     }
 
+    fn native_idle_signal(&self) -> bool {
+        // claude emits idle via the Notification `idle_prompt` hook.
+        true
+    }
+
     fn command(&self) -> &str {
         &self.command
     }

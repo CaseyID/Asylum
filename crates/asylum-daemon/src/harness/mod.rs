@@ -38,6 +38,13 @@ pub trait HarnessAdapter: Send + Sync {
     /// Idempotently record the workspace path as trusted in the harness's own config
     /// so the first-run trust dialog is skipped when the process spawns.
     fn pre_trust_workspace(&self, workspace: &str) -> anyhow::Result<()>;
+
+    /// Whether the harness reports idleness natively (claude via the Notification
+    /// `idle_prompt` hook). Harnesses that return false rely on the daemon's
+    /// output-quiescence timer for `node.idle` (codex).
+    fn native_idle_signal(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone)]
