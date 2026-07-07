@@ -204,3 +204,47 @@ Both do `...send().await.context(...)?` and return `Ok(())` without checking `re
 - **Boot reconciliation is race-free:** `reconcile_on_boot` is awaited to completion before background tasks start and before any listener binds; no local runtimes exist at boot.
 - **Partial-write durability concern does not apply:** individual SQLite writes remain atomic/durable under the default journal + `synchronous=FULL`.
 - **Honesty improvements shipped:** `hooks/mod.rs` deletes three dead catalog entries (`node.permission_requested`, `substrate.unreachable`, `schedule.cron`); `cli.rs` removes the dead `recipe` surface and candidly documents token `--scope` as advisory-only; the ntfy POST-to-root fix is correct and regression-tested.
+
+
+---
+
+## Resolution (2026-07-07)
+
+Fixes landed on branch `phase-d-fixes` across two commits:
+`ba81d86` (predecessor: C1, M1-M7, minors, nits) and `6a4c540`
+(this pass: Addenda A/B/C, M3 scope test, M8 doc, m2). Full
+`cargo test-asylum` green (cli 69, daemon 178, types 4, integration 7,
+cockpit 106); zero new build warnings.
+
+| Finding | Status | Commit | How |
+|---|---|---|---|
+| C1 loon watch_exit success-on-error + teardown-on-stream-loss | FIXED | ba81d86 | `ExitOutcome.stream_lost`; loon maps lost stream -> `success:false`/`node.errored`(stream_lost) and keeps the VM; only a parsed exit_code tears down. |
+| M1 resume/create eternal-Running TOCTOU | FIXED | ba81d86 | `transition_node_liveness` CAS; move to `Starting` before launch, exit sink owns terminal truth. |
+| M2 post_harness_event resurrection | FIXED | ba81d86 | liveness write is CAS from active states; terminal-node decision guard. |
+| M3 guest token unscoped + never revoked | FIXED | ba81d86 + 6a4c540 | revoke `loon-node-{id}` on stop/archive/exit/reconcile; `scoped_token_authorizes_path` narrows per-node token to its own `/api/nodes/{id}` path and blocks `/api/tokens`. Unit test added (6a4c540). |
+| M4 attach WS half-open silent drop | FIXED (structural; live check pending) | ba81d86 | WS keepalive ping + surface death as `node.errored`, keep VM. |
+| M5 concurrent send_input interleave | FIXED | ba81d86 | per-node submit mutex across body->gap->CR (local + loon). |
+| M6 decision dedup non-atomic | FIXED | ba81d86 | partial unique index `decisions_one_pending_per_node` + atomic upsert; DB-level test. |
+| M7 statusline O(n) body scan | FIXED | ba81d86 | ctx_pressure fired-state on node row; no per-post load-all. |
+| M8 ntfy topic = fleet control (doc) | FIXED (doc) | 6a4c540 | security note in README ntfy section + `NtfyConfig` doc-comment: topic write-access is fleet control; use a private/unguessable topic + publish ACL; 32-hex correlation token is anti-collision, not a secret. |
+| m1 idle downgrades WaitingForInput | FIXED | ba81d86 | idle liveness applied only via allowed-from guard. |
+| m2 resume drops per-node launch_args | FIXED | 6a4c540 | persist `launch_args` on node row at create; resume reappends them (argv matches create minus session-id->resume swap). Round-trip test. |
+| m3 reconcile assumes local PTYs died | SKIPPED | - | minor; skip-unless-trivial per mission brief (needs PID tracking / process-group kill; not trivial). |
+| m4 set_node_liveness_with_reason non-atomic pair | SKIPPED | - | minor audit-completeness gap (per-statement writes stay durable); skip-unless-trivial. |
+| m5 correlation token ~20 bits | FIXED | ba81d86 | `CHANNEL_REPLY_TOKEN_LENGTH` raised to 32 hex chars. |
+| m6 reply hardcodes approved | FIXED | ba81d86 | reply path records honest `answered` status with the verbatim answer. |
+| m7 dead LoonConfig fields | FIXED | ba81d86 | `api_key_file` / `cert_fingerprint_file` deleted. |
+| m8 loon caps advertised regardless of reachability | SKIPPED | - | minor; skip-unless-trivial per mission brief. |
+| m9 exec_signal/exec_resize ignore non-2xx | FIXED | ba81d86 | status `.is_success()` checked. |
+| n1 manual "13 events" omits node.resumed | FIXED | ba81d86 | manual lists 14; drift guard test vs `event_catalog()`. |
+| n2 statusline blocks before render | FIXED | ba81d86 | print line before dispatch. |
+| n3 empty ASYLUM_SOCKET_PATH treated valid | FIXED | ba81d86 | empty env filtered out. |
+| n4 toml_key does not escape newlines | FIXED | ba81d86 | newline escaping + test. |
+| Addendum A honest resumable (fs probe) | FIXED | 6a4c540 | reconcile + resume gate on on-disk transcript existence (claude `<cwd-slug>/<session>.jsonl`, codex `rollout-*-<thread-id>`); resume fails fast when absent. Slug + probe tests with fake HOME. |
+| Addendum B graceful claude stop | FIXED | 6a4c540 | claude stop submits `/exit` over PTY, bounded 5s wait for clean exit (transcript flush), then SIGKILL fallback; codex documented as staying on kill path. PTY sequencing test. |
+| Addendum C send_input event coverage | RESOLVED (no change) | 6a4c540 | programmatic `send_input` already records `InputSent`; the only gap is the raw interactive-attach path, deliberately event-less (per-keystroke events would be spam) - documented in `route_attach_input`. |
+
+### Deferred to a frugal live check (not unit-testable here)
+- **C1 stream-loss honesty**: with a real loon VM, drop the daemon->loon SSE mid-session and confirm the node goes `node.errored`(stream_lost) and the VM survives (no teardown).
+- **M4 half-open attach**: silently sever the attach WS TCP and confirm the keepalive ping detects it and surfaces death rather than accepting dropped input as delivered.
+- **Addendum B graceful-stop -> resume round trip**: stop a live claude node, confirm `/exit` flushed the transcript, then resume and confirm the session restores from that transcript.
