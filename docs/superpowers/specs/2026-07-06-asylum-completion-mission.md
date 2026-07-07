@@ -45,7 +45,9 @@ Harness hook bridge (Claude hooks / Codex notify -> `asylum` event posts: tool_c
 Gate: a monitor created in Cockpit fires on a real stalled session and its action executes; node asks a question -> ntfy -> reply -> node continues; same via Cockpit.
 
 ### Phase C — Durability and Loon parity
-Startup reconciliation (no eternal-Running lies; orphaned nodes marked honestly); capture harness session ids via the hook bridge; implement resume (`claude --resume <session-id>`, Codex equivalent) surfaced in CLI/Cockpit. Loon parity: `loon spawn` carries harness/workspace/launch-args (change LoonV2 as needed, rebuild + reinstall locally); Asylum MCP + hook bridge reachable from inside the guest (network path from microVM back to daemon over HTTP with token); observe/attach relay for Loon nodes.
+Startup reconciliation (no eternal-Running lies; orphaned nodes marked honestly); capture harness session ids (claude: pre-assign via `--session-id`; codex: correlate notify `thread-id` with rollout files); implement resume (`claude --resume <session-id>` from the node workspace dir, `codex resume <thread-id>`) surfaced in CLI/Cockpit.
+
+Loon parity — REVISED after the 2026-07-06 host assessment: Asylum's loon substrate was written against a CLI generation that no longer exists (spawn/tell/interrupt/stop/terminate/attach verbs + LOON_* env vars; zero occurrences in LoonV2 v0.1.5). The substrate must be REWRITTEN against the real contract: profile config via `loon connect` (`~/.config/loon/config.toml`, no env-var overrides), verbs `loon run <image> -- <cmd>` / `loon vm create|stop|rm` / `loon exec <vm> -- <cmd>` / `loon exec attach|signal`. Additional realities: host-path bind mounts are unsupported in v2 (Loon node workspaces live INSIDE the guest; repos get cloned/provisioned in-guest); no local guest image has node/npm — a claude/codex-capable guest image must be built (plus a way to pass Casey's subscription credentials into the guest); Asylum MCP + hook bridge from inside the guest reach the daemon over HTTP with a token (socket unavailable across the VM boundary). Change LoonV2 as needed, rebuild + reinstall locally; when installing the host, explicitly restage loon-guest (the staged copy predates the current musl build and the PATH-based installer will not refresh it).
 Gate: kill daemon mid-session, restart, state honest, a resumable node resumes; create/observe/send/interrupt/stop a real Claude node on a real Loon microVM from Asylum, and that node successfully calls one Asylum MCP tool.
 
 ### Phase D — Fleet acceptance and truthfulness sweep
@@ -55,17 +57,17 @@ Gate: the north-star scenario, witnessed end-to-end.
 ## Operating rules
 
 - Repos: `/home/casey/Projects/Asylum` and `/home/casey/Projects/LoonV2`. Branch per phase (or per coherent unit), clean merges to local `main`. Nothing pushed to GitHub. No releases, no version ceremony. LoonV2 changes are built and installed locally so the live host runs them.
-- Orchestration: the main (Fable) session plans, decomposes, reviews, and unblocks. All implementation is done by Opus/Sonnet subagents with precise briefs. Never Fable subagents. Keep main-session context lean; durable state lives in this file and phase plan docs, not in conversation memory.
+- Orchestration: the main (Fable) session plans, decomposes, reviews, and unblocks. All implementation is done by Opus/Sonnet subagents with precise briefs. Never Fable subagents. Use plain general-purpose/Explore agents only — the plugin principal-engineer agents (loon/firecracker) are banned as bloat (Casey, 2026-07-06). Keep main-session context lean; durable state lives in this file and phase plan docs, not in conversation memory.
 - Testing: solid unit/integration coverage as good engineering dictates — no TDD ceremony. Every phase gate includes a frugal real-session E2E check (Casey's subscriptions, trivial prompts, sessions stopped promptly). No simulated/mocked/stubbed behavior in shipped code, ever.
 - Escalation: questions for Casey accumulate in Open Questions below; the run continues around them unless a blocker gates all remaining work.
 
 ## Open questions for Casey
 
-(none yet)
+1. (2026-07-06) One-time passwordless-sudo setup so the run never blocks on a password. Run in the Claude session: `! echo 'casey ALL=(ALL:ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/99-casey-nopasswd && sudo chmod 0440 /etc/sudoers.d/99-casey-nopasswd`. Once done, the Loon host install proceeds unattended: `sudo env PATH=/home/casey/Projects/LoonV2/target/release:$PATH /home/casey/Projects/LoonV2/target/release/loon-host install --storage auto --yes` (creates a 20 GiB btrfs loopback at /var/lib/loon.btrfs.img, installs systemd units, binds https://127.0.0.1:7777).
 
 ## Status
 
-- Phase A: not started
+- Phase A: in progress (2026-07-06). Done: baseline green (181 Rust + 64 cockpit tests); phase-a-truth merged at b336d05 (flake fix, doc truth, prototype/dead-api removal); harness contracts researched and recorded in 2026-07-06-harness-contract-notes.md; loon CLI v0.1.5 on PATH at ~/.local/bin/loon. Pending: Loon host install (blocked on passwordless sudo setup; exact command in Open Questions), live spawn-peer E2E check.
 - Phase B: not started
 - Phase C: not started
 - Phase D: not started
