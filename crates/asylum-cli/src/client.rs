@@ -1,5 +1,6 @@
 use std::env;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::{self, StatusCode};
@@ -12,12 +13,13 @@ use asylum_types::api::{
     ChannelMessagesResponse, ChannelTestRequest, ChannelTestResponse, ChannelUpdateRequest,
     CreateNodeRequest, DecisionCreateRequest, DecisionListResponse, DecisionRecord,
     DecisionResolveRequest, ForkNodeRequest, GraphGetResponse, HarnessDescriptorResponse,
-    HealthResponse, HookCreateRequest, HookEventCatalogResponse, HookFiringsResponse,
-    HookListResponse, HookRule, HookTestResponse, LaunchPacketResponse, NativeAttachResponse,
-    NodeCreateResponse, NodeEventsResponse, NodeInspectResponse, NodeListResponse,
-    NotificationsResponse, RecipeListResponse, RecipeSpawnRequest, RecipeSpawnResponse,
-    RelationshipCreateRequest, RelationshipResponse, RemoteCommandRequest, RemoteCommandResponse,
-    SendInputRequest, SpawnPeerRequest, SpawnPeerResponse, TokenIssueResponse,
+    HarnessEventRequest, HarnessEventResponse, HealthResponse, HookCreateRequest,
+    HookEventCatalogResponse, HookFiringsResponse, HookListResponse, HookRule, HookTestResponse,
+    LaunchPacketResponse, NativeAttachResponse, NodeCreateResponse, NodeEventsResponse,
+    NodeInspectResponse, NodeListResponse, NotificationsResponse, RecipeListResponse,
+    RecipeSpawnRequest, RecipeSpawnResponse, RelationshipCreateRequest, RelationshipResponse,
+    RemoteCommandRequest, RemoteCommandResponse, SendInputRequest, SpawnPeerRequest,
+    SpawnPeerResponse, TokenIssueResponse,
 };
 use asylum_types::node::NodeRecord;
 use asylum_types::relationship::RelationshipRecord;
@@ -71,6 +73,57 @@ impl AsylumClient {
         Err(anyhow!(
             "Unix-socket daemon client is only supported on Unix platforms"
         ))
+    }
+
+    /// Like [`Self::new_socket`], but with an explicit request timeout. Used by the
+    /// `asylum harness-event` bridge, which must fail fast (~2s) rather than block a
+    /// harness hook/statusline invocation on a slow or wedged daemon.
+    #[cfg(unix)]
+    pub fn new_socket_with_timeout(
+        socket_path: impl AsRef<Path>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let socket_path = socket_path.as_ref().to_path_buf();
+        let http = reqwest::Client::builder()
+            .unix_socket(socket_path.clone())
+            .timeout(timeout)
+            .build()
+            .context("build Unix-socket daemon client")?;
+        Ok(Self {
+            base_url: "http://asylum.local".to_string(),
+            socket_path: Some(socket_path),
+            token: None,
+            http,
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub fn new_socket_with_timeout(
+        _socket_path: impl AsRef<Path>,
+        _timeout: Duration,
+    ) -> Result<Self> {
+        Err(anyhow!(
+            "Unix-socket daemon client is only supported on Unix platforms"
+        ))
+    }
+
+    /// Like [`Self::new`], but with an explicit request timeout. See
+    /// [`Self::new_socket_with_timeout`].
+    pub fn new_with_timeout(
+        base_url: impl Into<String>,
+        token: impl Into<Option<String>>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .context("build HTTP daemon client")?;
+        Ok(Self {
+            base_url: base_url.into(),
+            socket_path: None,
+            token: token.into(),
+            http,
+        })
     }
 
     #[allow(dead_code)]
@@ -449,6 +502,19 @@ impl AsylumClient {
     pub async fn node_events(&self, id: Uuid) -> Result<NodeEventsResponse> {
         let path = format!("/api/nodes/{id}/events");
         self.send_request(reqwest::Method::GET, &path, Option::<&str>::None)
+            .await
+    }
+
+    /// Forward a raw harness-native signal (claude hook/statusline payload, codex
+    /// notify payload) to the daemon's ingestion endpoint. Used by the
+    /// `asylum harness-event` bridge; the daemon owns all interpretation.
+    pub async fn post_harness_event(
+        &self,
+        id: Uuid,
+        request: HarnessEventRequest,
+    ) -> Result<HarnessEventResponse> {
+        let path = format!("/api/nodes/{id}/harness-event");
+        self.send_request(reqwest::Method::POST, &path, Some(&request))
             .await
     }
 

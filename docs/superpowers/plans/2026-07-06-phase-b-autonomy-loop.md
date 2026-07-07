@@ -84,15 +84,24 @@ W2/W3 build against this:
 - Interrupt now sends Ctrl-C only (no forced Stopped/exited). Exit sink: clean exit→Stopped+node.exited(exit_code); abnormal→Failed+node.errored. Quiescence idle: 30s sweep fires node.idle for Running Local nodes with native_idle_signal()==false (codex) after autonomy.idle_quiescence_seconds (default 120); claude skipped (native idle via Notification).
 - Schema: nullable nodes.harness_session_id (ensure_column migration). New config `[autonomy]`.
 
+## W2 delivered contract (branch phase-b-w2, not yet merged, 2026-07-06)
+
+W3/W4 build against this:
+- New CLI subcommand family in `crates/asylum-cli`: `asylum harness-event <source>` where `<source>` is `claude-hook`, `claude-statusline`, or `codex-notify`. Stays thin — no interpretation of the payload; forwards verbatim JSON as `POST /api/nodes/{id}/harness-event` with body `{"source": "claude_hook"|"claude_statusline"|"codex_notify", "payload": <verbatim JSON>}` (W1's endpoint).
+- Input acquisition: `claude-hook`/`claude-statusline` read JSON from stdin; `codex-notify` takes the JSON as an optional trailing positional argv element (never reads stdin, matching Codex nulling stdin/stdout/stderr for the notify subprocess).
+- `claude-statusline` always prints exactly one status line to stdout after attempting the post (regardless of success/failure) — dumb formatting: `"<model display_name> | ctx <used_percentage>%"` with graceful fallbacks (`"claude"` when model missing, ctx clause omitted when `context_window.used_percentage` missing). Never prints errors to stdout.
+- Node/daemon resolution mirrors `cli::runtime_client`'s existing precedence: `ASYLUM_SOCKET_PATH` (unauthenticated Unix socket, matches `asylum mcp`'s injected env) wins when set; otherwise falls back to HTTP via `ASYLUM_BASE_URL` + bearer `ASYLUM_TOKEN` (for future Loon guests); otherwise falls back to the default local socket path. Added `AsylumClient::new_socket_with_timeout` / `new_with_timeout` (2s request timeout, no retries) and `AsylumClient::post_harness_event` in `crates/asylum-cli/src/client.rs`.
+- Core logic lives in `crates/asylum-cli/src/harness_event.rs`: pure `build_request`, `render_statusline`, `resolve_target` functions plus a testable `dispatch` core (returns `Result<_, String>`, never panics). The shipped entry points (`run_claude_hook`, `run_claude_statusline`, `run_codex_notify`) always return `()` — bad JSON, missing `ASYLUM_NODE_ID`, or an unreachable daemon are logged to stderr only and the process always exits 0. Verified live: manual smoke of all three sources against no daemon exits 0 with correct stderr/stdout behavior.
+- Tests: 22 new unit tests in `harness_event.rs` (request-shape forwarding for Stop/Notification/SessionStart/codex-notify/statusline; statusline rendering full+fallback; env-resolution precedence; exit-0-on-failure; two real-transport round trips against one-shot TCP and Unix-socket test servers — no stub transports in the shipped path) plus 1 clap-parsing test in `cli.rs`. `asylum-cli` lib tests: 46 pre-existing -> 69 (23 new). Full `cargo test-asylum` green: 136 daemon tests unchanged, 4 asylum-types tests unchanged, 64 cockpit vitest tests unchanged.
+
 ## Status
 
 - W0: not started (input delivery bugs from E2E; note: interrupt/exit already fixed in W1, so W0 is now just the two send_input/launch-submit bugs, both in substrate/local.rs + harness launch)
 - W1: COMPLETE — merged to main f7186bb; 136 daemon-lib tests green (+12).
-- W2 (CLI bridge `asylum harness-event`): not started — build against the delivered contract above.
+- W2 (CLI bridge `asylum harness-event`): COMPLETE on branch phase-b-w2 (not yet merged) — see delivered contract above.
 - W3 (launch injection: --session-id, --settings hooks+statusLine for claude; -c notify for codex): not started.
 - W4 (hook actions send_input + honest spawn, delete recipes; decision producer from awaiting_input; resolve_decision feedback injection): not started.
 - W5 (cockpit: catalog-matched pickers, decision surfacing, liveness chips): not started.
-- W2: not started
 - W3: not started
 - W4: not started
 - W5: not started
