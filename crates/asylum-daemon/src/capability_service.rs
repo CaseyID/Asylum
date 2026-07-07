@@ -2077,6 +2077,20 @@ impl CapabilityService {
             }
             SubstrateKind::Loon => adapter.command().to_string(),
         };
+        // A blank harness command silently produced `exec ""` in the guest (exit
+        // 126, no output) / an unfindable local binary. Fail loudly instead: an
+        // empty command means the harness `*_command` config was set to "" (e.g.
+        // a `[harness]` table that omitted the key before the per-field serde
+        // defaults were fixed).
+        if launch_command.trim().is_empty() {
+            return Err(anyhow!(
+                "harness command for {harness} resolved empty; set [harness] {}_command in the daemon config",
+                match harness {
+                    HarnessKind::ClaudeCode => "claude",
+                    HarnessKind::Codex => "codex",
+                }
+            ));
+        }
 
         if matches!(substrate, SubstrateKind::Loon) {
             let loon = self
