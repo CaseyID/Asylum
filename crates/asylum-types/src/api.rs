@@ -271,6 +271,8 @@ pub struct ErrorPayload {
 pub struct TokenIssueResponse {
     pub id: String,
     pub raw_token: String,
+    /// Advisory only (see `security::TokenScope`): v0.1.x is single-user and
+    /// every valid token grants full access regardless of this list.
     pub scope: Vec<String>,
     pub expires_at_epoch_secs: i64,
 }

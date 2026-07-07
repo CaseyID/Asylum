@@ -1127,11 +1127,6 @@ impl CapabilityService {
                 graph.relationships.len()
             ));
         }
-        if target == "transcript.checkpoint" {
-            return Err(anyhow!(
-                "tool target 'transcript.checkpoint' is not supported yet"
-            ));
-        }
         Err(anyhow!("unknown tool target '{target}'"))
     }
 
@@ -1485,7 +1480,7 @@ impl CapabilityService {
                 CapabilityName::TokenIssue,
                 "/api/tokens",
                 "POST",
-                "Issue an owner command token",
+                "Issue an owner command token (scope is advisory-only; every token grants full access)",
                 true,
             ),
             descriptor(
@@ -5133,8 +5128,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transcript_checkpoint_hook_tool_reports_unsupported(
+    async fn unknown_tool_hook_action_target_reports_unknown_target(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // The dead `transcript.checkpoint` special case was deleted (2026-07,
+        // Phase D inert-surface sweep): no tool target was ever wired up to a
+        // real checkpoint capability, so it now falls through to the same
+        // honest "unknown tool target" error as any other made-up target.
         let workdir = tempfile::tempdir()?;
         let path = workdir.path().join("asylum.sqlite3").display().to_string();
         let store = Store::open(path)?;
@@ -5158,7 +5157,10 @@ mod tests {
         let response = service.hook_test(&hook.id).await?;
 
         assert!(!response.firing.ok);
-        assert!(response.firing.outcome.contains("not supported yet"));
+        assert!(response
+            .firing
+            .outcome
+            .contains("unknown tool target 'transcript.checkpoint'"));
         Ok(())
     }
 

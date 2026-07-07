@@ -60,6 +60,7 @@ pub struct TokenVerification {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenRequest {
     pub name: String,
+    /// Advisory labels only -- not enforced per-route (see `TokenScope` above).
     pub scope: Vec<String>,
     pub ttl_seconds: Option<u64>,
 }

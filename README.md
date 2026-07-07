@@ -70,9 +70,9 @@ When configured, the daemon subscribes to the topic at startup. Inbound ntfy mes
 ### Known Limits
 
 - Asylum is single-user in v0.1.x. Owner tokens protect HTTP access, but token scopes are advisory labels, not per-route authorization.
-- Local substrate behavior is the most validated path. Loon is optional and requires a configured Loon endpoint plus the `loon` CLI contract.
-- Inbound ntfy/webhook messages are recorded and can trigger hooks, but node addressing/reply correlation is still limited.
-- Decisions are not yet a first-class operator workflow; remote approve/deny pieces exist, but pending decision surfacing is incomplete.
+- Local substrate behavior is the most validated path. Loon is optional and requires a configured Loon host plus client profile (`loon connect`).
+- Inbound ntfy/webhook messages are recorded and can trigger hooks; ntfy replies are correlated back to the node that triggered the outbound message (via a hook `channel` action), not to arbitrary node addressing.
+- Decisions are a first-class operator workflow: harness-awaited-input events auto-create pending decisions, Cockpit/CLI/MCP can list and resolve them (approve/deny/free-text answer), and the resolution is injected back into the node. ntfy replies correlated to a node with a pending decision resolve it the same way.
 - Keep Cockpit bound to localhost unless you are deliberately protecting access with a private network such as Tailscale. Session URLs and transcripts are sensitive.
 
 ## Release Artifact Expectations
@@ -281,9 +281,9 @@ Token scopes are advisory labels in v0.1.x. Owner-token auth is enforced at the 
 - `ASYLUM_OWNER_TOKEN` and `ASYLUM_OWNER_TOKENS_ENABLED` for daemon-side owner-token auth
 - `ASYLUM_ATTACH_SECRET` for internal signed session transport; omitted means a per-process random secret
 - `ASYLUM_NTFY_SERVER`, `ASYLUM_NTFY_TOPIC`, `ASYLUM_NTFY_TOKEN`
-- `ASYLUM_LOON_ENABLED`, `ASYLUM_LOON_ENDPOINT`, and optional config-file `loon.cli_path`, `loon.api_key_file`, `loon.cert_fingerprint_file`
+- `ASYLUM_LOON_ENABLED`, `ASYLUM_LOON_ENDPOINT` (only needed to override the client profile's endpoint), and optional config-file `loon.cli_path`, `loon.config_path`, `loon.profile`, `loon.image`, `loon.guest_asylum_binary`. (`loon.api_key_file`/`loon.cert_fingerprint_file` are accepted but unused -- superseded by the `loon` client config below; kept for config back-compat.)
 
-When Loon is enabled, Asylum drives the documented `loon` CLI contract for launch, input, interrupt, stop, terminate, and session relay operations. It passes `LOON_ENDPOINT` plus configured auth/cert env vars to that process.
+When Loon is enabled, Asylum drives the real LoonV2 v2 CLI contract: `loon vm create|stop|rm|prune` for guest lifecycle and `loon exec` for provisioning, plus a direct HTTPS PTY-exec session against the loon daemon API for the interactive harness. Auth/endpoint are NOT passed via env vars -- the `loon` CLI resolves them itself from the client profile at `~/.config/loon/config.toml` (set up once via `loon connect`). Guest workspaces live inside the microVM (no host bind mounts); the in-guest harness reaches Asylum over HTTP via `host.loon.internal` with a per-node bearer token, since the guest cannot reach the host's Unix socket.
 
 ### Acceptance Walkthrough
 
