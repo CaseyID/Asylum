@@ -26,8 +26,8 @@ import type {
   HookUpdateRequest,
   NotificationRecord,
   SubstrateDescriptor,
-  RecipeListResponse,
   TokenListResponse,
+
   TokenRotateResponse,
 } from "./types";
 
@@ -343,16 +343,8 @@ export async function resolveDecision(id: string, req: DecisionResolveRequest): 
   });
 }
 
-// — recipes —
-
-export async function fetchRecipes(): Promise<RecipeListResponse["recipes"]> {
-  const data = await request<{ recipes: RecipeListResponse["recipes"] } | RecipeListResponse>("/recipes");
-  return Array.isArray((data as { recipes?: unknown })?.recipes)
-    ? ((data as { recipes: RecipeListResponse["recipes"] }).recipes)
-    : (data as RecipeListResponse).recipes;
-}
-
 // — fork —
+
 
 export async function forkNode(id: string, req: ForkNodeRequest = {}): Promise<AsylumNode> {
   const data = await request<AsylumNode | { node: AsylumNode }>(`/nodes/${id}/fork`, {

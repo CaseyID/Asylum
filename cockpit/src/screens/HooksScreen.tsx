@@ -5,7 +5,6 @@ import {
   createHook,
   deleteHook,
   dryRunHook,
-  fetchRecipes,
   fetchHookEvents,
   fetchHookFirings,
   fetchHooks,
@@ -16,8 +15,8 @@ import type {
   HookEventCatalogEntry,
   HookFiringRecord,
   HookRule,
-  RecipeDescriptor,
 } from "../types";
+
 
 function fmtTs(epoch: number): string {
   if (!epoch) return "—";
@@ -138,11 +137,8 @@ function HookCard({
   );
 }
 
-const BASE_ACTION_KINDS = ["channel", "tool", "pause_node", "archive"];
-
-function actionKinds(allowSpawn: boolean): readonly string[] {
-  return allowSpawn ? [...BASE_ACTION_KINDS, "spawn"] : BASE_ACTION_KINDS;
-}
+// send_input and spawn are honest, always-available hook actions (W4).
+const ACTION_KINDS = ["channel", "send_input", "spawn", "tool", "pause_node", "archive"];
 
 function HookEditor({
   hookId,
@@ -151,7 +147,6 @@ function HookEditor({
   events,
   onClose,
   onSaved,
-  allowSpawn,
 }: {
   hookId: string;
   presetEvent?: string;
@@ -159,9 +154,9 @@ function HookEditor({
   events: HookEventCatalogEntry[];
   onClose: () => void;
   onSaved: () => Promise<void> | void;
-  allowSpawn: boolean;
 }) {
-  const allowedActionKinds = useMemo(() => actionKinds(allowSpawn), [allowSpawn]);
+  const allowedActionKinds = ACTION_KINDS;
+
   const isNew = hookId === "__new";
   const existing = isNew ? null : hooks.find((h) => h.id === hookId) ?? null;
 
@@ -312,21 +307,21 @@ function HookEditor({
                   onClick={() => removeAction(i)}
                 />
               </div>
-              {a.kind === "channel" && (
+              {(a.kind === "channel" || a.kind === "send_input") && (
                 <input
                   className="input mono"
                   value={a.template ?? ""}
                   onChange={(e) => setAction(i, { template: e.target.value })}
-                  placeholder="template — e.g. {node.id} triggered"
+                  placeholder={
+                    a.kind === "send_input"
+                      ? "text — e.g. continue: {event}"
+                      : "template — e.g. {node.id} triggered"
+                  }
                   style={{ marginLeft: 28 }}
                 />
               )}
-              {!allowedActionKinds.includes(a.kind) && a.kind === "spawn" && (
-                <div style={{ marginLeft: 28, color: "var(--fg-muted)", fontSize: 11 }}>
-                  spawn is unavailable until recipes are enabled
-                </div>
-              )}
             </div>
+
           ))}
           <div style={{ alignSelf: "flex-start" }}>
             <Btn size="sm" kind="ghost" icon="plus" onClick={addAction}>
@@ -371,8 +366,8 @@ export function HooksScreen(): JSX.Element {
   const [hooks, setHooks] = useState<HookRule[]>([]);
   const [firings, setFirings] = useState<HookFiringRecord[]>([]);
   const [events, setEvents] = useState<HookEventCatalogEntry[]>([]);
-  const [recipes, setRecipes] = useState<RecipeDescriptor[]>([]);
   const [tab, setTab] = useState<string>("rules");
+
   const [drawer, setDrawer] = useState<DrawerState | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -404,12 +399,8 @@ export function HooksScreen(): JSX.Element {
 
   useEffect(() => {
     reloadHooks();
-    fetchRecipes()
-      .then(setRecipes)
-      .catch(() => {
-        setRecipes([]);
-      });
     fetchHookEvents()
+
       .then(setEvents)
       .catch((err) => {
         setLoadError(formatError("failed to load event catalog", err));
@@ -585,8 +576,8 @@ export function HooksScreen(): JSX.Element {
                 presetEvent={drawer.presetEvent}
                 hooks={hooks}
                 events={events}
-                allowSpawn={recipes.length > 0}
                 onClose={() => setDrawer(null)}
+
                 onSaved={reloadHooks}
               />
       )}

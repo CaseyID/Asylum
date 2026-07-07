@@ -16,9 +16,10 @@ use asylum_types::api::{
     HarnessEventRequest, HarnessEventResponse, HealthResponse, HookCreateRequest,
     HookEventCatalogResponse, HookFiringsResponse, HookListResponse, HookRule, HookTestResponse,
     LaunchPacketResponse, NativeAttachResponse, NodeCreateResponse, NodeEventsResponse,
-    NodeInspectResponse, NodeListResponse, NotificationsResponse, RecipeListResponse,
-    RecipeSpawnRequest, RecipeSpawnResponse, RelationshipCreateRequest, RelationshipResponse,
-    RemoteCommandRequest, RemoteCommandResponse, SendInputRequest, SpawnPeerRequest,
+    NodeInspectResponse, NodeListResponse, NotificationsResponse, RelationshipCreateRequest,
+    RelationshipResponse, RemoteCommandRequest, RemoteCommandResponse, SendInputRequest,
+    SpawnPeerRequest,
+
     SpawnPeerResponse, TokenIssueResponse,
 };
 use asylum_types::node::NodeRecord;
@@ -387,22 +388,8 @@ impl AsylumClient {
             .await
     }
 
-    pub async fn list_recipes(&self) -> Result<RecipeListResponse> {
-        self.send_request(reqwest::Method::GET, "/api/recipes", Option::<&str>::None)
-            .await
-    }
-
-    pub async fn spawn_recipe(
-        &self,
-        id: &str,
-        request: RecipeSpawnRequest,
-    ) -> Result<RecipeSpawnResponse> {
-        let path = format!("/api/recipes/{id}/spawn");
-        self.send_request(reqwest::Method::POST, &path, Some(&request))
-            .await
-    }
-
     pub async fn send_remote_command(
+
         &self,
         request: RemoteCommandRequest,
     ) -> Result<RemoteCommandResponse> {

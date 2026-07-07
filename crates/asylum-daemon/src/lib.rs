@@ -7,7 +7,8 @@ pub mod decision_ingester;
 pub mod harness;
 pub mod hooks;
 pub mod notifications;
-pub mod recipes;
+pub mod launch_packet;
+
 pub mod remote_commands;
 pub mod storage;
 pub mod substrate;

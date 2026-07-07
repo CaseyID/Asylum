@@ -10,8 +10,8 @@ const apiMocks = vi.hoisted(() => ({
   fetchHookEvents: vi.fn(),
   fetchHookFirings: vi.fn(),
   fetchHooks: vi.fn(),
-  fetchRecipes: vi.fn(),
   updateHook: vi.fn(),
+
 }));
 
 vi.mock("../api", () => apiMocks);
@@ -52,13 +52,12 @@ describe("HooksScreen error handling", () => {
     apiMocks.fetchHookEvents.mockReset();
     apiMocks.fetchHookFirings.mockReset();
     apiMocks.fetchHooks.mockReset();
-    apiMocks.fetchRecipes.mockReset();
     apiMocks.updateHook.mockReset();
 
     apiMocks.fetchHookEvents.mockResolvedValue([]);
     apiMocks.fetchHookFirings.mockResolvedValue([]);
-    apiMocks.fetchRecipes.mockResolvedValue([]);
   });
+
 
   afterEach(() => {
     cleanup();
@@ -101,37 +100,9 @@ describe("HooksScreen error handling", () => {
     expect(apiMocks.fetchHookFirings).toHaveBeenCalledTimes(0);
   });
 
-  it("hides spawn action when recipes are unavailable", async () => {
+  it("offers spawn and send_input as always-available actions", async () => {
     apiMocks.fetchHooks.mockResolvedValue([hook()]);
     apiMocks.fetchHookEvents.mockResolvedValue([]);
-    apiMocks.fetchRecipes.mockResolvedValue([]);
-
-    const { getAllByRole, getByText, findByText } = render(<HooksScreen />);
-    await findByText("hook-1");
-
-    const createButton = getAllByRole("button", { name: "new hook" })[0];
-    createButton.click();
-
-    const editor = await findByText("new hook");
-    expect(editor).toBeTruthy();
-    const actionSelect = document.querySelectorAll("select")[1];
-    const options = Array.from(actionSelect?.querySelectorAll("option") ?? []).map(
-      (o) => o.textContent ?? "",
-    );
-    expect(options).not.toContain("spawn");
-  });
-
-  it("enables spawn action when recipes are available", async () => {
-    apiMocks.fetchHooks.mockResolvedValue([hook()]);
-    apiMocks.fetchHookEvents.mockResolvedValue([]);
-    apiMocks.fetchRecipes.mockResolvedValue([
-      {
-        id: "recipe-id",
-        title: "Sample Recipe",
-        prompt_template: "{input}",
-        kind: "spawn",
-      },
-    ]);
 
     const { getAllByRole, findByText } = render(<HooksScreen />);
     await findByText("hook-1");
@@ -146,5 +117,7 @@ describe("HooksScreen error handling", () => {
       (o) => o.textContent ?? "",
     );
     expect(options).toContain("spawn");
+    expect(options).toContain("send_input");
   });
 });
+
