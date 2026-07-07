@@ -3,6 +3,7 @@
 // API/CLI/MCP panels dropped — those features don't exist yet.
 import { useEffect, useState, type JSX } from "react";
 import { Btn, Panel, Pill, Tag } from "../lib/ui";
+import { formatDurationSeconds } from "../lib/glyphs";
 import {
   fetchChannels,
   fetchHarnessDescriptors,
@@ -236,6 +237,12 @@ function NetSettings({ health }: { health: HealthResponse | null }) {
       <div className="kv">
         <span className="k">bind</span>
         <span className="v mono">{health ? health.bind_addr : "loading…"}</span>
+        <span className="k">uptime</span>
+        <span className="v mono">
+          {health && typeof health.uptime_seconds === "number"
+            ? formatDurationSeconds(health.uptime_seconds)
+            : "loading…"}
+        </span>
       </div>
       <div
         style={{

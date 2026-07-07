@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { previewFor, uiStateForLiveness, uiStateLabel } from "./glyphs";
+import { canResumeNode, formatDurationSeconds, previewFor, uiStateForLiveness, uiStateLabel } from "./glyphs";
 import type { AsylumNode, CapabilitySnapshot } from "../types";
 
 const caps: CapabilitySnapshot = {
@@ -60,5 +60,43 @@ describe("node liveness display", () => {
     expect(state).toBe("errored");
     expect(previewFor(node({ liveness: "failed" }))).toBe("! errored");
     expect(state).not.toBe(uiStateForLiveness("stopped"));
+  });
+});
+
+describe("formatDurationSeconds (D2 daemon-provided uptime)", () => {
+  it("renders sub-minute durations as seconds", () => {
+    expect(formatDurationSeconds(0)).toBe("0s");
+    expect(formatDurationSeconds(42)).toBe("42s");
+  });
+
+  it("renders sub-hour durations as minutes and seconds", () => {
+    expect(formatDurationSeconds(90)).toBe("1m 30s");
+  });
+
+  it("renders long durations as hours and minutes", () => {
+    expect(formatDurationSeconds(3 * 3600 + 61)).toBe("3h 1m");
+  });
+
+  it("clamps negative input to zero rather than showing a negative uptime", () => {
+    expect(formatDurationSeconds(-5)).toBe("0s");
+  });
+});
+
+describe("canResumeNode (D2 resume affordance)", () => {
+  it("is resumable when stopped with a recorded harness session id", () => {
+    expect(canResumeNode(node({ liveness: "stopped", harness_session_id: "sess-1" }))).toBe(true);
+  });
+
+  it("is not resumable without a harness session id", () => {
+    expect(canResumeNode(node({ liveness: "stopped", harness_session_id: null }))).toBe(false);
+    expect(canResumeNode(node({ liveness: "stopped" }))).toBe(false);
+  });
+
+  it("is not resumable when archived, even with a session id", () => {
+    expect(canResumeNode(node({ liveness: "archived", harness_session_id: "sess-1" }))).toBe(false);
+  });
+
+  it("is not resumable while still running", () => {
+    expect(canResumeNode(node({ liveness: "running", harness_session_id: "sess-1" }))).toBe(false);
   });
 });

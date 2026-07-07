@@ -15,6 +15,14 @@ pub struct HealthResponse {
     pub database_path: String,
     pub database_size_bytes: u64,
     pub transcripts_dir: String,
+    /// Unix timestamp (seconds) the daemon process started. Fixed for the
+    /// life of the process; lets a client compute elapsed time between polls
+    /// without re-deriving it from anything client-side.
+    pub daemon_started_at_epoch_secs: i64,
+    /// Convenience: `now - daemon_started_at_epoch_secs`, computed daemon-side
+    /// at response time so a single `/health` fetch is enough to render an
+    /// accurate uptime with no client-side clock math against a stored value.
+    pub uptime_seconds: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

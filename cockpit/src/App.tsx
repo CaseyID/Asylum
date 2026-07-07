@@ -18,10 +18,12 @@ import {
   hydrateOwnerTokenFromLocation,
   interruptNode,
   postNodeInput,
+  resumeNode,
   sendRemoteCommand,
   setStoredOwnerToken,
   stopNode,
 } from "./api";
+import { formatDurationSeconds } from "./lib/glyphs";
 import { selectCommandCenter, useCockpitStore } from "./state";
 import { Topbar } from "./components/Topbar";
 import { Nav } from "./components/Nav";
@@ -380,9 +382,9 @@ export function App() {
       } else if (action === "archive") {
         await archiveNode(target.id);
         setLocalNotice("archive issued");
-      } else if (action === "terminate") {
-        await stopNode(target.id);
-        setLocalNotice("stop issued; resources will be released");
+      } else if (action === "resume") {
+        await resumeNode(target.id);
+        setLocalNotice("resume issued");
       } else if (action === "fork") {
         const newNode = await forkNode(target.id, {});
         setLocalNotice(`forked into ${newNode.id}`);
@@ -483,6 +485,9 @@ export function App() {
           hookCount={enabledHookCount}
           daemonVersion={health?.daemon_version ? `asylum ${health.daemon_version}` : undefined}
           bindAddr={health?.bind_addr ?? (typeof window !== "undefined" ? window.location.host : "localhost")}
+          daemonUptime={
+            typeof health?.uptime_seconds === "number" ? formatDurationSeconds(health.uptime_seconds) : undefined
+          }
           onPick={handleSelectScreen}
         />
 
@@ -525,6 +530,7 @@ export function App() {
               onLaunch={() => setScreen("create")}
               onOpen={handleOpenNode}
               pendingDecisionNodeIds={pendingDecisionNodeIds}
+              relationships={graph.relationships}
             />
           )}
           {screen === "decisions" && <DecisionsScreen />}

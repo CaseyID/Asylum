@@ -218,7 +218,83 @@ describe("NodeScreen selection transition", () => {
 
     fireEvent.click(archive);
 
-    expect(queryByText("archived · transcript exported")).toBeNull();
+    expect(queryByText("archived · stopped, no resume")).toBeNull();
     await waitFor(() => expect(queryByText("archive failed: daemon unavailable")).toBeDefined());
+  });
+});
+
+// D2 — Resume affordance. Shown only for a stopped, non-archived node that
+// carries a harness_session_id (the resume key a real POST /nodes/:id/resume
+// route — delivered by a parallel workstream — needs). Fetch is mocked at the
+// module level (apiMocks) so this exercises purely the button-gating logic.
+describe("NodeScreen resume affordance (D2)", () => {
+  afterEach(() => cleanup());
+
+  it("shows a resume button for a stopped node with a harness_session_id", async () => {
+    const onAction = vi.fn().mockResolvedValue(undefined);
+    const props = {
+      node: node({ liveness: "stopped", harness_session_id: "sess-resume-1" }),
+      nodes: [node({ liveness: "stopped", harness_session_id: "sess-resume-1" })],
+      relationships: [],
+      onBack: vi.fn(),
+      onOpen: vi.fn(),
+      onAction,
+      onGraphRefresh: vi.fn(),
+    };
+
+    const { getByRole, container } = render(<NodeScreen {...props} />);
+    await waitFor(() => expect(container.textContent).toContain("command-center"));
+
+    const resume = getByRole("button", { name: "resume" });
+    fireEvent.click(resume);
+    expect(onAction).toHaveBeenCalledWith("resume");
+  });
+
+  it("hides the resume button for a running node", async () => {
+    const props = {
+      node: node({ liveness: "running", harness_session_id: "sess-resume-1" }),
+      nodes: [node({ liveness: "running", harness_session_id: "sess-resume-1" })],
+      relationships: [],
+      onBack: vi.fn(),
+      onOpen: vi.fn(),
+      onAction: vi.fn(),
+      onGraphRefresh: vi.fn(),
+    };
+
+    const { queryByRole, container } = render(<NodeScreen {...props} />);
+    await waitFor(() => expect(container.textContent).toContain("command-center"));
+    expect(queryByRole("button", { name: "resume" })).toBeNull();
+  });
+
+  it("hides the resume button for a stopped node with no harness_session_id", async () => {
+    const props = {
+      node: node({ liveness: "stopped", harness_session_id: undefined }),
+      nodes: [node({ liveness: "stopped", harness_session_id: undefined })],
+      relationships: [],
+      onBack: vi.fn(),
+      onOpen: vi.fn(),
+      onAction: vi.fn(),
+      onGraphRefresh: vi.fn(),
+    };
+
+    const { queryByRole, container } = render(<NodeScreen {...props} />);
+    await waitFor(() => expect(container.textContent).toContain("command-center"));
+    expect(queryByRole("button", { name: "resume" })).toBeNull();
+  });
+
+  it("hides the resume button for an archived node even with a harness_session_id", async () => {
+    const props = {
+      node: node({ liveness: "archived", harness_session_id: "sess-resume-1" }),
+      nodes: [node({ liveness: "archived", harness_session_id: "sess-resume-1" })],
+      relationships: [],
+      onBack: vi.fn(),
+      onOpen: vi.fn(),
+      onAction: vi.fn(),
+      onGraphRefresh: vi.fn(),
+    };
+
+    const { queryByRole, container } = render(<NodeScreen {...props} />);
+    await waitFor(() => expect(container.textContent).toContain("command-center"));
+    expect(queryByRole("button", { name: "resume" })).toBeNull();
   });
 });

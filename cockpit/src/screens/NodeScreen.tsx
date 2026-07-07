@@ -6,6 +6,7 @@ import { Btn, Empty, KV, Pill, Tag } from "../lib/ui";
 import { NodeSession } from "../components/NodeSession";
 import {
   ROLE_GLYPH,
+  canResumeNode,
   harnessLabel,
   isCommandCenter,
   shortNodeId,
@@ -30,8 +31,8 @@ export type NodeScreenAction =
   | "interrupt"
   | "fork"
   | "stop"
-  | "terminate"
-  | "archive";
+  | "archive"
+  | "resume";
 
 export interface NodeScreenProps {
   node?: AsylumNode;
@@ -268,12 +269,14 @@ export function NodeScreen({
             <Btn size="sm" icon="git-branch" onClick={() => fire("fork", "forked → see graph")}>
               fork
             </Btn>
-            <Btn size="sm" icon="archive" onClick={() => fire("archive", "archived · transcript exported")}>
+            <Btn size="sm" kind="danger" icon="archive" onClick={() => fire("archive", "archived · stopped, no resume")}>
               archive
             </Btn>
-            <Btn size="sm" kind="danger" icon="x" onClick={() => fire("terminate", "terminated · resources released")}>
-              terminate
-            </Btn>
+            {canResumeNode(node) && (
+              <Btn size="sm" icon="play" onClick={() => fire("resume", "resume issued")}>
+                resume
+              </Btn>
+            )}
           </div>
           {flash && (
             <div className={`action-flash ${flash.status}`} key={flash.id}>
