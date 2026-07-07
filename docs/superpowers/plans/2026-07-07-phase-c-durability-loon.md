@@ -90,4 +90,4 @@ Live gate evidence (frugal, isolated daemon on 127.0.0.1:8793, ASYLUM_HOME=/tmp/
 - C2 (reconciliation + resume): COMPLETE (delivered contract above; branch phase-c2)
 - Gate: BOTH legs passed 2026-07-07. C1 leg (real claude node on a real Loon microVM: MCP round-trip, observe/send/interrupt/stop) passed in C1's live verification. C2 leg passed this pass: kill -9 the daemon under a live claude node -> restart -> reconciliation marked the node honestly Stopped (not Running, resumable recorded), and `asylum node resume` relaunched `claude --resume` with `node.session_started` source=resume and recovered context (PINEAPPLE returned via send). NOTE: interactive claude 2.1.202 does not persist its transcript on a hard crash (harness limitation documented in the C2 contract); the resume leg's persisted session was seeded headlessly to exercise asylum's real resume path against a real persisted claude session.
 
-Release status: local-only mission work; not released. Last published release: v0.1.10 (2026-05-07).
+Release status: shipped in asylum v0.2.0 + LoonV2 v0.1.6 (published 2026-07-07, deployed locally). See RELEASES.md ledger.
