@@ -409,6 +409,40 @@ impl Store {
         Ok(())
     }
 
+    /// Set liveness AND record a single `LivenessChanged` event carrying an
+    /// explicit reason (and optional extra fields). Used by startup
+    /// reconciliation so the honest transition is auditable ("why is this node
+    /// Stopped?") without inventing a new event-catalog kind.
+    pub fn set_node_liveness_with_reason(
+        &self,
+        id: Uuid,
+        liveness: NodeLiveness,
+        reason: &str,
+        extra: JsonValue,
+    ) -> Result<()> {
+        let now = OffsetDateTime::now_utc();
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE nodes SET liveness = ?1, updated_at = ?2 WHERE id = ?3",
+            params![liveness.to_string(), now.unix_timestamp(), id.to_string()],
+        )?;
+        let mut body = serde_json::Map::new();
+        body.insert("liveness".to_string(), JsonValue::String(liveness.to_string()));
+        body.insert("reason".to_string(), JsonValue::String(reason.to_string()));
+        if let JsonValue::Object(extra_map) = extra {
+            for (k, v) in extra_map {
+                body.insert(k, v);
+            }
+        }
+        Self::record_event_with_conn(
+            &conn,
+            id,
+            NodeEventKind::LivenessChanged,
+            JsonValue::Object(body),
+        )?;
+        Ok(())
+    }
+
     pub fn set_node_external_id(&self, id: Uuid, external_id: Option<String>) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(

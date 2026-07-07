@@ -467,6 +467,12 @@ impl AsylumClient {
             .await
     }
 
+    pub async fn resume_node(&self, id: Uuid) -> Result<()> {
+        let path = format!("/api/nodes/{id}/resume");
+        self.send_request_no_content(reqwest::Method::POST, &path, Option::<&str>::None)
+            .await
+    }
+
     pub async fn archive_node(&self, id: Uuid) -> Result<()> {
         let path = format!("/api/nodes/{id}/archive");
         self.send_request_no_content(reqwest::Method::POST, &path, Option::<&str>::None)

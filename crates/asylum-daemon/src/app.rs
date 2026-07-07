@@ -79,6 +79,9 @@ pub async fn serve_with_socket(
 ) -> Result<()> {
     let state = build_state(bind, database, socket_path.clone(), config)?;
     let service_arc = Arc::new(state.service.clone());
+    // Reconcile persisted liveness against reality BEFORE binding listeners, so
+    // no client ever sees an eternal-Running lie left by the previous process.
+    service_arc.reconcile_on_boot().await;
     service_arc.start_background_tasks();
 
     let tcp_router = build_router_for_transport(state.clone(), true);
@@ -234,6 +237,7 @@ pub fn build_router_for_transport(state: Arc<AppState>, require_auth: bool) -> R
             post(api_node_harness_event),
         )
         .route("/api/nodes/{id}/interrupt", post(api_node_interrupt))
+        .route("/api/nodes/{id}/resume", post(api_node_resume))
         .route("/api/nodes/{id}/stop", post(api_node_stop))
         .route("/api/nodes/{id}/archive", post(api_node_archive))
         .route("/api/nodes/{id}/spawn", post(api_node_spawn_peer))
@@ -447,6 +451,20 @@ pub async fn api_node_interrupt(
     state
         .service
         .interrupt_node(id)
+        .await
+        .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn api_node_resume(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let id = Uuid::parse_str(&id)
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    state
+        .service
+        .resume_node(id)
         .await
         .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
     Ok(StatusCode::NO_CONTENT)

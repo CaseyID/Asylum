@@ -741,6 +741,41 @@ impl LoonSubstrate {
         self.runtimes.read().await.contains_key(external_id)
     }
 
+    /// Whether a VM with this instance id still exists on the loon host. Queries
+    /// the authenticated `/instances` listing (destroyed-hidden by default, so a
+    /// torn-down VM does not appear) and checks membership. Used by startup
+    /// reconciliation to distinguish a VM that outlived the daemon from one that
+    /// is already gone. Errors (host unreachable) propagate so the caller can be
+    /// conservative rather than silently declaring a VM dead.
+    pub async fn vm_exists(&self, external_id: &str) -> Result<bool> {
+        let base = self.api_base()?.to_string();
+        let key = self.api_key()?.to_string();
+        let http = self.http()?;
+        let resp = http
+            .get(format!("{base}/instances"))
+            .bearer_auth(&key)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .context("list loon instances")?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("loon /instances returned {}", resp.status()));
+        }
+        let value = resp
+            .json::<serde_json::Value>()
+            .await
+            .context("parse loon /instances body")?;
+        Ok(instance_ids(&value).iter().any(|id| id == external_id))
+    }
+
+    /// Tear a VM down by instance id (stop + rm + prune), regardless of whether an
+    /// in-memory runtime exists. Used by startup reconciliation to reclaim VMs
+    /// orphaned by a daemon restart (the guest workspace does not survive, so the
+    /// node is not resumable and the honest action is teardown).
+    pub async fn force_teardown(&self, external_id: &str) -> Result<()> {
+        self.teardown_vm(external_id).await
+    }
+
     pub async fn list_nodes(&self) -> Vec<Uuid> {
         self.runtimes
             .read()
@@ -1131,6 +1166,27 @@ fn count_running_instances(value: &serde_json::Value) -> Option<usize> {
             })
             .count(),
     )
+}
+
+/// Extract every instance id from a `/instances` listing body. Tolerant of the
+/// exact JSON shape (bare array or `{"instances": [...]}`) and of the id field
+/// name (`id`/`instance_id`/`vm_id`/`instanceId`), mirroring `parse_instance_id`.
+fn instance_ids(value: &serde_json::Value) -> Vec<String> {
+    let arr = value
+        .as_array()
+        .or_else(|| value.get("instances").and_then(|v| v.as_array()));
+    let mut out = Vec::new();
+    if let Some(arr) = arr {
+        for inst in arr {
+            for key in ["id", "instance_id", "vm_id", "instanceId"] {
+                if let Some(id) = inst.get(key).and_then(|v| v.as_str()) {
+                    out.push(id.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Parse the instance id from `loon --json vm create` output. Tolerant of the

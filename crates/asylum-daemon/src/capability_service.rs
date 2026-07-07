@@ -1883,7 +1883,14 @@ impl CapabilityService {
             .harnesses
             .get(&harness)
             .ok_or_else(|| anyhow!("missing harness adapter"))?;
-        let capabilities = adapter.capabilities();
+        let mut capabilities = adapter.capabilities();
+        if matches!(substrate, SubstrateKind::Loon) {
+            // Loon guest workspaces (and the in-guest harness session) do not
+            // survive a daemon restart or VM teardown, so a Loon node is not
+            // resumable even for a harness whose Local form is. Keep the stored
+            // capability honest.
+            capabilities.resume = false;
+        }
         let launch_command = match substrate {
             SubstrateKind::Local => {
                 resolve_command(adapter.command()).unwrap_or_else(|| adapter.command().to_string())
@@ -2051,6 +2058,281 @@ impl CapabilityService {
         Ok(NodeCreateResponse {
             node_id: node.id.to_string(),
         })
+    }
+
+    /// Reconcile persisted node liveness against reality at daemon boot. Every
+    /// in-memory runtime (Local PTYs, Loon attach/SSE tasks) died with the
+    /// previous daemon process, so any node the DB still marks live is a lie
+    /// until proven otherwise. This is the single place that clears
+    /// eternal-Running rows; `list_nodes_by_liveness` finally earns its keep.
+    /// Runs to completion before the HTTP listeners bind, so no client ever
+    /// observes a stale liveness.
+    pub async fn reconcile_on_boot(&self) {
+        // Liveness values that imply a live runtime the daemon no longer has.
+        let stale_states = [
+            NodeLiveness::Starting,
+            NodeLiveness::Running,
+            NodeLiveness::WaitingForInput,
+        ];
+        let mut reconciled = 0usize;
+        for state in stale_states {
+            let nodes = match self.store.list_nodes_by_liveness(state.clone()) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(error = %e, ?state, "reconcile: failed to list nodes by liveness");
+                    continue;
+                }
+            };
+            for node in nodes {
+                match node.substrate {
+                    SubstrateKind::Local => {
+                        // All local PTYs died with the daemon; nothing to query.
+                        let resumable = self.local_node_resumable(&node);
+                        self.mark_reconciled(
+                            &node,
+                            "reconciled_local_pty_lost",
+                            resumable,
+                            None,
+                        );
+                    }
+                    SubstrateKind::Loon => self.reconcile_loon_node(&node).await,
+                }
+                reconciled += 1;
+            }
+        }
+        if reconciled > 0 {
+            tracing::info!(reconciled, "startup reconciliation marked stale-live nodes honestly");
+        }
+    }
+
+    /// A Local node is resumable iff it recorded a harness session id and its
+    /// workspace still exists on disk (claude `--resume` is cwd-scoped; codex
+    /// `resume` reads the rollout under the same session id).
+    fn local_node_resumable(&self, node: &NodeRecord) -> bool {
+        let has_session = node
+            .harness_session_id
+            .as_deref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let workspace_ok = node
+            .workspace
+            .as_deref()
+            .map(|w| !w.is_empty() && std::path::Path::new(w).is_dir())
+            .unwrap_or(false);
+        has_session && workspace_ok
+    }
+
+    async fn reconcile_loon_node(&self, node: &NodeRecord) {
+        let loon = match &self.loon_substrate {
+            Some(loon) => loon,
+            None => {
+                // Node was created against Loon but the substrate is now disabled;
+                // we cannot query the host. Mark honestly, not resumable.
+                self.mark_reconciled(node, "reconciled_loon_substrate_disabled", false, None);
+                return;
+            }
+        };
+        let external_id = match node.external_id.as_deref() {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => {
+                self.mark_reconciled(node, "reconciled_loon_no_vm", false, None);
+                return;
+            }
+        };
+        match loon.vm_exists(&external_id).await {
+            Ok(true) => {
+                // The VM outlived the daemon but the attach/SSE runtime (and the
+                // original PTY exec id) died with it. We cannot re-attach to the
+                // orphaned exec, and launching a competing `--resume` against a
+                // still-live guest harness would risk corrupting the session. The
+                // guest workspace dies with the VM regardless, so the honest,
+                // cheap action is teardown + mark Stopped (not resumable).
+                // Adopt-and-resume-in-guest is future work (needs exec-id
+                // persistence across restarts).
+                let _ = loon.force_teardown(&external_id).await;
+                self.mark_reconciled(
+                    node,
+                    "reconciled_loon_vm_orphaned_torn_down",
+                    false,
+                    Some(&external_id),
+                );
+            }
+            Ok(false) => {
+                // VM already gone; prune any tombstone and mark honestly.
+                let _ = loon.force_teardown(&external_id).await;
+                self.mark_reconciled(node, "reconciled_loon_vm_gone", false, Some(&external_id));
+            }
+            Err(e) => {
+                // Host unreachable: we still have no live runtime, so the node is
+                // not Running here — mark Stopped, but do not attempt teardown
+                // against an unreachable host.
+                tracing::warn!(error = %e, node_id = %node.id, "reconcile: loon host unreachable; marking stopped without teardown");
+                self.mark_reconciled(
+                    node,
+                    "reconciled_loon_host_unreachable",
+                    false,
+                    Some(&external_id),
+                );
+            }
+        }
+    }
+
+    /// Record the honest liveness transition for a reconciled node: Stopped plus
+    /// a `LivenessChanged` event carrying the reason and whether the node stayed
+    /// resumable. Uses the existing event-catalog kind (no new kinds invented).
+    fn mark_reconciled(
+        &self,
+        node: &NodeRecord,
+        reason: &str,
+        resumable: bool,
+        external_id: Option<&str>,
+    ) {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "substrate".to_string(),
+            json!(node.substrate.to_string()),
+        );
+        extra.insert("resumable".to_string(), json!(resumable));
+        extra.insert("previous".to_string(), json!(node.liveness.to_string()));
+        if let Some(id) = external_id {
+            extra.insert("external_id".to_string(), json!(id));
+        }
+        if let Err(e) = self.store.set_node_liveness_with_reason(
+            node.id,
+            NodeLiveness::Stopped,
+            reason,
+            JsonValue::Object(extra),
+        ) {
+            tracing::warn!(error = %e, node_id = %node.id, "reconcile: failed to record honest liveness");
+        } else {
+            tracing::info!(node_id = %node.id, reason, resumable, "reconciled node to Stopped");
+        }
+    }
+
+    /// Resume a previously-stopped node in its SAME row/workspace: relaunch the
+    /// harness against its recorded session id (claude `--resume`, codex
+    /// `resume`) with all W3 injection intact, so context survives and the
+    /// SessionStart hook posts source=resume. Honest failures: no recorded
+    /// session id, workspace missing, node not in a resumable state, or a
+    /// harness/substrate that cannot resume.
+    pub async fn resume_node(&self, node_id: Uuid) -> Result<()> {
+        let node = self.store.get_node(node_id)?.context("node not found")?;
+
+        let session_id = node
+            .harness_session_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow!("node has no recorded harness session id; nothing to resume")
+            })?
+            .to_string();
+
+        match node.liveness {
+            NodeLiveness::Stopped | NodeLiveness::Exited | NodeLiveness::Failed => {}
+            NodeLiveness::Running | NodeLiveness::Starting | NodeLiveness::WaitingForInput => {
+                return Err(anyhow!(
+                    "node is already live ({}); resume only applies to a stopped session",
+                    node.liveness
+                ));
+            }
+            NodeLiveness::Archived => {
+                return Err(anyhow!(
+                    "node is archived; create a new node instead of resuming"
+                ));
+            }
+        }
+
+        let harness = node.harness.clone();
+        let adapter = self
+            .harnesses
+            .get(&harness)
+            .ok_or_else(|| anyhow!("missing harness adapter"))?;
+
+        match node.substrate {
+            SubstrateKind::Local => {
+                if self.local_substrate.has_runtime(node_id).await {
+                    return Err(anyhow!("node already has a live runtime; not resuming"));
+                }
+                let workspace = node
+                    .workspace
+                    .as_deref()
+                    .filter(|w| !w.is_empty())
+                    .ok_or_else(|| {
+                        anyhow!("node has no workspace; resume is workspace-scoped")
+                    })?;
+                if !std::path::Path::new(workspace).is_dir() {
+                    return Err(anyhow!(
+                        "node workspace {workspace} no longer exists; cannot resume"
+                    ));
+                }
+
+                let asylum_binary = current_asylum_binary();
+                let args = adapter
+                    .resume_args(
+                        &session_id,
+                        &asylum_binary,
+                        &DaemonResolution::Socket(self.config.socket_path.as_deref()),
+                        node.id,
+                    )
+                    .ok_or_else(|| anyhow!("harness {harness} does not support resume"))?;
+                let env =
+                    self.local_launch_env(&node, &harness, &node.substrate, &node.capabilities)?;
+                let launch_command = resolve_command(adapter.command())
+                    .unwrap_or_else(|| adapter.command().to_string());
+
+                // Re-assert workspace trust (idempotent) before relaunch.
+                if let Err(e) = adapter.pre_trust_workspace(workspace) {
+                    return Err(anyhow!("pre_trust_workspace failed: {e}"));
+                }
+
+                let context = SubstrateContext {
+                    node_id: node.id,
+                    harness: harness.clone(),
+                    command: launch_command,
+                    args,
+                    workspace: node.workspace.clone(),
+                    env,
+                    // No launch prompt: resume restores the prior session's
+                    // context and waits. The caller drives it with the next
+                    // send_input; re-submitting the instruction prompt would
+                    // start a fresh task on top of the resumed history.
+                    launch_prompt: None,
+                };
+                if let Err(launch_err) = self.local_substrate.launch(context).await {
+                    let _ = self.store.set_node_liveness(node.id, NodeLiveness::Failed);
+                    let _ = self.store.record_event(
+                        node.id,
+                        NodeEventKind::HarnessFailure,
+                        json!({ "error": launch_err.to_string(), "phase": "resume" }),
+                    );
+                    return Err(anyhow!("resume launch failed: {launch_err}"));
+                }
+                self.store.set_node_liveness_with_reason(
+                    node.id,
+                    NodeLiveness::Running,
+                    "resumed",
+                    json!({ "harness_session_id": session_id }),
+                )?;
+                self.post_hook_event(
+                    "node.resumed",
+                    Some(node.id),
+                    json!({
+                        "node": {
+                            "id": node.id.to_string(),
+                            "harness": harness.to_string(),
+                            "substrate": "local",
+                        },
+                        "harness_session_id": session_id,
+                    }),
+                );
+                Ok(())
+            }
+            SubstrateKind::Loon => Err(anyhow!(
+                "resume is not supported for Loon nodes: the guest workspace and harness \
+                 session do not survive a daemon restart or VM teardown. Create a new Loon \
+                 node instead."
+            )),
+        }
     }
 
     fn local_launch_env(
@@ -6195,6 +6477,7 @@ mod tests {
             "node.session_end",
             "node.exited",
             "node.errored",
+            "node.resumed",
             "channel.inbound",
             "schedule.5m",
             "schedule.30m",
@@ -6594,6 +6877,247 @@ mod tests {
             "resolve_decision feedback did not reach node stdin; sink: {:?}",
             std::fs::read_to_string(&sink_path).unwrap_or_default()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_marks_stale_local_running_node_stopped_and_resumable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let workspace = workdir.path().join("ws");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        // A node the previous daemon left marked Running, with a recorded session
+        // id and an existing workspace: resumable after honest reconciliation.
+        let node = store.insert_node(
+            HarnessKind::ClaudeCode,
+            SubstrateKind::Local,
+            "worker",
+            Some(&workspace.display().to_string()),
+            None,
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        store.set_node_harness_session_id(node.id, Some(&Uuid::new_v4().to_string()))?;
+        store.set_node_liveness(node.id, NodeLiveness::Running)?;
+
+        service.reconcile_on_boot().await;
+
+        let after = store.get_node(node.id)?.expect("node exists");
+        assert_eq!(
+            after.liveness,
+            NodeLiveness::Stopped,
+            "stale-live local node must be marked honestly, not left Running"
+        );
+        let events = store.list_events(node.id)?;
+        let liveness_event = events
+            .iter()
+            .rev()
+            .find(|e| e.kind == NodeEventKind::LivenessChanged)
+            .expect("a LivenessChanged event must be recorded");
+        assert_eq!(liveness_event.body["reason"], "reconciled_local_pty_lost");
+        assert_eq!(liveness_event.body["resumable"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_marks_local_node_without_session_not_resumable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        // No recorded session id and no workspace -> honest Stopped, not resumable.
+        let node = store.insert_node(
+            HarnessKind::ClaudeCode,
+            SubstrateKind::Local,
+            "worker",
+            None,
+            None,
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        store.set_node_liveness(node.id, NodeLiveness::WaitingForInput)?;
+
+        service.reconcile_on_boot().await;
+
+        let after = store.get_node(node.id)?.expect("node exists");
+        assert_eq!(after.liveness, NodeLiveness::Stopped);
+        let events = store.list_events(node.id)?;
+        let liveness_event = events
+            .iter()
+            .rev()
+            .find(|e| e.kind == NodeEventKind::LivenessChanged)
+            .expect("a LivenessChanged event must be recorded");
+        assert_eq!(liveness_event.body["resumable"], false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_node_without_session_id() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let node = store.insert_node(
+            HarnessKind::ClaudeCode,
+            SubstrateKind::Local,
+            "worker",
+            None,
+            None,
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        store.set_node_liveness(node.id, NodeLiveness::Stopped)?;
+
+        let err = service.resume_node(node.id).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no recorded harness session id"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_live_node() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let workspace = workdir.path().join("ws");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let node = store.insert_node(
+            HarnessKind::ClaudeCode,
+            SubstrateKind::Local,
+            "worker",
+            Some(&workspace.display().to_string()),
+            None,
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        store.set_node_harness_session_id(node.id, Some(&Uuid::new_v4().to_string()))?;
+        store.set_node_liveness(node.id, NodeLiveness::Running)?;
+
+        let err = service.resume_node(node.id).await.unwrap_err();
+        assert!(
+            err.to_string().contains("already live"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_missing_workspace() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let missing = workdir.path().join("gone");
+        let node = store.insert_node(
+            HarnessKind::ClaudeCode,
+            SubstrateKind::Local,
+            "worker",
+            Some(&missing.display().to_string()),
+            None,
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        store.set_node_harness_session_id(node.id, Some(&Uuid::new_v4().to_string()))?;
+        store.set_node_liveness(node.id, NodeLiveness::Stopped)?;
+
+        let err = service.resume_node(node.id).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no longer exists"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_loon_node_honestly() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let node = store.insert_node(
+            HarnessKind::ClaudeCode,
+            SubstrateKind::Loon,
+            "worker",
+            Some("/work"),
+            None,
+            Some("loon-instance-1"),
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        store.set_node_harness_session_id(node.id, Some(&Uuid::new_v4().to_string()))?;
+        store.set_node_liveness(node.id, NodeLiveness::Stopped)?;
+
+        let err = service.resume_node(node.id).await.unwrap_err();
+        assert!(
+            err.to_string().contains("not supported for Loon"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_relaunches_stopped_local_node() -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        // A fake harness that stays alive so resume drives it to Running.
+        let script_path = workdir.path().join("fake-harness.sh");
+        write_executable_script(
+            &script_path,
+            "#!/bin/sh\ntrap '' INT\nwhile true; do sleep 1; done\n",
+        )?;
+
+        let _home = EnvVarGuard::set_var("HOME", &home);
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        // A stopped codex node with a recorded thread-id and a live workspace.
+        let node = store.insert_node(
+            HarnessKind::Codex,
+            SubstrateKind::Local,
+            "worker",
+            Some(&workspace.display().to_string()),
+            None,
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        let thread_id = Uuid::new_v4().to_string();
+        store.set_node_harness_session_id(node.id, Some(&thread_id))?;
+        store.set_node_liveness(node.id, NodeLiveness::Stopped)?;
+
+        service.resume_node(node.id).await?;
+        wait_for_liveness(&store, node.id, NodeLiveness::Running).await?;
+
+        // Session id is preserved and a node.resumed lifecycle event was posted.
+        let after = store.get_node(node.id)?.expect("node exists");
+        assert_eq!(after.harness_session_id.as_deref(), Some(thread_id.as_str()));
+
+        let _ = service.stop_node(node.id).await;
         Ok(())
     }
 }
