@@ -74,10 +74,24 @@ Local-only mission work; not released. Last published release: v0.1.10 (2026-05-
 
 Live spawn-peer test PASSED the core capability: a supervisor claude node, via injected MCP, called node.spawn_peer and produced a real second live claude session + a correctly-typed `spawned_for` relationship edge; two independent `claude`+`asylum mcp` process trees confirmed; supervisor also called node.list (got 2) and reported back. MCP injection (`--mcp-config`, `--strict-mcp-config`, ASYLUM_NODE_ID/SOCKET env, `--allowedTools mcp__asylum__*`) works. Bugs found → W0. Also noted: `node.spawn_peer` MCP tool takes `description` not `prompt` (the supervisor adapted); W4/W3 should consider exposing an explicit initial-prompt param for spawned peers so a supervisor's intended first instruction is delivered as the worker's submitted prompt.
 
+## W1 delivered contract (merged to main f7186bb, 2026-07-06)
+
+W2/W3 build against this:
+- Ingestion: `POST /api/nodes/{id}/harness-event`, protected router (owner-token, socket + HTTP). Body: `{ "source": "claude_hook"|"claude_statusline"|"codex_notify", "payload": <verbatim harness JSON> }`. Response 200: `{ "accepted": bool, "event": <mapped kind|omitted>, "session_id": <recorded|omitted> }`. 400 on bad UUID / node-not-found / bad body. Mapping is entirely daemon-side — the CLI bridge just forwards source+payload.
+- Mapping: claude_hook dispatches on `hook_event_name` (Stop→turn_complete, SessionStart→session_started, SessionEnd→session_end, PostToolUse→tool_call, Notification by `type`: permission_prompt/agent_needs_input/elicitation*→awaiting_input, idle_prompt→idle, agent_completed→turn_complete). codex_notify agent-turn-complete→turn_complete (session id from `thread-id`). claude_statusline reads `context_window.used_percentage`, updates ctx_pct, fires node.ctx_pressure on threshold crossings (config `[autonomy] ctx_pressure_thresholds` default [75,90]).
+- Catalog (13, final): graph.spawn, node.session_started, node.turn_complete, node.awaiting_input, node.idle, node.ctx_pressure, node.tool_call, node.session_end, node.exited, node.errored, channel.inbound, schedule.5m, schedule.30m. (removed permission_requested→merged into awaiting_input; removed substrate.unreachable, schedule.cron.)
+- Liveness: awaiting_input→WaitingForInput; turn_complete/idle/session_started/tool_call→Running; session_end/ctx_pressure→no change; terminal nodes reject but still record session id.
+- Interrupt now sends Ctrl-C only (no forced Stopped/exited). Exit sink: clean exit→Stopped+node.exited(exit_code); abnormal→Failed+node.errored. Quiescence idle: 30s sweep fires node.idle for Running Local nodes with native_idle_signal()==false (codex) after autonomy.idle_quiescence_seconds (default 120); claude skipped (native idle via Notification).
+- Schema: nullable nodes.harness_session_id (ensure_column migration). New config `[autonomy]`.
+
 ## Status
 
-- W0: not started (input delivery bugs from E2E)
-- W1: in progress (agent worktree phase-b-w1-event-ingestion; ~630 insertions across 12 files; not yet reported complete)
+- W0: not started (input delivery bugs from E2E; note: interrupt/exit already fixed in W1, so W0 is now just the two send_input/launch-submit bugs, both in substrate/local.rs + harness launch)
+- W1: COMPLETE — merged to main f7186bb; 136 daemon-lib tests green (+12).
+- W2 (CLI bridge `asylum harness-event`): not started — build against the delivered contract above.
+- W3 (launch injection: --session-id, --settings hooks+statusLine for claude; -c notify for codex): not started.
+- W4 (hook actions send_input + honest spawn, delete recipes; decision producer from awaiting_input; resolve_decision feedback injection): not started.
+- W5 (cockpit: catalog-matched pickers, decision surfacing, liveness chips): not started.
 - W2: not started
 - W3: not started
 - W4: not started
