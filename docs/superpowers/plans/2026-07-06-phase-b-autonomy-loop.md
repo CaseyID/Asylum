@@ -68,7 +68,7 @@ Order: W1 first (contract), then W2+W3+W4 in parallel (W2/W3 pair on the bridge 
 
 ## Release status
 
-Local-only mission work; not released. Last published release: v0.1.10 (2026-05-07).
+Shipped in asylum v0.2.0 (published 2026-07-07, deployed locally). See RELEASES.md ledger.
 
 ## E2E baseline (2026-07-06)
 
