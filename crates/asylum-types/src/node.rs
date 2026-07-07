@@ -18,6 +18,10 @@ pub struct NodeRecord {
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
     pub external_id: Option<String>,
+    /// Harness-native session identity recorded from the harness-event bridge
+    /// (claude `session_id`, codex `thread-id`). Resume key for Phase C.
+    #[serde(default)]
+    pub harness_session_id: Option<String>,
     pub capabilities: CapabilitySnapshot,
     #[serde(default)]
     pub tokens_in: u64,
@@ -97,6 +101,7 @@ impl Default for NodeRecord {
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
             external_id: None,
+            harness_session_id: None,
             capabilities: CapabilitySnapshot::default(),
             tokens_in: 0,
             tokens_out: 0,
@@ -215,6 +220,7 @@ mod tests {
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
             external_id: None,
+            harness_session_id: Some("sess-1".to_string()),
             capabilities: CapabilitySnapshot {
                 browser_attach: true,
                 native_attach: true,

@@ -17,6 +17,8 @@ pub struct AsylumConfig {
     pub ntfy: NtfyConfig,
     #[serde(default)]
     pub workspace: WorkspaceConfig,
+    #[serde(default)]
+    pub autonomy: AutonomyConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,6 +38,27 @@ impl Default for AsylumConfig {
             loon: LoonConfig::default(),
             ntfy: NtfyConfig::default(),
             workspace: WorkspaceConfig::default(),
+            autonomy: AutonomyConfig::default(),
+        }
+    }
+}
+
+/// Tunables for the daemon-side autonomy signals (Phase B).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AutonomyConfig {
+    /// Context-window usage percentages (0-100) that fire `node.ctx_pressure`
+    /// when crossed. Each threshold fires at most once per harness session.
+    pub ctx_pressure_thresholds: Vec<f64>,
+    /// Seconds of no PTY output on a Running local node before the quiescence
+    /// timer fires `node.idle` (only for harnesses without a native idle signal).
+    pub idle_quiescence_seconds: u64,
+}
+
+impl Default for AutonomyConfig {
+    fn default() -> Self {
+        Self {
+            ctx_pressure_thresholds: vec![75.0, 90.0],
+            idle_quiescence_seconds: 120,
         }
     }
 }

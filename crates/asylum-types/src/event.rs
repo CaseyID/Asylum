@@ -38,4 +38,8 @@ pub enum NodeEventKind {
     NotificationSent,
     RemoteCommandReceived,
     AttachIssued,
+    /// A harness-native signal ingested via the daemon's harness-event bridge
+    /// (claude hooks / statusline, codex notify). The stringly-typed hook event
+    /// kind and its detail live in the body under `event`/`source`.
+    HarnessEvent,
 }

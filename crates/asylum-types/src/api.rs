@@ -79,6 +79,29 @@ pub struct SendInputRequest {
     pub text: String,
 }
 
+/// A raw harness-native signal posted by the CLI bridge (claude hooks /
+/// statusline, codex notify). The daemon maps `(source, payload)` to a node
+/// event kind; the CLI stays thin and does no interpretation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HarnessEventRequest {
+    /// One of `claude_hook`, `claude_statusline`, `codex_notify`.
+    pub source: String,
+    /// The verbatim harness payload (claude hook stdin JSON, statusline stdin
+    /// JSON, or codex notify argv JSON).
+    pub payload: serde_json::Value,
+}
+
+/// Result of ingesting a harness event: whether it was accepted, the mapped
+/// node event kind (if any fired), and any harness session id recorded.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HarnessEventResponse {
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttachRequest {
     pub include_input: bool,
