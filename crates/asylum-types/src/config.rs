@@ -71,9 +71,9 @@ pub struct AuthConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HarnessConfig {
-    #[serde(default)]
+    #[serde(default = "default_codex_command")]
     pub codex_command: String,
-    #[serde(default)]
+    #[serde(default = "default_claude_command")]
     pub claude_command: String,
     #[serde(default)]
     pub default_workspace_root: Option<PathBuf>,
@@ -81,11 +81,19 @@ pub struct HarnessConfig {
     pub startup_args: BTreeMap<String, Vec<String>>,
 }
 
+fn default_codex_command() -> String {
+    "codex".to_string()
+}
+
+fn default_claude_command() -> String {
+    "claude".to_string()
+}
+
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
-            codex_command: "codex".to_string(),
-            claude_command: "claude".to_string(),
+            codex_command: default_codex_command(),
+            claude_command: default_claude_command(),
             default_workspace_root: None,
             startup_args: BTreeMap::new(),
         }
@@ -211,5 +219,42 @@ pub struct WorkspaceConfig {
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self { recent_limit: 20 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: a `[harness]` table that sets only some keys must still default
+    // the harness commands to their real names. Field-level `#[serde(default)]`
+    // uses the field TYPE's Default (empty String), NOT `HarnessConfig::default`,
+    // so an omitted `claude_command` used to deserialize to "" — which the Loon
+    // substrate launched as `exec ""` in-guest (exit 126, zero output).
+    #[test]
+    fn partial_harness_table_defaults_commands_to_binary_names() {
+        let cfg: AsylumConfig = toml::from_str(
+            "base_url = \"http://127.0.0.1:7798\"\n[harness]\ndefault_workspace_root = \"/tmp/ws\"\n",
+        )
+        .expect("parse config");
+        assert_eq!(cfg.harness.claude_command, "claude");
+        assert_eq!(cfg.harness.codex_command, "codex");
+    }
+
+    #[test]
+    fn explicit_harness_commands_are_honored() {
+        let cfg: AsylumConfig = toml::from_str(
+            "[harness]\nclaude_command = \"/opt/claude\"\ncodex_command = \"/opt/codex\"\n",
+        )
+        .expect("parse config");
+        assert_eq!(cfg.harness.claude_command, "/opt/claude");
+        assert_eq!(cfg.harness.codex_command, "/opt/codex");
+    }
+
+    #[test]
+    fn absent_harness_table_defaults_commands() {
+        let cfg: AsylumConfig = toml::from_str("base_url = \"x\"\n").expect("parse config");
+        assert_eq!(cfg.harness.claude_command, "claude");
+        assert_eq!(cfg.harness.codex_command, "codex");
     }
 }

@@ -1,3 +1,21 @@
+# RESOLUTION (2026-07-07, superseding successor) — the 126 was a config bug, not an environmental regression
+
+The "Root blocker for checks 2 & 3" below (claude 2.1.202 fails under loon PTY) is RETRACTED.
+Actual root cause: `HarnessConfig.claude_command` used field-level `#[serde(default)]`, which
+defaults an omitted key to `String::default()` = "" (not `HarnessConfig::default`'s "claude").
+The final-check config's `[harness]` table omitted claude_command, so the Loon substrate launched
+`exec ""` in-guest -> exit 126, zero output. The acceptance run had no `[harness]` table -> "claude"
+default -> its loon worker launched fine on the SAME 2.1.202 image. Proven by instrumenting exec_pty
+(captured the empty argv element) and by reproducing the exact loon PTY exec by hand (claude 2.1.202
+launched cleanly). FIXED on phase-d-final (serde defaults + empty-command guard + regression tests).
+Post-fix, a loon/claude node reached session_started -> turn_complete -> idle. C1 stream-loss and M4
+send-after-sever then PASSED LIVE. Full detail: mission spec "Phase D FINAL LIVE CHECK — RESOLUTION"
+and jobs/c4517aa5/tmp/final-check-evidence/RESOLUTION-126-root-cause.txt + C1-M4-live-results.txt.
+The host CHECK 0 "output.write assertion" crash is a separate LOCAL-portable_pty follow-up, unrelated
+to the loon 126.
+
+---
+
 # Phase D FINAL LIVE CHECK — HANDOFF
 
 Branch phase-d-final (= main 1c93ab4). Re-validated the 3 behaviors that changed after the
