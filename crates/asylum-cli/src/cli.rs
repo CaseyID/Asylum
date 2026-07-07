@@ -718,6 +718,8 @@ enum TokenCommand {
     Issue {
         #[arg(long)]
         name: String,
+        /// Advisory labels only: every issued token grants full access in
+        /// v0.1.x. Recorded for future per-route enforcement, not enforced today.
         #[arg(long)]
         scope: Vec<String>,
         #[arg(long)]
