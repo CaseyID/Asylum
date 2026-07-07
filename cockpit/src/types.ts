@@ -306,6 +306,12 @@ export interface HealthResponse {
   database_path: string;
   database_size_bytes: number;
   transcripts_dir: string;
+  // D2: daemon-provided uptime (was previously derived client-side from
+  // per-node created_at only; the daemon itself did not expose its own
+  // start time). Optional so fixtures/tests that predate the field still
+  // type-check.
+  daemon_started_at_epoch_secs?: number;
+  uptime_seconds?: number;
 }
 
 export interface TokenSummary {

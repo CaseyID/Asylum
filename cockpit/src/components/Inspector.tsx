@@ -1,6 +1,7 @@
 import { Fragment, type JSX } from "react";
 import { Btn, KV, Pill } from "../lib/ui";
 import {
+  canResumeNode,
   harnessLabel,
   roleGlyph,
   shortNodeId,
@@ -17,8 +18,8 @@ export type InspectorAction =
   | "interrupt"
   | "fork"
   | "stop"
-  | "terminate"
-  | "archive";
+  | "archive"
+  | "resume";
 
 export interface InspectorProps {
   node?: AsylumNode;
@@ -185,11 +186,20 @@ export function Inspector({
             <Btn
               size="sm"
               kind="danger"
-              icon="x"
-              onClick={() => onAction("terminate")}
+              icon="archive"
+              onClick={() => onAction("archive")}
             >
-              terminate
+              archive
             </Btn>
+            {canResumeNode(node) && (
+              <Btn
+                size="sm"
+                icon="play"
+                onClick={() => onAction("resume")}
+              >
+                resume
+              </Btn>
+            )}
           </div>
           <div style={{ marginTop: 10 }}>
             <Btn

@@ -147,3 +147,58 @@ describe("Inspector W5 decision + session surfacing", () => {
     expect(container.textContent).toContain("sess-xyz");
   });
 });
+
+// D2 — the danger "terminate" button was a mislabeled duplicate of "stop"
+// (App.tsx routed both to the same stopNode call); it is now a real "archive"
+// action, and a gated "resume" button appears for stopped-but-resumable nodes.
+describe("Inspector controls (D2 stop/archive/resume truth)", () => {
+  it("no longer offers a 'terminate' action — archive replaces it", () => {
+    const node = makeNode("worker-abc123");
+    const { queryByRole, getByRole } = render(
+      <Inspector node={node} onAction={vi.fn()} onOpen={vi.fn()} />,
+    );
+
+    expect(queryByRole("button", { name: "terminate" })).toBeNull();
+    expect(getByRole("button", { name: "archive" })).toBeDefined();
+  });
+
+  it("archive button calls onAction('archive')", () => {
+    const node = makeNode("worker-abc123");
+    const onAction = vi.fn();
+    const { getByRole } = render(
+      <Inspector node={node} onAction={onAction} onOpen={vi.fn()} />,
+    );
+
+    getByRole("button", { name: "archive" }).click();
+    expect(onAction).toHaveBeenCalledWith("archive");
+  });
+
+  it("shows a resume button for a stopped node with a harness_session_id", () => {
+    const node = { ...makeNode("worker-abc123"), liveness: "stopped" as const, harness_session_id: "sess-1" };
+    const onAction = vi.fn();
+    const { getByRole } = render(
+      <Inspector node={node} onAction={onAction} onOpen={vi.fn()} />,
+    );
+
+    getByRole("button", { name: "resume" }).click();
+    expect(onAction).toHaveBeenCalledWith("resume");
+  });
+
+  it("hides the resume button when the node is running", () => {
+    const node = { ...makeNode("worker-abc123"), liveness: "running" as const, harness_session_id: "sess-1" };
+    const { queryByRole } = render(
+      <Inspector node={node} onAction={vi.fn()} onOpen={vi.fn()} />,
+    );
+
+    expect(queryByRole("button", { name: "resume" })).toBeNull();
+  });
+
+  it("hides the resume button when stopped but no harness_session_id is recorded", () => {
+    const node = { ...makeNode("worker-abc123"), liveness: "stopped" as const };
+    const { queryByRole } = render(
+      <Inspector node={node} onAction={vi.fn()} onOpen={vi.fn()} />,
+    );
+
+    expect(queryByRole("button", { name: "resume" })).toBeNull();
+  });
+});

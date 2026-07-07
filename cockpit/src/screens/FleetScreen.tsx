@@ -15,7 +15,7 @@ import {
   uptimeLabel,
   previewFor,
 } from "../lib/glyphs";
-import type { AsylumNode, UiState } from "../types";
+import type { AsylumNode, GraphRelationship, UiState } from "../types";
 
 export interface FleetScreenProps {
   nodes: AsylumNode[];
@@ -23,13 +23,36 @@ export interface FleetScreenProps {
   onOpen: (node: AsylumNode) => void;
   // node ids with an unresolved pending decision (W5 decision surfacing).
   pendingDecisionNodeIds?: Set<string>;
+  // D2: spawn_peer lineage — graph relationships, used to show each node's
+  // spawning parent (the same edge data the Graph view already renders as a
+  // dashed spawned_for line).
+  relationships?: GraphRelationship[];
 }
 
 const STATE_FILTERS: ("all" | UiState)[] = ["all", "running", "waiting", "idle", "errored", "stopped", "archived"];
 
-export function FleetScreen({ nodes, onLaunch, onOpen, pendingDecisionNodeIds }: FleetScreenProps): JSX.Element {
+export function FleetScreen({
+  nodes,
+  onLaunch,
+  onOpen,
+  pendingDecisionNodeIds,
+  relationships,
+}: FleetScreenProps): JSX.Element {
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState<(typeof STATE_FILTERS)[number]>("all");
+
+  // D2: first relationship targeting a node is treated as its spawning
+  // parent for display, matching App.tsx's graphNodes derivation for the
+  // Graph view.
+  const parentByChild = useMemo(() => {
+    const map = new Map<string, { parentId: string; kind: string }>();
+    for (const rel of relationships ?? []) {
+      if (!map.has(rel.target_node_id)) {
+        map.set(rel.target_node_id, { parentId: rel.source_node_id, kind: rel.kind });
+      }
+    }
+    return map;
+  }, [relationships]);
 
   const filtered = useMemo(() => {
     return nodes.filter((n) => {
@@ -118,6 +141,7 @@ export function FleetScreen({ nodes, onLaunch, onOpen, pendingDecisionNodeIds }:
             <th style={{ width: 110 }}>role</th>
             <th style={{ width: 130 }}>harness</th>
             <th style={{ width: 110 }}>substrate</th>
+            <th style={{ width: 100 }}>lineage</th>
             <th style={{ width: 110 }}>state</th>
             <th>preview</th>
             <th style={{ width: 80 }} className="right">
@@ -155,6 +179,23 @@ export function FleetScreen({ nodes, onLaunch, onOpen, pendingDecisionNodeIds }:
                 <td className="mono muted">{n.role_hint}</td>
                 <td className="mono">{harnessLabel(n.harness)}</td>
                 <td className="mono muted">{n.substrate}</td>
+                <td className="mono muted" onClick={(e) => e.stopPropagation()}>
+                  {(() => {
+                    const rel = parentByChild.get(n.id);
+                    if (!rel) return "—";
+                    const parent = nodes.find((p) => p.id === rel.parentId);
+                    if (!parent) return `← ${shortNodeId(rel.parentId)}`;
+                    return (
+                      <a
+                        style={{ color: "var(--fg)", cursor: "pointer" }}
+                        title={rel.kind}
+                        onClick={() => onOpen(parent)}
+                      >
+                        ← {shortNodeId(rel.parentId)}
+                      </a>
+                    );
+                  })()}
+                </td>
                 <td>
                   <Pill status={state}>{uiStateLabel(state)}</Pill>
                 </td>
@@ -171,7 +212,7 @@ export function FleetScreen({ nodes, onLaunch, onOpen, pendingDecisionNodeIds }:
           })}
           {filtered.length === 0 && (
             <tr>
-              <td colSpan={10} style={{ textAlign: "center", padding: 32, color: "var(--fg-muted)" }}>
+              <td colSpan={11} style={{ textAlign: "center", padding: 32, color: "var(--fg-muted)" }}>
                 no nodes match the filter
               </td>
             </tr>

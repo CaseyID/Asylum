@@ -72,17 +72,32 @@ export function harnessLabel(harness: string): string {
   return harness;
 }
 
-// approximate uptime from created_at; the daemon does not yet expose duration.
-export function uptimeLabel(node: AsylumNode): string {
-  const created = Date.parse(node.created_at);
-  if (!Number.isFinite(created)) return "—";
-  const ms = Date.now() - created;
-  const sec = Math.max(0, Math.floor(ms / 1000));
+// format a duration given in whole seconds as a short, human label.
+// Shared by node uptime (derived from the node's own created_at, which is
+// real daemon-assigned data) and daemon uptime (D2: now provided directly by
+// /health as uptime_seconds, no client-side clock derivation required).
+export function formatDurationSeconds(totalSeconds: number): string {
+  const sec = Math.max(0, Math.floor(totalSeconds));
   if (sec < 60) return `${sec}s`;
   const min = Math.floor(sec / 60);
   if (min < 60) return `${min}m ${sec % 60}s`;
   const hr = Math.floor(min / 60);
   return `${hr}h ${min % 60}m`;
+}
+
+export function uptimeLabel(node: AsylumNode): string {
+  const created = Date.parse(node.created_at);
+  if (!Number.isFinite(created)) return "—";
+  const ms = Date.now() - created;
+  return formatDurationSeconds(ms / 1000);
+}
+
+// D2: resume affordance eligibility — a node can be resumed only when it is
+// stopped (not archived/failed/still-running) and the harness recorded a
+// session id we can hand back to `claude --resume`/`codex resume` (via the
+// daemon's POST /api/nodes/:id/resume once that route lands).
+export function canResumeNode(node: AsylumNode): boolean {
+  return node.liveness === "stopped" && Boolean(node.harness_session_id);
 }
 
 // telemetry projects daemon-side counters from the events table; see crates/asylum-daemon/src/storage.rs::hydrate_node_telemetry.

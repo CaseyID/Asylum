@@ -171,7 +171,7 @@ export async function createNode(payload: CreateNodeRequest): Promise<AsylumNode
   return created as AsylumNode;
 }
 
-async function postNodeAction(nodeId: string, action: "interrupt" | "stop" | "archive"): Promise<void> {
+async function postNodeAction(nodeId: string, action: "interrupt" | "stop" | "archive" | "resume"): Promise<void> {
   await request<void>(`/nodes/${nodeId}/${action}`, { method: "POST", body: JSON.stringify({}) });
 }
 
@@ -185,6 +185,11 @@ export async function postNodeInput(nodeId: string, input: string): Promise<void
 export const interruptNode = (id: string) => postNodeAction(id, "interrupt");
 export const stopNode = (id: string) => postNodeAction(id, "stop");
 export const archiveNode = (id: string) => postNodeAction(id, "archive");
+// D2: resume a stopped-but-resumable node (has harness_session_id) via the
+// daemon's POST /api/nodes/:id/resume. The route is delivered by a parallel
+// workstream; this client call is shaped to match the existing node-action
+// endpoints (empty JSON body, same auth/error handling as stop/archive).
+export const resumeNode = (id: string) => postNodeAction(id, "resume");
 
 export async function requestBrowserAttach(nodeId: string): Promise<AttachBrowserResponse> {
   const data = await request<
