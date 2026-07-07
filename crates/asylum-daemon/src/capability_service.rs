@@ -218,8 +218,12 @@ fn map_harness_event(source: &str, payload: &JsonValue) -> MappedHarnessEvent {
                     });
                 }
                 "Notification" => {
+                    // Real claude (2.1.202) sends the notification kind as
+                    // `notification_type`; older docs/fixtures used `type`. Accept
+                    // both, preferring the real field.
                     let ntype = payload
-                        .get("type")
+                        .get("notification_type")
+                        .or_else(|| payload.get("type"))
                         .and_then(|v| v.as_str())
                         .unwrap_or_default();
                     let message = payload.get("message").cloned().unwrap_or(JsonValue::Null);
@@ -5802,6 +5806,51 @@ mod tests {
         let mapped = map_harness_event("claude_hook", &payload);
         assert_eq!(mapped.event, Some("node.idle"));
         assert_eq!(mapped.liveness, Some(NodeLiveness::Running));
+    }
+
+    /// Real claude (2.1.202) sends the notification kind as `notification_type`,
+    /// not `type` (live-captured payload from the Phase B gate run). The mapping
+    /// must accept the real field or idle/awaiting-input/decisions never fire.
+    #[test]
+    fn map_harness_event_maps_real_claude_notification_type_field() {
+        // Verbatim shape captured live from claude 2.1.202 via the injected
+        // Notification hook (paths/UUIDs shortened).
+        let idle = json!({
+            "cwd": "/tmp/ws",
+            "hook_event_name": "Notification",
+            "message": "Claude is waiting for your input",
+            "notification_type": "idle_prompt",
+            "prompt_id": "5550f842-6752-43d3-94c3-e6d4284dacc8",
+            "session_id": "sess-real-idle",
+            "transcript_path": "/home/u/.claude/projects/x/sess.jsonl"
+        });
+        let mapped = map_harness_event("claude_hook", &idle);
+        assert_eq!(mapped.event, Some("node.idle"));
+        assert_eq!(mapped.liveness, Some(NodeLiveness::Running));
+        assert_eq!(mapped.session_id.as_deref(), Some("sess-real-idle"));
+
+        let perm = json!({
+            "hook_event_name": "Notification",
+            "message": "Claude needs your permission",
+            "notification_type": "permission_prompt",
+            "session_id": "sess-real-perm"
+        });
+        let mapped = map_harness_event("claude_hook", &perm);
+        assert_eq!(mapped.event, Some("node.awaiting_input"));
+        assert_eq!(mapped.liveness, Some(NodeLiveness::WaitingForInput));
+        assert_eq!(mapped.detail["type"], json!("permission_prompt"));
+
+        // `notification_type` wins over a stray `type` when both are present.
+        let both = json!({
+            "hook_event_name": "Notification",
+            "notification_type": "idle_prompt",
+            "type": "permission_prompt",
+            "message": "m"
+        });
+        assert_eq!(
+            map_harness_event("claude_hook", &both).event,
+            Some("node.idle")
+        );
     }
 
     #[test]
