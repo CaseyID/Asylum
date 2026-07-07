@@ -1746,9 +1746,11 @@ impl CapabilityService {
             ));
         }
         launch_args.extend(request.launch_args.clone());
-        // Append a single positional prompt argument so both local harness command lines and
-        // Loon `--prompt` receive the same runtime launch intent.
-        launch_args.push(launch_prompt.clone());
+        // The launch prompt is intentionally NOT appended as a positional argv.
+        // Interactive harnesses (claude, codex) pre-fill a positional prompt into
+        // the input box but never submit it, so the node sits idle. It is instead
+        // delivered over the PTY as a submitted message once the TUI is ready
+        // (Local: SubstrateContext::launch_prompt) or as `--prompt` (Loon).
         let env = self.local_launch_env(&node, &harness, &substrate, &capabilities)?;
         let context = SubstrateContext {
             node_id: node.id,
@@ -1757,6 +1759,7 @@ impl CapabilityService {
             args: launch_args,
             workspace: request.workspace.clone(),
             env,
+            launch_prompt: Some(launch_prompt.clone()),
         };
         match substrate {
             SubstrateKind::Local => {
@@ -3808,8 +3811,15 @@ mod tests {
         assert!(argv.contains("mcp_servers.asylum.args=[\"mcp\"]"));
         assert!(argv.contains(&format!("ASYLUM_NODE_ID=\"{}\"", child_id)));
         assert!(argv.contains("ASYLUM_SOCKET_PATH=\"/tmp/asylum-test.sock\""));
-        assert!(argv.contains("node.spawn_peer"));
-        assert!(argv.contains("Do not simulate worker nodes inside your own harness session."));
+        // The launch prompt (node role/context + Asylum instructions) must NOT
+        // ride along as a positional argv any more — it is delivered over the PTY
+        // as a submitted message. Its presence in argv would be the old bug-1
+        // behavior where the prompt landed in the input box but never submitted.
+        assert!(
+            !argv.contains("node.spawn_peer"),
+            "launch prompt must not be a positional argv: {argv}"
+        );
+        assert!(!argv.contains("Do not simulate worker nodes inside your own harness session."));
         Ok(())
     }
 
@@ -4459,8 +4469,14 @@ mod tests {
             wait_for_liveness(&store, node_id, NodeLiveness::Stopped).await?;
             let node = store.get_node(node_id)?.expect("node should exist");
             assert_eq!(node.workspace, None);
+            // The launch prompt is delivered over the PTY, not as a positional
+            // argv, so the normalized "Workspace: <none>" context must NOT appear
+            // in argv. node.workspace == None above already proves normalization.
             let output = std::fs::read_to_string(&argv_path)?;
-            assert!(output.contains("Workspace: <none>"));
+            assert!(
+                !output.contains("Workspace:"),
+                "launch prompt must not ride as a positional argv: {output}"
+            );
             response
         };
 
@@ -4509,8 +4525,14 @@ mod tests {
             wait_for_liveness(&store, node_id, NodeLiveness::Stopped).await?;
             let node = store.get_node(node_id)?.expect("node should exist");
             assert_eq!(node.workspace, None);
+            // The launch prompt is delivered over the PTY, not as a positional
+            // argv, so the normalized "Workspace: <none>" context must NOT appear
+            // in argv. node.workspace == None above already proves normalization.
             let output = std::fs::read_to_string(&argv_path)?;
-            assert!(output.contains("Workspace: <none>"));
+            assert!(
+                !output.contains("Workspace:"),
+                "launch prompt must not ride as a positional argv: {output}"
+            );
             response
         };
 
@@ -4560,8 +4582,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_launch_delivers_description_as_prompt_and_persists_early_tui_output(
+    async fn local_launch_does_not_pass_prompt_as_positional_argv_and_persists_early_output(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Bug-1 regression at the capability layer: the launch prompt must not be
+        // appended as a positional argv (interactive harnesses never submit it).
+        // Actual PTY delivery + submit of the prompt is covered by the
+        // substrate-level test `launch_delivers_prompt_over_pty_after_readiness`
+        // in substrate/local.rs; here we only assert the prompt is absent from
+        // argv and that early TUI output is still captured by the reader.
         let _env = env_lock();
         let workdir = tempfile::tempdir()?;
         let home = workdir.path().join("home");
@@ -4569,15 +4597,14 @@ mod tests {
         let _home = EnvVarGuard::set_var("HOME", &home);
         let path = workdir.path().join("asylum.sqlite3").display().to_string();
         let argv_path = workdir.path().join("argv.txt");
-        let release_marker = workdir.path().join("codex-run-release");
         let workspace = workdir.path().join("workspace");
         std::fs::create_dir_all(&workspace)?;
         let script_path = workdir.path().join("fake-codex.sh");
+        // Dump argv, emit one TUI frame, then exit cleanly (drives the node to
+        // Stopped via the exit sink). No positional prompt should appear here.
         let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '\\033[1;1H\\033[0mwelcome'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\n",
-            argv_path.display()
-            ,
-            release_marker.display()
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{argv}'\nprintf '\\033[1;1H\\033[0mwelcome'\nsleep 0.2\n",
+            argv = argv_path.display(),
         );
         write_executable_script(&script_path, &script)?;
 
@@ -4594,9 +4621,8 @@ mod tests {
             ))
             .await?;
         let node_id = Uuid::parse_str(&response.node_id)?;
-        std::fs::write(&release_marker, b"release")?;
 
-        for _ in 0..50 {
+        for _ in 0..100 {
             if argv_path.exists() {
                 break;
             }
@@ -4608,32 +4634,18 @@ mod tests {
             args.first(),
             Some(&"--dangerously-bypass-approvals-and-sandbox")
         );
-        let payload = argv;
-        let expected_workspace = format!("Workspace: {}", workspace.display());
         let expected_context = format!("You are node {} with role 'worker'.", node_id);
         assert!(
-            payload.contains(&expected_context),
-            "missing node-role prefix in launch prompt: {payload}"
+            !argv.contains(&expected_context),
+            "launch prompt must not be a positional argv: {argv}"
         );
         assert!(
-            payload.contains(&expected_workspace),
-            "missing workspace in launch context: {payload}"
+            !argv.contains("User launch packet:"),
+            "user launch packet must not be a positional argv: {argv}"
         );
         assert!(
-            payload.contains("System map:"),
-            "missing system map in launch context: {payload}"
-        );
-        assert!(
-            payload.contains("Capabilities:"),
-            "missing capabilities in launch context: {payload}"
-        );
-        assert!(
-            payload.contains("User launch packet:"),
-            "missing user packet header in launch prompt: {payload}"
-        );
-        assert!(
-            payload.contains(prompt),
-            "missing user launch packet body: {payload}"
+            !argv.contains(prompt),
+            "prompt body must not be a positional argv: {argv}"
         );
 
         wait_for_liveness(&store, node_id, NodeLiveness::Stopped).await?;
