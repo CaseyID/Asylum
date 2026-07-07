@@ -249,6 +249,10 @@ impl Store {
         ensure_column(&conn, "channel_messages", "node_id", "TEXT")?;
         ensure_column(&conn, "channel_messages", "correlation_token", "TEXT")?;
         ensure_column(&conn, "nodes", "harness_session_id", "TEXT")?;
+        // m2: persist the per-node create-time launch_args (JSON array of
+        // strings) so resume can reuse the exact extra flags the node was
+        // created with, instead of silently reverting to the adapter baseline.
+        ensure_column(&conn, "nodes", "launch_args", "TEXT")?;
         // M7: track the ctx_pressure fired-state on the node row so ingest_statusline
         // never has to load-and-scan every prior harness-event body per post.
         ensure_column(&conn, "nodes", "ctx_pressure_session", "TEXT")?;
@@ -581,6 +585,37 @@ impl Store {
             params![harness_session_id, id.to_string()],
         )?;
         Ok(())
+    }
+
+    /// m2: persist the per-node create-time `launch_args` (the extra flags the
+    /// operator passed at create, e.g. a model override) as a JSON array so
+    /// resume can reproduce the same argv. Empty is stored as NULL.
+    pub fn set_node_launch_args(&self, id: Uuid, launch_args: &[String]) -> Result<()> {
+        let conn = self.conn()?;
+        let json = if launch_args.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(launch_args)?)
+        };
+        conn.execute(
+            "UPDATE nodes SET launch_args = ?1 WHERE id = ?2",
+            params![json, id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// m2: read back the persisted per-node create-time `launch_args`. Absent or
+    /// unparseable rows yield an empty vec (the baseline argv).
+    pub fn get_node_launch_args(&self, id: Uuid) -> Result<Vec<String>> {
+        let conn = self.conn()?;
+        let raw: Option<String> = conn.query_row(
+            "SELECT launch_args FROM nodes WHERE id = ?1",
+            params![id.to_string()],
+            |row| row.get::<_, Option<String>>(0),
+        )?;
+        Ok(raw
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .unwrap_or_default())
     }
 
     /// Epoch seconds of the most recent PTY output chunk for a node, or None if
@@ -2099,6 +2134,23 @@ mod tests {
         store.insert_decision(Some(node.id), "first").unwrap();
         let dup = store.insert_decision(Some(node.id), "second");
         assert!(dup.is_err(), "DB must reject a second pending decision per node");
+    }
+
+    // m2: per-node create-time launch_args round-trip; absent column reads empty.
+    #[test]
+    fn node_launch_args_round_trip() {
+        let store = Store::open_in_memory().unwrap();
+        let node = store.insert_test_node("worker").unwrap();
+        // Never set: baseline (empty), so resume falls back to the adapter args.
+        assert!(store.get_node_launch_args(node.id).unwrap().is_empty());
+
+        let args = vec!["--model".to_string(), "opus".to_string()];
+        store.set_node_launch_args(node.id, &args).unwrap();
+        assert_eq!(store.get_node_launch_args(node.id).unwrap(), args);
+
+        // Setting empty clears back to NULL/empty.
+        store.set_node_launch_args(node.id, &[]).unwrap();
+        assert!(store.get_node_launch_args(node.id).unwrap().is_empty());
     }
 
     // M7: ctx_pressure fired-state round-trips on the node row.

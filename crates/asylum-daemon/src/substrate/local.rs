@@ -35,6 +35,16 @@ const LAUNCH_READY_MAX: Duration = Duration::from_secs(10);
 /// composer does nothing in both claude and codex.
 const LAUNCH_SUBMIT_NUDGES: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(10)];
 
+/// Addendum B: on stop, claude nodes are asked to quit cleanly (the `/exit`
+/// slash command) so the harness flushes its session transcript before we fall
+/// back to killing the process. Bounded so a wedged harness still gets torn
+/// down promptly.
+const GRACEFUL_QUIT_WAIT: Duration = Duration::from_secs(5);
+const GRACEFUL_QUIT_POLL: Duration = Duration::from_millis(100);
+/// claude 2.1.202 clean-quit slash command (verified via docs: `/quit` aliases
+/// `/exit`). Delivered as a submitted message (body + CR) like any TUI input.
+const CLAUDE_QUIT_COMMAND: &str = "/exit";
+
 /// Deliver `text` to a writer as a SUBMITTED message: write the body, pause, then
 /// write a lone carriage return as a DISTINCT write. Claude's TUI uses auto-paste
 /// / bracketed-paste detection, so a CR bundled into the same write as the body
@@ -136,6 +146,9 @@ struct LocalRuntime {
     /// M5: per-node lock held across a whole submit sequence so concurrent
     /// send_input calls cannot interleave their body/CR writes.
     submit_lock: Arc<Mutex<()>>,
+    /// Addendum B: the harness kind, so stop() can send the harness's clean-quit
+    /// command (claude `/exit`) before falling back to SIGKILL.
+    harness: HarnessKind,
 }
 
 /// How a local harness process ended, reported to the exit sink so the
@@ -264,6 +277,7 @@ impl LocalSubstrate {
                 output_tx,
                 killer: Arc::new(Mutex::new(killer)),
                 submit_lock,
+                harness: ctx.harness.clone(),
             },
         );
 
@@ -410,6 +424,37 @@ impl LocalSubstrate {
     }
 
     pub async fn stop(&self, node_id: Uuid) -> Result<()> {
+        // Clone the runtime handles WITHOUT removing the entry yet: the graceful
+        // path needs the process to exit on its own so the reader task records the
+        // real (clean) exit outcome and removes the runtime itself.
+        let runtime = { self.runtimes.read().await.get(&node_id).cloned() };
+        let Some(runtime) = runtime else {
+            return Ok(());
+        };
+
+        // Addendum B: claude flushes its session transcript on a clean quit, so
+        // ask it to `/exit` first and give the process a bounded window to leave
+        // before we resort to SIGKILL (which would drop the transcript tail).
+        // Codex has no cheap in-band clean-quit that reliably terminates the
+        // process from a single PTY write (its `/quit` needs a confirm and a
+        // stray CR can select a dialog default), so codex stays on the direct
+        // kill path below -- documented here rather than guessed at.
+        if matches!(runtime.harness, HarnessKind::ClaudeCode) {
+            let _ = submit_over_writer(&runtime.submit_lock, &runtime.writer, CLAUDE_QUIT_COMMAND)
+                .await;
+            let deadline = tokio::time::Instant::now() + GRACEFUL_QUIT_WAIT;
+            while tokio::time::Instant::now() < deadline {
+                // The reader task removes the runtime from the map when the child
+                // exits; a miss means the clean quit worked and no kill is needed.
+                if !self.runtimes.read().await.contains_key(&node_id) {
+                    return Ok(());
+                }
+                tokio::time::sleep(GRACEFUL_QUIT_POLL).await;
+            }
+        }
+
+        // Fallback (non-claude, or claude that did not quit in time): remove the
+        // runtime and SIGKILL the child.
         let runtime = {
             let mut runtimes = self.runtimes.write().await;
             runtimes.remove(&node_id)
@@ -580,6 +625,58 @@ mod tests {
             delivered,
             "launch prompt was not delivered/submitted over the PTY; captured: {:?}",
             collected.lock().unwrap()
+        );
+    }
+
+    /// Addendum B: stopping a claude node writes the clean-quit command over the
+    /// PTY and lets the process exit on its own (flushing its transcript) before
+    /// the SIGKILL fallback. The stand-in process reads one line and exits 0 iff
+    /// it received `/exit`; had stop() gone straight to SIGKILL, the process
+    /// would have been killed mid-read and the outcome would not be a clean
+    /// self-exit (code 0).
+    #[tokio::test]
+    async fn claude_stop_sends_exit_command_and_lets_process_quit_cleanly() {
+        let outcome: Arc<StdMutex<Option<ExitOutcome>>> = Arc::new(StdMutex::new(None));
+        let outcome_sink = outcome.clone();
+        let substrate = LocalSubstrate::new_with_sinks(
+            |_id, _text| {},
+            |_id, _req| {},
+            move |_id, o| {
+                *outcome_sink.lock().unwrap() = Some(o);
+            },
+        );
+
+        let node_id = Uuid::new_v4();
+        let ctx = crate::substrate::SubstrateContext {
+            node_id,
+            harness: HarnessKind::ClaudeCode,
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "IFS= read -r line; case \"$line\" in */exit*) exit 0;; *) exit 3;; esac"
+                    .to_string(),
+            ],
+            workspace: None,
+            env: Vec::new(),
+            launch_prompt: None,
+        };
+        substrate.launch(ctx).await.expect("launch should succeed");
+        // Let the shell reach its read() before we stop it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        substrate.stop(node_id).await.expect("stop should succeed");
+
+        let mut got = None;
+        for _ in 0..100 {
+            if let Some(o) = *outcome.lock().unwrap() {
+                got = Some(o);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let got = got.expect("exit outcome should have been recorded");
+        assert!(
+            got.success && got.code == Some(0),
+            "claude stop should quit the process cleanly via /exit (expected success exit 0), got {got:?}"
         );
     }
 }

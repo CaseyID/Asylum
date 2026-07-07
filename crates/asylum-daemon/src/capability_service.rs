@@ -167,6 +167,80 @@ fn node_id_from_path(path: &str) -> Option<String> {
     None
 }
 
+/// Slugify a workspace path the way claude derives its per-project transcript
+/// directory: every non-alphanumeric character becomes `-`, 1:1 (no
+/// dash-collapsing). Verified empirically against ~/.claude/projects, e.g.
+/// `/home/casey/Projects/Asylum/.claude/worktrees/orchestrator` ->
+/// `-home-casey-Projects-Asylum--claude-worktrees-orchestrator` (the `/.` in
+/// `/.claude` yields two dashes).
+fn claude_project_slug(workspace: &str) -> String {
+    workspace
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// True iff claude's session transcript for `session_id` exists on disk under
+/// `home` for the given workspace (cwd). claude writes
+/// `~/.claude/projects/<cwd-slug>/<session-id>.jsonl`. Filesystem existence
+/// only -- no parsing (Addendum A).
+fn claude_transcript_exists(home: &std::path::Path, workspace: &str, session_id: &str) -> bool {
+    home.join(".claude")
+        .join("projects")
+        .join(claude_project_slug(workspace))
+        .join(format!("{session_id}.jsonl"))
+        .is_file()
+}
+
+/// True iff a codex rollout file for `thread_id` exists anywhere under
+/// `~/.codex/sessions` (layout `<Y>/<M>/<D>/rollout-<ts>-<thread-id>.jsonl`).
+/// Recursive existence probe, bounded to a small tree; no glob dependency and
+/// no parsing (Addendum A).
+fn codex_rollout_exists(home: &std::path::Path, thread_id: &str) -> bool {
+    fn walk(dir: &std::path::Path, suffix: &str) -> bool {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return false,
+        };
+        for entry in entries.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                if walk(&path, suffix) {
+                    return true;
+                }
+            } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("rollout-") && name.ends_with(suffix) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    let root = home.join(".codex").join("sessions");
+    walk(&root, &format!("-{thread_id}.jsonl"))
+}
+
+/// Honest resumability probe (Addendum A): the recorded harness session
+/// transcript must actually exist on disk. Reconciliation and the resume
+/// endpoint both gate on this so we never claim/attempt resume for a session
+/// whose transcript is gone -- `claude --resume` / `codex resume` would just
+/// error, and asserting resumable without the file would be a dishonest claim.
+fn harness_transcript_exists(
+    home: &std::path::Path,
+    harness: &HarnessKind,
+    workspace: &str,
+    session_id: &str,
+) -> bool {
+    match harness {
+        HarnessKind::ClaudeCode => claude_transcript_exists(home, workspace, session_id),
+        HarnessKind::Codex => codex_rollout_exists(home, session_id),
+    }
+}
+
 /// The live states a process-termination event is allowed to transition FROM.
 /// Used as the compare-and-set guard in the exit sink so a terminal state set by
 /// an operator stop/archive is never clobbered by a later exit signal.
@@ -404,6 +478,11 @@ pub struct CapabilityService {
     /// process) was constructed. Feeds `HealthResponse.uptime_seconds` so
     /// Cockpit no longer derives daemon uptime client-side.
     started_at_epoch_secs: i64,
+    /// Root under which harness session transcripts are probed (Addendum A).
+    /// Production is the process HOME (`dirs::home_dir()`); tests inject a fake
+    /// HOME so the resumability probe can be exercised without touching the real
+    /// `~/.claude` / `~/.codex` trees.
+    transcript_home: Option<std::path::PathBuf>,
 }
 
 impl CapabilityService {
@@ -534,7 +613,19 @@ impl CapabilityService {
             hook_engine,
             idle_fired: Arc::new(Mutex::new(HashMap::new())),
             started_at_epoch_secs: OffsetDateTime::now_utc().unix_timestamp(),
+            transcript_home: None,
         }
+    }
+
+    /// Root under which harness session transcripts are probed. Defaults to the
+    /// process HOME; a test override wins when set.
+    fn transcript_home_root(&self) -> Option<std::path::PathBuf> {
+        self.transcript_home.clone().or_else(dirs::home_dir)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_transcript_home_for_test(&mut self, home: std::path::PathBuf) {
+        self.transcript_home = Some(home);
     }
 
     pub fn start_background_tasks(self: &Arc<Self>) {
@@ -2013,6 +2104,15 @@ impl CapabilityService {
                 .and_then(|id| Uuid::parse_str(id).ok()),
         )?;
 
+        // m2: persist the per-node create-time launch_args so resume can reuse
+        // them (see resume_node). Best-effort: a persistence failure must not
+        // block node creation, only degrade resume to the baseline argv.
+        if !request.launch_args.is_empty() {
+            if let Err(e) = self.store.set_node_launch_args(node.id, &request.launch_args) {
+                tracing::warn!(error = %e, node_id = %node.id, "failed to persist per-node launch_args");
+            }
+        }
+
         let launch_prompt = launch_prompt_for_runtime(adapter.as_ref(), node.id, &request);
         let mut launch_args = adapter.launch_args().to_vec();
         // Pre-assign the harness session id where the harness supports it (claude
@@ -2219,21 +2319,30 @@ impl CapabilityService {
         }
     }
 
-    /// A Local node is resumable iff it recorded a harness session id and its
-    /// workspace still exists on disk (claude `--resume` is cwd-scoped; codex
-    /// `resume` reads the rollout under the same session id).
+    /// A Local node is resumable iff it recorded a harness session id, its
+    /// workspace still exists on disk (claude `--resume` is cwd-scoped), AND the
+    /// harness session transcript is actually present on disk (Addendum A): a
+    /// claude `<cwd-slug>/<session-id>.jsonl` or a codex `rollout-*-<thread-id>`
+    /// rollout. Without the transcript the resume would just error, so claiming
+    /// resumable would be dishonest.
     fn local_node_resumable(&self, node: &NodeRecord) -> bool {
-        let has_session = node
+        let Some(session_id) = node
             .harness_session_id
             .as_deref()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-        let workspace_ok = node
-            .workspace
-            .as_deref()
-            .map(|w| !w.is_empty() && std::path::Path::new(w).is_dir())
-            .unwrap_or(false);
-        has_session && workspace_ok
+            .filter(|s| !s.is_empty())
+        else {
+            return false;
+        };
+        let Some(workspace) = node.workspace.as_deref().filter(|w| !w.is_empty()) else {
+            return false;
+        };
+        if !std::path::Path::new(workspace).is_dir() {
+            return false;
+        }
+        let Some(home) = self.transcript_home_root() else {
+            return false;
+        };
+        harness_transcript_exists(&home, &node.harness, workspace, session_id)
     }
 
     async fn reconcile_loon_node(&self, node: &NodeRecord) {
@@ -2383,6 +2492,20 @@ impl CapabilityService {
                     ));
                 }
 
+                // Addendum A: fail fast when the harness session transcript is
+                // absent on disk. `claude --resume`/`codex resume` need the
+                // recorded session's transcript; without it the relaunch would
+                // error (or silently start a fresh session), so refuse honestly
+                // rather than claim a resume we cannot perform.
+                let home = self.transcript_home_root()
+                    .ok_or_else(|| anyhow!("cannot determine HOME to locate the harness transcript"))?;
+                if !harness_transcript_exists(&home, &harness, workspace, &session_id) {
+                    return Err(anyhow!(
+                        "harness session transcript for {session_id} not found on disk; cannot \
+                         resume (the session was deleted, or ran under a different HOME/workspace)"
+                    ));
+                }
+
                 let asylum_binary = current_asylum_binary();
                 let args = adapter
                     .resume_args(
@@ -2392,6 +2515,12 @@ impl CapabilityService {
                         node.id,
                     )
                     .ok_or_else(|| anyhow!("harness {harness} does not support resume"))?;
+                // m2: reapply the per-node create-time launch_args, mirroring the
+                // create path which appends request.launch_args AFTER the control
+                // injection. The resumed argv then matches the created argv except
+                // for the session-id -> resume swap owned by resume_args().
+                let mut args = args;
+                args.extend(self.store.get_node_launch_args(node.id).unwrap_or_default());
                 let env =
                     self.local_launch_env(&node, &harness, &node.substrate, &node.capabilities)?;
                 let launch_command = resolve_command(adapter.command())
@@ -4377,6 +4506,123 @@ mod tests {
         );
         assert!(service.token_id_for_raw("not-a-token", true).is_err());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_guest_token_is_confined_to_its_own_node(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // M3: a minted per-node (loon-node-<id>) guest token must be path-scoped:
+        // it may drive its OWN node, must be rejected on any OTHER node's path and
+        // on the token-management surface, while a real owner token is unrestricted.
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let raw_owner = "owner-secret-token";
+        let service = CapabilityService::new(
+            store,
+            AuthMode::OwnerToken {
+                config_token_hash: Some(hash_token(raw_owner)),
+            },
+            test_app_config(),
+        );
+
+        let node_a = Uuid::new_v4();
+        let node_b = Uuid::new_v4();
+        let guest = service.mint_loon_node_token(node_a)?;
+
+        // Own node: accepted.
+        assert!(
+            service.scoped_token_authorizes_path(&guest, &format!("/api/nodes/{node_a}/input")),
+            "guest token must authorize its own node's path"
+        );
+        // Cross node: rejected.
+        assert!(
+            !service.scoped_token_authorizes_path(&guest, &format!("/api/nodes/{node_b}/input")),
+            "guest token must be rejected on another node's path"
+        );
+        // Token-management surface: rejected outright.
+        assert!(
+            !service.scoped_token_authorizes_path(&guest, "/api/tokens"),
+            "guest token must not touch the token-management surface"
+        );
+        assert!(
+            !service.scoped_token_authorizes_path(&guest, "/api/tokens/abc"),
+            "guest token must not touch token sub-paths"
+        );
+        // Owner token: unrestricted (not a DB-scoped guest token).
+        assert!(
+            service.scoped_token_authorizes_path(raw_owner, &format!("/api/nodes/{node_b}/input")),
+            "owner token must be unrestricted across nodes"
+        );
+        assert!(
+            service.scoped_token_authorizes_path(raw_owner, "/api/tokens"),
+            "owner token must reach the token surface"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn claude_project_slug_maps_nonalnum_to_dash() {
+        // Addendum A: the slug is claude's own cwd->project-dir transform,
+        // verified empirically against ~/.claude/projects.
+        assert_eq!(
+            claude_project_slug("/home/casey/Projects/Asylum/.claude/worktrees/orchestrator"),
+            "-home-casey-Projects-Asylum--claude-worktrees-orchestrator"
+        );
+        assert_eq!(
+            claude_project_slug("/home/casey/Projects/Asylum"),
+            "-home-casey-Projects-Asylum"
+        );
+    }
+
+    #[test]
+    fn claude_transcript_probe_matches_disk_layout() {
+        // Addendum A: probe finds the transcript only when the exact
+        // <cwd-slug>/<session-id>.jsonl file exists under a fake HOME.
+        let home = tempfile::tempdir().unwrap();
+        let workspace = "/tmp/asylum/ws-claude";
+        let session = "55864ae8-245d-4eb6-bb7f-f430a85f0f8a";
+        assert!(!claude_transcript_exists(home.path(), workspace, session));
+
+        let dir = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_slug(workspace));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{session}.jsonl")), b"{}\n").unwrap();
+
+        assert!(claude_transcript_exists(home.path(), workspace, session));
+        // Wrong session id -> not resumable.
+        assert!(!claude_transcript_exists(home.path(), workspace, "deadbeef-0000"));
+        // Wrong workspace slug -> not resumable.
+        assert!(!claude_transcript_exists(home.path(), "/tmp/other/ws", session));
+    }
+
+    #[test]
+    fn codex_rollout_probe_finds_by_thread_id() {
+        // Addendum A: recursive probe locates a codex rollout by thread id under
+        // the ~/.codex/sessions/<Y>/<M>/<D>/ tree.
+        let home = tempfile::tempdir().unwrap();
+        let thread = "019dbc3f-ac60-7991-84cb-296a542148a4";
+        assert!(!codex_rollout_exists(home.path(), thread));
+
+        let day = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("04")
+            .join("23");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            day.join(format!("rollout-2026-04-23T17-29-42-{thread}.jsonl")),
+            b"{}\n",
+        )
+        .unwrap();
+
+        assert!(codex_rollout_exists(home.path(), thread));
+        assert!(!codex_rollout_exists(home.path(), "019ffffff-dead-beef-0000-000000000000"));
     }
 
     #[tokio::test]
@@ -7188,7 +7434,11 @@ mod tests {
         std::fs::create_dir_all(&workspace)?;
         let path = workdir.path().join("asylum.sqlite3").display().to_string();
         let store = Store::open(path)?;
-        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+        let mut service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+        // Addendum A: point the transcript probe at a fake HOME and drop the
+        // claude transcript on disk so this node reads as honestly resumable.
+        let home = workdir.path().join("home");
+        service.set_transcript_home_for_test(home.clone());
 
         // A node the previous daemon left marked Running, with a recorded session
         // id and an existing workspace: resumable after honest reconciliation.
@@ -7202,7 +7452,14 @@ mod tests {
             CapabilitySnapshot::default(),
             None,
         )?;
-        store.set_node_harness_session_id(node.id, Some(&Uuid::new_v4().to_string()))?;
+        let session_id = Uuid::new_v4().to_string();
+        let transcript_dir = home
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_slug(&workspace.display().to_string()));
+        std::fs::create_dir_all(&transcript_dir)?;
+        std::fs::write(transcript_dir.join(format!("{session_id}.jsonl")), b"{}\n")?;
+        store.set_node_harness_session_id(node.id, Some(&session_id))?;
         store.set_node_liveness(node.id, NodeLiveness::Running)?;
 
         service.reconcile_on_boot().await;
@@ -7409,6 +7666,15 @@ mod tests {
         let thread_id = Uuid::new_v4().to_string();
         store.set_node_harness_session_id(node.id, Some(&thread_id))?;
         store.set_node_liveness(node.id, NodeLiveness::Stopped)?;
+
+        // Addendum A: resume fails fast without the session transcript on disk, so
+        // drop a codex rollout for this thread id under the fake HOME.
+        let rollout_dir = home.join(".codex").join("sessions").join("2026").join("07").join("07");
+        std::fs::create_dir_all(&rollout_dir)?;
+        std::fs::write(
+            rollout_dir.join(format!("rollout-2026-07-07T00-00-00-{thread_id}.jsonl")),
+            b"{}\n",
+        )?;
 
         service.resume_node(node.id).await?;
         wait_for_liveness(&store, node.id, NodeLiveness::Running).await?;

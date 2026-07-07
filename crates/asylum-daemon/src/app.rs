@@ -1123,6 +1123,14 @@ async fn attach_output_for(
 
 /// Route raw attach input (no appended submit key) to the node's owning
 /// substrate PTY.
+///
+/// Addendum C: this raw interactive-attach path intentionally records NO
+/// `InputSent` event. Unlike `CapabilityService::send_input` (the programmatic
+/// one-message-per-call API, which does record `InputSent`), this path carries a
+/// live operator terminal's per-keystroke byte stream. Emitting an event per
+/// keystroke would spam the event log with no useful granularity, so the raw
+/// attach stream is deliberately left off the event ledger; the attach session
+/// itself is the audit unit.
 async fn route_attach_input(
     service: &crate::capability_service::CapabilityService,
     node: &asylum_types::node::NodeRecord,
