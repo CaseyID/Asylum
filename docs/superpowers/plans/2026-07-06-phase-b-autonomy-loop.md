@@ -25,6 +25,11 @@ Rules: ingestion validates the node id exists and is running; events are stored 
 
 ## Workstreams
 
+W0 — input delivery correctness (crates/asylum-daemon/src/substrate/local.rs + harness launch). BLOCKER, found in the 2026-07-06 live E2E. Two real bugs on the exact path a supervisor uses to drive a worker:
+- The launch prompt (passed as a trailing positional argv to `claude`) is never auto-submitted — it lands in the input box and the session sits idle. Launch must deliver the initial prompt as a submitted message (send it over the PTY after the TUI is ready, or use the harness's documented initial-prompt mechanism, not a bare positional).
+- `send_input`/`send_input_raw` write `text + "\r"` in a single PTY `write_all`; Claude's TUI absorbs the CR as pasted content, so nothing submits until a separate lone `\r` is sent. Fix: send the text, then submit Enter as a distinct write (small delay or bracketed-paste-aware sequence) so a single `node send` both enters and submits. Verify with a real claude session: one `node send` delivers AND submits.
+Get W0 right first — every downstream gate (hook actions doing send_input, decision feedback injection, supervisor feeding workers) depends on input actually submitting.
+
 W1 — daemon ingestion + event truth (crates/asylum-daemon)
 - New capability `node.post_harness_event` (HTTP + socket, token-protected like the rest): body = source (claude_hook|claude_statusline|codex_notify|daemon), raw payload, mapped event kind. Mapping lives daemon-side so the CLI stays thin.
 - Liveness updates per table above; interrupt fix: `interrupt_node` sends Ctrl-C WITHOUT forcing Stopped/`node.exited` (liveness now follows real signals; exit sink still owns termination).
@@ -65,9 +70,14 @@ Order: W1 first (contract), then W2+W3+W4 in parallel (W2/W3 pair on the bridge 
 
 Local-only mission work; not released. Last published release: v0.1.10 (2026-05-07).
 
+## E2E baseline (2026-07-06)
+
+Live spawn-peer test PASSED the core capability: a supervisor claude node, via injected MCP, called node.spawn_peer and produced a real second live claude session + a correctly-typed `spawned_for` relationship edge; two independent `claude`+`asylum mcp` process trees confirmed; supervisor also called node.list (got 2) and reported back. MCP injection (`--mcp-config`, `--strict-mcp-config`, ASYLUM_NODE_ID/SOCKET env, `--allowedTools mcp__asylum__*`) works. Bugs found → W0. Also noted: `node.spawn_peer` MCP tool takes `description` not `prompt` (the supervisor adapted); W4/W3 should consider exposing an explicit initial-prompt param for spawned peers so a supervisor's intended first instruction is delivered as the worker's submitted prompt.
+
 ## Status
 
-- W1: not started
+- W0: not started (input delivery bugs from E2E)
+- W1: in progress (agent worktree phase-b-w1-event-ingestion; ~630 insertions across 12 files; not yet reported complete)
 - W2: not started
 - W3: not started
 - W4: not started
