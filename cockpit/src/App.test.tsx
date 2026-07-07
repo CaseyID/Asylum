@@ -19,6 +19,7 @@ const apiMocks = vi.hoisted(() => {
     archiveNode: vi.fn(),
     fetchChannelMessages: vi.fn(),
     fetchChannels: vi.fn(),
+    fetchDecisions: vi.fn(),
     fetchGraph: vi.fn(),
     fetchHarnessDescriptors: vi.fn(),
     fetchHealth: vi.fn(),
@@ -88,6 +89,7 @@ describe("App populated daemon state", () => {
 
     apiMocks.hydrateOwnerTokenFromLocation.mockReturnValue("");
     apiMocks.fetchNotifications.mockResolvedValue([]);
+    apiMocks.fetchDecisions.mockResolvedValue([]);
     apiMocks.fetchHealth.mockResolvedValue({
       status: "ok",
       daemon_version: "0.1.6",
@@ -164,6 +166,33 @@ describe("App populated daemon state", () => {
     expect(container.textContent).toContain("2");
     expect(container.textContent).toContain("1 running");
     expect(container.textContent).not.toContain("start a command center");
+  });
+
+  it("shows a pending-decision badge on the fleet screen for a node awaiting one", async () => {
+    apiMocks.fetchGraph.mockResolvedValue({
+      nodes: [
+        node({ id: "cc-node", role_hint: "command-center", liveness: "running" }),
+        node({ id: "worker-node", role_hint: "worker", liveness: "waiting_for_input", description: "needs input" }),
+      ],
+      relationships: [],
+    });
+    apiMocks.fetchDecisions.mockResolvedValue([
+      {
+        id: "dec-1",
+        node_id: "worker-node",
+        text: "should I proceed?",
+        status: "pending",
+        created_at_epoch_secs: 0,
+        decided_at_epoch_secs: null,
+      },
+    ]);
+
+    const { getByText, getByTitle } = render(<App />);
+
+    await waitFor(() => expect(getByText("asylum 0.1.6")).toBeDefined());
+    fireEvent.click(getByText("nodes"));
+
+    await waitFor(() => expect(getByTitle("pending decision")).toBeDefined());
   });
 
   it("keeps the fleet screen backed by the populated graph snapshot", async () => {

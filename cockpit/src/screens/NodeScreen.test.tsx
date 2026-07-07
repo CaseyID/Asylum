@@ -50,6 +50,86 @@ function node(overrides: Partial<AsylumNode> = {}): AsylumNode {
   };
 }
 
+describe("NodeScreen W5 decision + session surfacing", () => {
+  beforeEach(() => {
+    apiMocks.fetchHarnessDescriptors.mockReset();
+    apiMocks.fetchHarnessDescriptors.mockResolvedValue([]);
+    apiMocks.fetchNodeEvents.mockReset();
+    apiMocks.fetchNodeEvents.mockResolvedValue([]);
+  });
+
+  afterEach(() => cleanup());
+
+  it("shows a pending-decision affordance and routes it to the decisions screen", async () => {
+    const onOpenDecisions = vi.fn();
+    const props = {
+      node: node(),
+      nodes: [node()],
+      relationships: [],
+      onBack: vi.fn(),
+      onOpen: vi.fn(),
+      onAction: vi.fn(),
+      onGraphRefresh: vi.fn(),
+      hasPendingDecision: true,
+      onOpenDecisions,
+    };
+
+    const { getByRole, container } = render(<NodeScreen {...props} />);
+
+    await waitFor(() => expect(container.textContent).toContain("command-center"));
+    const btn = getByRole("button", { name: "pending decision" });
+    fireEvent.click(btn);
+    expect(onOpenDecisions).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not show a pending-decision affordance when there is none", () => {
+    const props = {
+      node: node(),
+      nodes: [node()],
+      relationships: [],
+      onBack: vi.fn(),
+      onOpen: vi.fn(),
+      onAction: vi.fn(),
+      onGraphRefresh: vi.fn(),
+      hasPendingDecision: false,
+    };
+
+    const { queryByRole } = render(<NodeScreen {...props} />);
+    expect(queryByRole("button", { name: "pending decision" })).toBeNull();
+  });
+
+  it("shows the harness_session_id when the daemon provides one", async () => {
+    const props = {
+      node: node({ harness_session_id: "sess-abc-123" }),
+      nodes: [node({ harness_session_id: "sess-abc-123" })],
+      relationships: [],
+      onBack: vi.fn(),
+      onOpen: vi.fn(),
+      onAction: vi.fn(),
+      onGraphRefresh: vi.fn(),
+    };
+
+    const { container } = render(<NodeScreen {...props} />);
+    await waitFor(() => expect(container.textContent).toContain("sess-abc-123"));
+  });
+
+  it("falls back to an em dash when no harness_session_id is recorded", async () => {
+    const props = {
+      node: node({ harness_session_id: undefined }),
+      nodes: [node({ harness_session_id: undefined })],
+      relationships: [],
+      onBack: vi.fn(),
+      onOpen: vi.fn(),
+      onAction: vi.fn(),
+      onGraphRefresh: vi.fn(),
+    };
+
+    const { container } = render(<NodeScreen {...props} />);
+    await waitFor(() => expect(container.textContent).toContain("command-center"));
+    expect(container.textContent).toMatch(/session:\s*—/);
+  });
+});
+
 describe("NodeScreen selection transition", () => {
   beforeEach(() => {
     apiMocks.requestBrowserAttach.mockReset();

@@ -21,11 +21,13 @@ export interface FleetScreenProps {
   nodes: AsylumNode[];
   onLaunch: () => void;
   onOpen: (node: AsylumNode) => void;
+  // node ids with an unresolved pending decision (W5 decision surfacing).
+  pendingDecisionNodeIds?: Set<string>;
 }
 
 const STATE_FILTERS: ("all" | UiState)[] = ["all", "running", "waiting", "idle", "errored", "stopped", "archived"];
 
-export function FleetScreen({ nodes, onLaunch, onOpen }: FleetScreenProps): JSX.Element {
+export function FleetScreen({ nodes, onLaunch, onOpen, pendingDecisionNodeIds }: FleetScreenProps): JSX.Element {
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState<(typeof STATE_FILTERS)[number]>("all");
 
@@ -140,6 +142,15 @@ export function FleetScreen({ nodes, onLaunch, onOpen }: FleetScreenProps): JSX.
                 <td className="mono" style={{ color: "var(--fg)" }}>
                   {shortNodeId(n.id)}
                   {cc && <span style={{ marginLeft: 8, color: "var(--fg-muted)", fontSize: 10 }}>[cc]</span>}
+                  {pendingDecisionNodeIds?.has(n.id) && (
+                    <span
+                      className="pill pill-waiting"
+                      style={{ marginLeft: 8, fontSize: 9, padding: "1px 6px" }}
+                      title="pending decision"
+                    >
+                      decision
+                    </span>
+                  )}
                 </td>
                 <td className="mono muted">{n.role_hint}</td>
                 <td className="mono">{harnessLabel(n.harness)}</td>

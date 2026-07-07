@@ -136,6 +136,28 @@ Tests: daemon-lib 142→146 net (removed 2 recipe tests + the old spawn-rejected
 
 What W5 must know: hook action arg forms for `send_input` (target + text/template) and `spawn` (harness/substrate/role/workspace/prompt args) still need real Cockpit UI — HooksScreen only exposes the kind picker + the shared template input today. Decision surfacing (pending badge on node cards/graph, NodeScreen indicator) and liveness chips for the new truthful states are still W5. The MCP `decision.list` `pending` filter and `decision.resolve` `answer` param are available for any supervisor-facing surfaces.
 
+## W5 delivered (branch phase-b-w5, 2026-07-07)
+
+Cockpit surfacing of everything W1-W4 made real. No daemon changes were needed — every gap closed against endpoints that already existed (`/api/hooks/events`, `/api/nodes` `harness_session_id`, `/api/decisions`).
+
+- **HooksScreen** (`cockpit/src/screens/HooksScreen.tsx`): the event picker already read the live 13-entry catalog from `/api/hooks/events` (done in W4); this workstream built the real action forms.
+  - `send_input`: the target cell becomes a node picker (`<select>`, aria-label `send_input target node`) sourced from `fetchNodes()`, defaulting to "(event's node)" for blank/`event`/`node`/`event.node` sentinels; the existing template input carries the text.
+  - `spawn`: harness (`claude_code`|`codex`) and substrate (`local`|`loon`) selects plus role/workspace/description text inputs and a prompt textarea, all writing into `action.args`. A new `sanitizeActionForSave` strips blank optional fields and forces `target: ""`, `template: undefined` right before `createHook`/`updateHook` so a saved rule never carries an empty-string `role` (which would silently override the daemon's `"worker"` default) or stray target.
+  - Switching an action's kind (`onKindChange`) now resets target/template/args to sensible per-kind defaults instead of leaking a previous kind's shape into the new one.
+  - `channel`/`tool`/`pause_node`/`archive` kinds are untouched (still freeform target input).
+- **Decision surfacing**: a pending-decision indicator now follows the node wherever it's shown.
+  - `App.tsx` polls `fetchDecisions()` independently of `refreshAll` (6s) and derives `pendingDecisionNodeIds: Set<string>` (status `pending` + non-null `node_id`), threaded into `CockpitScreen`, `FleetScreen`, and `NodeScreen`.
+  - `Graph.tsx` node cards render a small amber `?` badge (`title="pending decision"`) for a node in the set.
+  - `FleetScreen.tsx` shows a `decision` pill next to the node id in the table.
+  - `Inspector.tsx` (the cockpit-screen side panel) and `NodeScreen.tsx` (the node detail header) both grow a "pending decision" button that jumps straight to the Decisions screen (`onOpenDecisions`).
+  - `DecisionsScreen.tsx`: each pending row gets a free-text answer input (aria-label `answer for decision <id>`) wired into `resolveDecision(id, { status, answer })` — `answer` is only sent when non-blank, matching the daemon's optional-field contract; the field clears after a successful resolve.
+- **Liveness truth**: `waiting_for_input` already rendered as a distinct `waiting` pill/label everywhere via the pre-existing `uiStateForLiveness` mapping — confirmed with new `glyphs.test.ts` cases (`waiting_for_input` vs `running`, `failed` vs `stopped`) rather than reworked, since no gap existed. `harness_session_id` (optional on `AsylumNode`, since the daemon always serializes it but many test fixtures predate the field) is now shown on `NodeScreen` (header `meta` row + side "telemetry estimates" panel) and `Inspector` (overview KV), falling back to `"—"` — the Phase C resume key is visible without leaving Cockpit.
+- Small support additions: `HelpCircle` registered in `lib/icons.tsx` as `"help-circle"` for the pending-decision buttons.
+
+Daemon API gaps found: none. `/api/hooks/events`, node `harness_session_id`, and `/api/decisions` (client-side filtered to `pending`, matching the existing `DecisionsScreen` pattern — the REST list endpoint has no server-side filter, only MCP's `decision.list` got one in W4) were all sufficient; no Rust changes were made.
+
+Tests: cockpit vitest 63 → 85 (+22): 8 in `HooksScreen.test.tsx` (2 pre-existing rewritten for the `fetchNodes` mock + 6 new — send_input node-picker serialization, send_input blank-target default, spawn full-field serialization, spawn default/blank-field omission), 2 new in `glyphs.test.ts` (waiting_for_input, failed distinctness), 3 new in `DecisionsScreen.test.tsx` (answer wired through, blank answer omitted, field clears after resolve), 4 new in `NodeScreen.test.tsx` (pending-decision button + wiring, absent when not pending, harness_session_id shown/falls back), 3 new in `Inspector.test.tsx` (pending-decision button + wiring, absent when not pending, harness_session_id shown), 3 new `FleetScreen.test.tsx` (decision pill present/absent, distinct waiting/errored/running pills — new file, none existed before), 2 new `Graph.test.tsx` (decision badge present/absent — new file, none existed before), 1 new in `App.test.tsx` (end-to-end: a pending decision surfaces the badge on the real Fleet screen through the App's poll). `npx tsc --noEmit` clean. Full `cargo test-asylum` green: 146 daemon-lib, 69 cli, 4 asylum-types, 85 cockpit vitest — unchanged Rust counts confirm no daemon/CLI regressions from a cockpit-only change.
+
 ## Status
 
 
@@ -145,5 +167,5 @@ What W5 must know: hook action arg forms for `send_input` (target + text/templat
 - W3 (launch injection: --session-id, --settings hooks+statusLine for claude; -c notify for codex): COMPLETE — branch phase-b-w3; 142 daemon-lib tests green (+3); live-verified session_started (pre-assigned id confirmed), turn_complete, statusline ctx telemetry, and PostToolUse tool_call all arrived. See delivered contract above.
 - W4 (hook actions send_input + honest spawn, delete recipes; decision producer from awaiting_input; resolve_decision feedback injection): COMPLETE — branch phase-b-w4; 146 daemon-lib tests green (+4 net), 69 cli, 4 asylum-types, 63 cockpit vitest; zero build warnings; recipe surface fully removed; new create/spawn `prompt` param and `DecisionResolveRequest.answer`. No live harness run (W0/W3 live-verified the input/event paths; the comprehensive live gate runs after W5). See delivered contract above.
 
-- W5 (cockpit: catalog-matched pickers, decision surfacing, liveness chips): not started.
-- Gate: not run
+- W5 (cockpit: catalog-matched pickers, decision surfacing, liveness chips): COMPLETE — branch phase-b-w5; 85 cockpit vitest tests green (+22); no daemon API gaps found, no Rust changes needed. See delivered section above.
+- Gate: not run — the live gate check (docs section above) still needs to be run end-to-end against a real daemon + harness now that W1-W5 are all merged.

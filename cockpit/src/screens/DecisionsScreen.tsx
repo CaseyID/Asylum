@@ -34,11 +34,15 @@ function DecisionRow({
   showActions,
   onResolve,
   resolving,
+  answer,
+  onAnswerChange,
 }: {
   decision: DecisionRecord;
   showActions: boolean;
   onResolve: (id: string, status: DecisionAction) => void;
   resolving: string | null;
+  answer: string;
+  onAnswerChange: (id: string, value: string) => void;
 }) {
   const normalized = decision.status.toLowerCase();
 
@@ -52,26 +56,36 @@ function DecisionRow({
       <td className="mono muted">{fmtEpoch(decision.created_at_epoch_secs)}</td>
       <td style={{ maxWidth: 600, whiteSpace: "normal", wordBreak: "break-word" }}>{decision.text}</td>
       <td className="mono muted">{fmtEpoch(decision.decided_at_epoch_secs)}</td>
-      <td style={{ width: 160 }}>
+      <td style={{ width: 220 }}>
         {showActions ? (
-          <div style={{ display: "flex", gap: 6 }}>
-            <Btn
-              kind="secondary"
-              size="sm"
-              icon="thumbs-up"
-              disabled={Boolean(resolving)}
-              onClick={() => onResolve(decision.id, "approved")}
-            >
-              approve
-            </Btn>
-            <Btn
-              kind="danger"
-              size="sm"
-              disabled={Boolean(resolving)}
-              onClick={() => onResolve(decision.id, "denied")}
-            >
-              deny
-            </Btn>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <input
+              className="input mono"
+              aria-label={`answer for decision ${decision.id}`}
+              placeholder="free-text answer (optional)"
+              value={answer}
+              onChange={(e) => onAnswerChange(decision.id, e.target.value)}
+              style={{ fontSize: 11 }}
+            />
+            <div style={{ display: "flex", gap: 6 }}>
+              <Btn
+                kind="secondary"
+                size="sm"
+                icon="thumbs-up"
+                disabled={Boolean(resolving)}
+                onClick={() => onResolve(decision.id, "approved")}
+              >
+                approve
+              </Btn>
+              <Btn
+                kind="danger"
+                size="sm"
+                disabled={Boolean(resolving)}
+                onClick={() => onResolve(decision.id, "denied")}
+              >
+                deny
+              </Btn>
+            </div>
           </div>
         ) : (
           <span className="muted">resolved</span>
@@ -97,6 +111,7 @@ export function DecisionsScreen(): JSX.Element {
   const [resolving, setResolving] = useState<string | null>(null);
   const [text, setText] = useState("");
   const [nodeId, setNodeId] = useState("");
+  const [answers, setAnswers] = useState<Record<string, string>>({});
 
   const loadDecisions = useCallback(async () => {
     setState("loading");
@@ -151,11 +166,21 @@ export function DecisionsScreen(): JSX.Element {
     }
   }
 
+  function setAnswer(id: string, value: string) {
+    setAnswers((cur) => ({ ...cur, [id]: value }));
+  }
+
   async function handleResolve(id: string, status: DecisionAction) {
+    const answer = answers[id]?.trim();
     setResolving(id);
     setError(null);
     try {
-      await resolveDecision(id, { status });
+      await resolveDecision(id, { status, ...(answer ? { answer } : {}) });
+      setAnswers((cur) => {
+        const next = { ...cur };
+        delete next[id];
+        return next;
+      });
       await loadDecisions();
     } catch (err) {
       setError(String(err instanceof Error ? err.message : err));
@@ -244,6 +269,8 @@ export function DecisionsScreen(): JSX.Element {
                       showActions
                       onResolve={handleResolve}
                       resolving={resolving === d.id ? d.id : null}
+                      answer={answers[d.id] ?? ""}
+                      onAnswerChange={setAnswer}
                     />
                   ))}
                 </tbody>
@@ -282,6 +309,8 @@ export function DecisionsScreen(): JSX.Element {
                         showActions={false}
                         onResolve={handleResolve}
                         resolving={resolving}
+                        answer=""
+                        onAnswerChange={setAnswer}
                       />
                     ))
                   )}
