@@ -6,6 +6,7 @@ import { Btn, Empty, KV, Pill, Tag } from "../lib/ui";
 import { NodeSession } from "../components/NodeSession";
 import {
   ROLE_GLYPH,
+  canResumeNode,
   harnessLabel,
   isCommandCenter,
   shortNodeId,
@@ -30,8 +31,8 @@ export type NodeScreenAction =
   | "interrupt"
   | "fork"
   | "stop"
-  | "terminate"
-  | "archive";
+  | "archive"
+  | "resume";
 
 export interface NodeScreenProps {
   node?: AsylumNode;
@@ -41,6 +42,9 @@ export interface NodeScreenProps {
   onOpen: (node: AsylumNode) => void;
   onAction: (action: NodeScreenAction, payload?: string) => Promise<void>;
   onGraphRefresh: () => void;
+  // true when this node has an unresolved pending decision (W5 decision surfacing).
+  hasPendingDecision?: boolean;
+  onOpenDecisions?: () => void;
 }
 
 type Tab = "session" | "events" | "activity" | "capabilities" | "relationships";
@@ -61,6 +65,8 @@ export function NodeScreen({
   onOpen,
   onAction,
   onGraphRefresh,
+  hasPendingDecision,
+  onOpenDecisions,
 }: NodeScreenProps): JSX.Element {
   const [tab, setTab] = useState<Tab>("session");
   const [flash, setFlash] = useState<ActionFlash | null>(null);
@@ -141,6 +147,11 @@ export function NodeScreen({
             <span className="id">{shortNodeId(node.id)}</span>
             <Pill status={state}>{uiStateLabel(state)}</Pill>
             {cc && <Tag kind="role">command-center</Tag>}
+            {hasPendingDecision && (
+              <Btn size="sm" kind="secondary" icon="help-circle" onClick={onOpenDecisions}>
+                pending decision
+              </Btn>
+            )}
           </div>
           <div className="meta">
             <span>
@@ -157,6 +168,9 @@ export function NodeScreen({
             </span>
             <span>
               ctx est.: <b>{Math.round(tel.ctx * 100)}%</b>
+            </span>
+            <span>
+              session: <b className="mono">{node.harness_session_id ?? "—"}</b>
             </span>
           </div>
           <div className="node-tabs">
@@ -202,6 +216,7 @@ export function NodeScreen({
               ["ctx est.", `${Math.round(tel.ctx * 100)}%`],
               ["tool calls est.", tel.tools],
               ["uptime", uptimeLabel(node)],
+              ["harness session", node.harness_session_id ?? "—"],
             ]}
           />
         </div>
@@ -254,12 +269,14 @@ export function NodeScreen({
             <Btn size="sm" icon="git-branch" onClick={() => fire("fork", "forked → see graph")}>
               fork
             </Btn>
-            <Btn size="sm" icon="archive" onClick={() => fire("archive", "archived · transcript exported")}>
+            <Btn size="sm" kind="danger" icon="archive" onClick={() => fire("archive", "archived · stopped, no resume")}>
               archive
             </Btn>
-            <Btn size="sm" kind="danger" icon="x" onClick={() => fire("terminate", "terminated · resources released")}>
-              terminate
-            </Btn>
+            {canResumeNode(node) && (
+              <Btn size="sm" icon="play" onClick={() => fire("resume", "resume issued")}>
+                resume
+              </Btn>
+            )}
           </div>
           {flash && (
             <div className={`action-flash ${flash.status}`} key={flash.id}>

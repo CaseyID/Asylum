@@ -6,6 +6,7 @@ import {
   archiveNode,
   fetchChannelMessages,
   fetchChannels,
+  fetchDecisions,
   fetchGraph,
   fetchHarnessDescriptors,
   fetchHealth,
@@ -17,10 +18,12 @@ import {
   hydrateOwnerTokenFromLocation,
   interruptNode,
   postNodeInput,
+  resumeNode,
   sendRemoteCommand,
   setStoredOwnerToken,
   stopNode,
 } from "./api";
+import { formatDurationSeconds } from "./lib/glyphs";
 import { selectCommandCenter, useCockpitStore } from "./state";
 import { Topbar } from "./components/Topbar";
 import { Nav } from "./components/Nav";
@@ -44,6 +47,7 @@ import { useUiPrefs } from "./lib/uiPrefs";
 import type {
   AsylumNode,
   ChannelDescriptor,
+  DecisionRecord,
   HookRule,
   HealthResponse,
   NotificationRecord,
@@ -84,6 +88,7 @@ export function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [harnessCount, setHarnessCount] = useState(0);
   const [substrates, setSubstrates] = useState<SubstrateDescriptor[]>([]);
+  const [decisions, setDecisions] = useState<DecisionRecord[]>([]);
   const lastSeenMessageId = useRef<number>(0);
 
   const [ownerToken, setOwnerToken] = useState("");
@@ -188,6 +193,35 @@ export function App() {
     const t = setInterval(() => void refreshAll(), 6000);
     return () => clearInterval(t);
   }, [refreshAll]);
+
+  // Decisions poll independently of refreshAll so the pending-decision
+  // indicators (node cards, graph, inspector) stay live even while the
+  // Decisions screen itself is closed.
+  useEffect(() => {
+    let cancelled = false;
+    async function tick() {
+      try {
+        const list = await fetchDecisions();
+        if (!cancelled) setDecisions(list);
+      } catch {
+        // best-effort; the Decisions screen surfaces load errors of its own
+      }
+    }
+    void tick();
+    const t = setInterval(() => void tick(), 6000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, []);
+
+  const pendingDecisionNodeIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const d of decisions) {
+      if (d.status.toLowerCase() === "pending" && d.node_id) ids.add(d.node_id);
+    }
+    return ids;
+  }, [decisions]);
 
   useEffect(() => {
     if (!selectedNodeId && commandCenterNodeId) setSelectedNode(commandCenterNodeId);
@@ -348,9 +382,9 @@ export function App() {
       } else if (action === "archive") {
         await archiveNode(target.id);
         setLocalNotice("archive issued");
-      } else if (action === "terminate") {
-        await stopNode(target.id);
-        setLocalNotice("stop issued; resources will be released");
+      } else if (action === "resume") {
+        await resumeNode(target.id);
+        setLocalNotice("resume issued");
       } else if (action === "fork") {
         const newNode = await forkNode(target.id, {});
         setLocalNotice(`forked into ${newNode.id}`);
@@ -451,6 +485,9 @@ export function App() {
           hookCount={enabledHookCount}
           daemonVersion={health?.daemon_version ? `asylum ${health.daemon_version}` : undefined}
           bindAddr={health?.bind_addr ?? (typeof window !== "undefined" ? window.location.host : "localhost")}
+          daemonUptime={
+            typeof health?.uptime_seconds === "number" ? formatDurationSeconds(health.uptime_seconds) : undefined
+          }
           onPick={handleSelectScreen}
         />
 
@@ -482,11 +519,19 @@ export function App() {
                 onLaunchCC={() => setScreen("create")}
                 substrates={substrates}
                 relationships={graph.relationships}
+                pendingDecisionNodeIds={pendingDecisionNodeIds}
+                onOpenDecisions={() => setScreen("decisions")}
               />
             )
           )}
           {screen === "fleet" && (
-            <FleetScreen nodes={graph.nodes} onLaunch={() => setScreen("create")} onOpen={handleOpenNode} />
+            <FleetScreen
+              nodes={graph.nodes}
+              onLaunch={() => setScreen("create")}
+              onOpen={handleOpenNode}
+              pendingDecisionNodeIds={pendingDecisionNodeIds}
+              relationships={graph.relationships}
+            />
           )}
           {screen === "decisions" && <DecisionsScreen />}
           {screen === "node" && (
@@ -498,6 +543,10 @@ export function App() {
               onBack={() => setScreen("fleet")}
               onOpen={handleOpenNode}
               onAction={(a, p) => handleNodeAction(openNode ?? selectedNode, a, p)}
+              hasPendingDecision={
+                (openNode ?? selectedNode) ? pendingDecisionNodeIds.has((openNode ?? selectedNode)!.id) : false
+              }
+              onOpenDecisions={() => setScreen("decisions")}
             />
           )}
           {screen === "create" && (

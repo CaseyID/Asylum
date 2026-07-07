@@ -1,4 +1,3 @@
-use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
@@ -7,8 +6,8 @@ use anyhow::{bail, Context, Result};
 use asylum_types::api::{
     ChannelCreateRequest, ChannelInboundRequest, ChannelTestRequest, ChannelUpdateRequest,
     CreateNodeRequest, DecisionCreateRequest, DecisionResolveRequest, ErrorPayload,
-    ForkNodeRequest, HookCreateRequest, HookUpdateRequest, LaunchPacketResponse, SendInputRequest,
-    SpawnPeerRequest,
+    ForkNodeRequest, HarnessEventRequest, HookCreateRequest, HookUpdateRequest,
+    LaunchPacketResponse, SendInputRequest, SpawnPeerRequest,
 };
 use asylum_types::config::AsylumConfig;
 use asylum_types::node::SubstrateKind;
@@ -31,7 +30,7 @@ use serde_json::json;
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast::error::RecvError, mpsc, Mutex};
+use tokio::sync::broadcast::{self, error::RecvError};
 use uuid::Uuid;
 
 use crate::auth::hash_token;
@@ -44,7 +43,6 @@ use axum::response::Html;
 #[cfg(debug_assertions)]
 use axum::routing::get_service;
 use futures::{SinkExt, StreamExt};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 #[cfg(not(debug_assertions))]
 use rust_embed::RustEmbed;
 #[cfg(debug_assertions)]
@@ -81,6 +79,9 @@ pub async fn serve_with_socket(
 ) -> Result<()> {
     let state = build_state(bind, database, socket_path.clone(), config)?;
     let service_arc = Arc::new(state.service.clone());
+    // Reconcile persisted liveness against reality BEFORE binding listeners, so
+    // no client ever sees an eternal-Running lie left by the previous process.
+    service_arc.reconcile_on_boot().await;
     service_arc.start_background_tasks();
 
     let tcp_router = build_router_for_transport(state.clone(), true);
@@ -179,6 +180,7 @@ fn build_state(
             ntfy_poll_interval_seconds: Some(config.ntfy.poll_interval_seconds),
             harness: config.harness,
             loon: config.loon,
+            autonomy: config.autonomy,
         },
     );
 
@@ -230,7 +232,12 @@ pub fn build_router_for_transport(state: Arc<AppState>, require_auth: bool) -> R
         .route("/api/nodes/{id}/events", get(api_node_events))
         .route("/api/graph", get(api_graph))
         .route("/api/nodes/{id}/input", post(api_node_send_input))
+        .route(
+            "/api/nodes/{id}/harness-event",
+            post(api_node_harness_event),
+        )
         .route("/api/nodes/{id}/interrupt", post(api_node_interrupt))
+        .route("/api/nodes/{id}/resume", post(api_node_resume))
         .route("/api/nodes/{id}/stop", post(api_node_stop))
         .route("/api/nodes/{id}/archive", post(api_node_archive))
         .route("/api/nodes/{id}/spawn", post(api_node_spawn_peer))
@@ -291,8 +298,8 @@ pub fn build_router_for_transport(state: Arc<AppState>, require_auth: bool) -> R
         .route("/api/hooks/firings", get(api_hook_firings))
         .route("/api/hooks/events", get(api_hook_events))
         .route("/api/hooks/{id}/test", post(api_hook_test))
-        .route("/api/recipes", get(api_recipes_list))
         .route("/api/nodes/{id}/fork", post(api_node_fork));
+
     let protected = if require_auth {
         protected.layer(middleware::from_fn_with_state(
             state.clone(),
@@ -420,6 +427,21 @@ pub async fn api_node_send_input(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn api_node_harness_event(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(request): Json<HarnessEventRequest>,
+) -> Result<Json<asylum_types::api::HarnessEventResponse>, AppError> {
+    let id = Uuid::parse_str(&id)
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    let response = state
+        .service
+        .post_harness_event(id, request)
+        .await
+        .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(response))
+}
+
 pub async fn api_node_interrupt(
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<String>,
@@ -429,6 +451,20 @@ pub async fn api_node_interrupt(
     state
         .service
         .interrupt_node(id)
+        .await
+        .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn api_node_resume(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let id = Uuid::parse_str(&id)
+        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    state
+        .service
+        .resume_node(id)
         .await
         .map_err(|error| AppError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
@@ -547,16 +583,23 @@ async fn handle_node_observe_ws(
     let Ok(Some(node)) = service.store.get_node(node_id) else {
         return;
     };
-    if node.substrate != SubstrateKind::Local {
+    // Live PTY output streams for both Local and Loon nodes (Loon frames flow
+    // through the same broadcast as the transcript sink).
+    let output = match node.substrate {
+        SubstrateKind::Local => service.local_substrate.attach(node_id).await.ok(),
+        SubstrateKind::Loon => {
+            match (service.loon_substrate.as_ref(), node.external_id.as_deref()) {
+                (Some(loon), Some(external_id)) => loon.attach(external_id).await.ok(),
+                _ => None,
+            }
+        }
+    };
+    let Some(mut output) = output else {
         let _ = socket
             .send(Message::Text(
                 "asylum.observe.ws.live_stream_unavailable".into(),
             ))
             .await;
-        return;
-    }
-
-    let Ok(mut output) = service.local_substrate.attach(node_id).await else {
         return;
     };
 
@@ -978,27 +1021,9 @@ pub async fn api_attach_ws(
     if let Err(error) = state.service.require_attachable_node(node.id).await {
         return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
     }
-    match node.substrate {
-        SubstrateKind::Local => {
-            ws.on_upgrade(move |socket| handle_attach_ws(socket, state.service.clone(), node.id))
-        }
-        SubstrateKind::Loon => {
-            let external_id = match node.external_id.as_deref() {
-                Some(value) => value.to_string(),
-                None => {
-                    return (StatusCode::BAD_REQUEST, "missing loon external id").into_response()
-                }
-            };
-            let loon = match state.service.loon_substrate.as_ref() {
-                Some(loon) => loon.clone(),
-                None => {
-                    return (StatusCode::BAD_REQUEST, "loon substrate unavailable").into_response()
-                }
-            };
-            let (command, args, env) = loon.attach_invocation(&external_id);
-            ws.on_upgrade(move |socket| handle_command_attach_ws(socket, command, args, env))
-        }
-    }
+    // Both substrates stream the live PTY over a broadcast; input is routed to
+    // the owning substrate inside handle_attach_ws.
+    ws.on_upgrade(move |socket| handle_attach_ws(socket, state.service.clone(), node.id))
 }
 
 async fn handle_attach_ws(
@@ -1006,7 +1031,16 @@ async fn handle_attach_ws(
     service: crate::capability_service::CapabilityService,
     node_id: Uuid,
 ) {
-    let output = match service.local_substrate.attach(node_id).await {
+    let node = match service.store.get_node(node_id) {
+        Ok(Some(node)) => node,
+        _ => {
+            let _ = socket
+                .send(Message::Text("attach failed: node not found".into()))
+                .await;
+            return;
+        }
+    };
+    let output = match attach_output_for(&service, &node).await {
         Ok(receiver) => receiver,
         Err(error) => {
             let _ = socket
@@ -1023,7 +1057,7 @@ async fn handle_attach_ws(
         tokio::select! {
             inbound = recv.next() => match inbound {
                 Some(Ok(Message::Text(text))) => {
-                    if let Err(error) = service.local_substrate.send_input_raw(node_id, &text).await {
+                    if let Err(error) = route_attach_input(&service, &node, text.as_bytes()).await {
                         let _ = send
                             .send(Message::Text(format!("input failed: {error}").into()))
                             .await;
@@ -1032,7 +1066,7 @@ async fn handle_attach_ws(
                 Some(Ok(Message::Binary(bytes))) => {
                     match String::from_utf8(bytes.to_vec()) {
                         Ok(text) => {
-                            if let Err(error) = service.local_substrate.send_input_raw(node_id, &text).await {
+                            if let Err(error) = route_attach_input(&service, &node, text.as_bytes()).await {
                                 let _ = send
                                     .send(Message::Text(format!("input failed: {error}").into()))
                                     .await;
@@ -1066,111 +1100,59 @@ async fn handle_attach_ws(
     }
 }
 
-async fn handle_command_attach_ws(
-    socket: WebSocket,
-    command: std::path::PathBuf,
-    args: Vec<String>,
-    env: Vec<(String, String)>,
-) {
-    let pty = match native_pty_system().openpty(PtySize::default()) {
-        Ok(pty) => pty,
-        Err(error) => {
-            send_attach_setup_error(socket, format!("attach failed: {error}")).await;
-            return;
-        }
-    };
-    let mut builder = CommandBuilder::new(command);
-    for arg in args {
-        builder.arg(arg);
-    }
-    for (key, value) in env {
-        builder.env(key, value);
-    }
-    let child = match pty.slave.spawn_command(builder) {
-        Ok(child) => child,
-        Err(error) => {
-            send_attach_setup_error(socket, format!("attach failed: {error}")).await;
-            return;
-        }
-    };
-    let mut reader = match pty.master.try_clone_reader() {
-        Ok(reader) => reader,
-        Err(error) => {
-            send_attach_setup_error(socket, format!("attach failed: {error}")).await;
-            return;
-        }
-    };
-    let writer = match pty.master.take_writer() {
-        Ok(writer) => writer,
-        Err(error) => {
-            send_attach_setup_error(socket, format!("attach failed: {error}")).await;
-            return;
-        }
-    };
-
-    let writer = Arc::new(Mutex::new(writer));
-    let (output_tx, mut output_rx) = mpsc::channel::<String>(128);
-    tokio::task::spawn_blocking(move || {
-        let mut child = child;
-        let mut buffer = [0_u8; 1024];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(size) => {
-                    let chunk = String::from_utf8_lossy(&buffer[..size]).to_string();
-                    if output_tx.blocking_send(chunk).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = child.wait();
-    });
-
-    let (mut send, mut recv) = socket.split();
-    loop {
-        tokio::select! {
-            inbound = recv.next() => match inbound {
-                Some(Ok(Message::Text(text))) => {
-                    if write_attach_input(writer.clone(), text.as_bytes()).await.is_err() {
-                        let _ = send.send(Message::Text("input failed".into())).await;
-                    }
-                }
-                Some(Ok(Message::Binary(bytes))) => {
-                    if write_attach_input(writer.clone(), &bytes).await.is_err() {
-                        let _ = send.send(Message::Text("input failed".into())).await;
-                    }
-                }
-                Some(Ok(Message::Close(_))) => break,
-                Some(Ok(Message::Ping(payload))) => {
-                    let _ = send.send(Message::Pong(payload)).await;
-                }
-                Some(Ok(_)) | Some(Err(_)) | None => break,
-            },
-            output = output_rx.recv() => match output {
-                Some(chunk) => {
-                    if send.send(Message::Text(chunk.into())).await.is_err() {
-                        break;
-                    }
-                }
-                None => break,
-            },
+/// Resolve the live PTY output broadcast for a node from its owning substrate.
+async fn attach_output_for(
+    service: &crate::capability_service::CapabilityService,
+    node: &asylum_types::node::NodeRecord,
+) -> anyhow::Result<broadcast::Receiver<String>> {
+    match node.substrate {
+        SubstrateKind::Local => service.local_substrate.attach(node.id).await,
+        SubstrateKind::Loon => {
+            let loon = service
+                .loon_substrate
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("loon substrate unavailable"))?;
+            let external_id = node
+                .external_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("missing loon external id"))?;
+            loon.attach(external_id).await
         }
     }
 }
 
-async fn send_attach_setup_error(mut socket: WebSocket, message: String) {
-    let _ = socket.send(Message::Text(message.into())).await;
-}
-
-async fn write_attach_input(
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+/// Route raw attach input (no appended submit key) to the node's owning
+/// substrate PTY.
+///
+/// Addendum C: this raw interactive-attach path intentionally records NO
+/// `InputSent` event. Unlike `CapabilityService::send_input` (the programmatic
+/// one-message-per-call API, which does record `InputSent`), this path carries a
+/// live operator terminal's per-keystroke byte stream. Emitting an event per
+/// keystroke would spam the event log with no useful granularity, so the raw
+/// attach stream is deliberately left off the event ledger; the attach session
+/// itself is the audit unit.
+async fn route_attach_input(
+    service: &crate::capability_service::CapabilityService,
+    node: &asylum_types::node::NodeRecord,
     bytes: &[u8],
-) -> std::io::Result<()> {
-    let mut writer = writer.lock().await;
-    writer.write_all(bytes)?;
-    writer.flush()
+) -> anyhow::Result<()> {
+    match node.substrate {
+        SubstrateKind::Local => {
+            let text = String::from_utf8_lossy(bytes);
+            service.local_substrate.send_input_raw(node.id, &text).await
+        }
+        SubstrateKind::Loon => {
+            let loon = service
+                .loon_substrate
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("loon substrate unavailable"))?;
+            let external_id = node
+                .external_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("missing loon external id"))?;
+            loon.send_input_raw(external_id, bytes).await
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1384,13 +1366,8 @@ pub async fn api_hook_test(
     Ok(Json(response))
 }
 
-pub async fn api_recipes_list(
-    Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_types::api::RecipeListResponse> {
-    Json(state.service.list_recipes().await)
-}
-
 pub async fn api_node_fork(
+
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<String>,
     Json(request): Json<ForkNodeRequest>,
@@ -1580,6 +1557,7 @@ mod tests {
             ntfy_poll_interval_seconds: Some(core.ntfy.poll_interval_seconds),
             harness: core.harness,
             loon: core.loon,
+            autonomy: core.autonomy,
         }
     }
 
@@ -1787,29 +1765,41 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    let has_bearer = request
+    let path = request.uri().path().to_string();
+
+    // Bearer header: validate, then M3 scope-check (a per-node guest token may
+    // only act on its own node's path).
+    let header_value = request
         .headers()
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| state.service.validate_owner_token(Some(value)));
-
-    if has_bearer {
-        return next.run(request).await;
+        .map(|v| v.to_string());
+    if let Some(value) = header_value {
+        if state.service.validate_owner_token(Some(&value)) {
+            let raw = value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+                .unwrap_or(&value);
+            if state.service.scoped_token_authorizes_path(raw, &path) {
+                return next.run(request).await;
+            }
+            return forbidden_cross_node();
+        }
     }
 
     // Browser WebSocket clients cannot set custom headers; accept a ?token= query param.
-    let has_query_token = request
-        .uri()
-        .query()
-        .and_then(|query| {
-            url::form_urlencoded::parse(query.as_bytes())
-                .find(|(key, _)| key == "token")
-                .map(|(_, value)| value.into_owned())
-        })
-        .is_some_and(|token| state.service.validate_owner_token_value(&token));
-
-    if has_query_token {
-        return next.run(request).await;
+    let query_token = request.uri().query().and_then(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .find(|(key, _)| key == "token")
+            .map(|(_, value)| value.into_owned())
+    });
+    if let Some(token) = query_token {
+        if state.service.validate_owner_token_value(&token) {
+            if state.service.scoped_token_authorizes_path(&token, &path) {
+                return next.run(request).await;
+            }
+            return forbidden_cross_node();
+        }
     }
 
     (
@@ -1817,6 +1807,19 @@ pub async fn auth_middleware(
         Json(ErrorPayload {
             code: "unauthorized".to_string(),
             message: "missing or invalid token".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+/// M3: a valid per-node guest token tried to act outside its own node (or on the
+/// token-management surface). Authenticated but not authorized.
+fn forbidden_cross_node() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorPayload {
+            code: "forbidden".to_string(),
+            message: "token is scoped to its own node and may not act on this resource".to_string(),
         }),
     )
         .into_response()

@@ -28,6 +28,9 @@ tracing.workspace = true
 uuid.workspace = true
 url.workspace = true
 serde_with.workspace = true
+tokio-tungstenite.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

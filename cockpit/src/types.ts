@@ -47,6 +47,11 @@ export interface AsylumNode {
   tool_calls: number;
   ctx_pct: number;
   idle_seconds: number;
+  // Harness-native session identity recorded from the harness-event bridge
+  // (claude `session_id`, codex `thread-id`). Resume key for Phase C. Present
+  // on the daemon's NodeRecord as of W1/W3; optional here so fixtures/tests
+  // that predate it still type-check.
+  harness_session_id?: string | null;
   // augments
   output_preview?: string;
   is_command_center?: boolean;
@@ -169,10 +174,25 @@ export interface ChannelTestRequest {
 // ─── hooks ────────────────────────────────────────────────────────
 
 export interface HookAction {
-  kind: "channel" | "spawn" | "tool" | "pause_node" | "archive" | string;
+  kind: "channel" | "send_input" | "spawn" | "tool" | "pause_node" | "archive" | string;
   target: string;
   template?: string;
   args?: Record<string, unknown>;
+}
+
+// ─── hook action arg shapes (W4 contract; args stays a loose Record on the
+// wire, these are the shapes the cockpit forms read/write) ────────────────
+export interface SendInputActionArgs {
+  text?: string;
+}
+
+export interface SpawnActionArgs {
+  harness?: HarnessKind;
+  substrate?: SubstrateKind;
+  role?: string;
+  workspace?: string;
+  description?: string;
+  prompt?: string;
 }
 
 export interface HookRule {
@@ -220,20 +240,8 @@ export interface HookEventCatalogEntry {
   label: string;
 }
 
-// ─── recipes ───────────────────────────────────────────────────────
-
-export interface RecipeDescriptor {
-  id: string;
-  title: string;
-  prompt_template: string;
-  kind: string;
-}
-
-export interface RecipeListResponse {
-  recipes: RecipeDescriptor[];
-}
-
 // ─── decisions ────────────────────────────────────────────────────
+
 
 export interface DecisionRecord {
   id: string;
@@ -255,6 +263,9 @@ export interface DecisionCreateRequest {
 
 export interface DecisionResolveRequest {
   status: "approved" | "denied";
+  // Optional free-text answer injected verbatim into the node's PTY,
+  // overriding the status-derived affirmative/negative feedback (W4).
+  answer?: string;
 }
 
 // ─── fork ─────────────────────────────────────────────────────────
@@ -295,6 +306,12 @@ export interface HealthResponse {
   database_path: string;
   database_size_bytes: number;
   transcripts_dir: string;
+  // D2: daemon-provided uptime (was previously derived client-side from
+  // per-node created_at only; the daemon itself did not expose its own
+  // start time). Optional so fixtures/tests that predate the field still
+  // type-check.
+  daemon_started_at_epoch_secs?: number;
+  uptime_seconds?: number;
 }
 
 export interface TokenSummary {

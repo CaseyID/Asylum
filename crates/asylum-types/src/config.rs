@@ -17,6 +17,8 @@ pub struct AsylumConfig {
     pub ntfy: NtfyConfig,
     #[serde(default)]
     pub workspace: WorkspaceConfig,
+    #[serde(default)]
+    pub autonomy: AutonomyConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,6 +38,27 @@ impl Default for AsylumConfig {
             loon: LoonConfig::default(),
             ntfy: NtfyConfig::default(),
             workspace: WorkspaceConfig::default(),
+            autonomy: AutonomyConfig::default(),
+        }
+    }
+}
+
+/// Tunables for the daemon-side autonomy signals (Phase B).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AutonomyConfig {
+    /// Context-window usage percentages (0-100) that fire `node.ctx_pressure`
+    /// when crossed. Each threshold fires at most once per harness session.
+    pub ctx_pressure_thresholds: Vec<f64>,
+    /// Seconds of no PTY output on a Running local node before the quiescence
+    /// timer fires `node.idle` (only for harnesses without a native idle signal).
+    pub idle_quiescence_seconds: u64,
+}
+
+impl Default for AutonomyConfig {
+    fn default() -> Self {
+        Self {
+            ctx_pressure_thresholds: vec![75.0, 90.0],
+            idle_quiescence_seconds: 120,
         }
     }
 }
@@ -48,9 +71,9 @@ pub struct AuthConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HarnessConfig {
-    #[serde(default)]
+    #[serde(default = "default_codex_command")]
     pub codex_command: String,
-    #[serde(default)]
+    #[serde(default = "default_claude_command")]
     pub claude_command: String,
     #[serde(default)]
     pub default_workspace_root: Option<PathBuf>,
@@ -58,11 +81,19 @@ pub struct HarnessConfig {
     pub startup_args: BTreeMap<String, Vec<String>>,
 }
 
+fn default_codex_command() -> String {
+    "codex".to_string()
+}
+
+fn default_claude_command() -> String {
+    "claude".to_string()
+}
+
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
-            codex_command: "codex".to_string(),
-            claude_command: "claude".to_string(),
+            codex_command: default_codex_command(),
+            claude_command: default_claude_command(),
             default_workspace_root: None,
             startup_args: BTreeMap::new(),
         }
@@ -71,25 +102,96 @@ impl Default for HarnessConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoonConfig {
+    #[serde(default = "default_loon_endpoint")]
     pub endpoint: String,
-    pub api_key_file: Option<PathBuf>,
-    pub cert_fingerprint_file: Option<PathBuf>,
+    #[serde(default)]
     pub cli_path: Option<PathBuf>,
+    #[serde(default)]
     pub enabled: bool,
+    /// Path to the loon client config.toml (url/key/fingerprint per profile).
+    /// Defaults to \$XDG_CONFIG_HOME/loon/config.toml (or ~/.config/loon/config.toml).
+    #[serde(default)]
+    pub config_path: Option<PathBuf>,
+    /// loon profile name to use from the client config. Defaults to the config's
+    /// default_profile.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Guest OCI-tar image path (local path the loon host can read) used for
+    /// . Defaults to the claude-dev reference image.
+    #[serde(default = "default_loon_image")]
+    pub image: String,
+    /// Base URL the in-guest harness uses to reach the Asylum daemon over HTTP.
+    /// Guests reach the host via the per-VM gateway, stably named
+    /// host.loon.internal. Defaults to http://host.loon.internal:<asylum-port>
+    /// derived from the daemon bind when unset.
+    #[serde(default)]
+    pub guest_base_url: Option<String>,
+    /// In-guest workspace directory created at provision when a node does not
+    /// specify a workspace. Loon workspaces live INSIDE the guest (no host bind
+    /// mounts). Defaults to /work.
+    #[serde(default = "default_loon_workspace")]
+    pub workspace_dir: String,
+    /// microVM memory in MiB for `loon vm create`. claude-code (Node.js) plus the
+    /// in-guest MCP server need well beyond loon's 256 MiB default; too little
+    /// OOMs the guest. Defaults to 2048.
+    #[serde(default = "default_loon_vm_memory_mib")]
+    pub vm_memory_mib: u32,
+    /// microVM vCPU count for `loon vm create`. Defaults to 2.
+    #[serde(default = "default_loon_vm_cpus")]
+    pub vm_cpus: u32,
+    /// Host path to the static musl \`asylum\` binary staged into the guest at
+    /// /usr/local/bin/asylum for the in-guest MCP server + harness-event bridge.
+    /// Required for MCP-in-guest; build via scripts/build-guest-asylum.sh.
+    #[serde(default)]
+    pub guest_asylum_binary: Option<PathBuf>,
+}
+
+fn default_loon_endpoint() -> String {
+    "http://127.0.0.1:7777".to_string()
+}
+
+fn default_loon_image() -> String {
+    "/var/lib/loon/agent-images/claude-dev.oci.tar".to_string()
+}
+
+fn default_loon_workspace() -> String {
+    "/work".to_string()
+}
+
+fn default_loon_vm_memory_mib() -> u32 {
+    2048
+}
+
+fn default_loon_vm_cpus() -> u32 {
+    2
 }
 
 impl Default for LoonConfig {
     fn default() -> Self {
         Self {
             endpoint: "http://127.0.0.1:7777".to_string(),
-            api_key_file: None,
-            cert_fingerprint_file: None,
             cli_path: None,
             enabled: false,
+            config_path: None,
+            profile: None,
+            image: default_loon_image(),
+            guest_base_url: None,
+            workspace_dir: default_loon_workspace(),
+            vm_memory_mib: default_loon_vm_memory_mib(),
+            vm_cpus: default_loon_vm_cpus(),
+            guest_asylum_binary: None,
         }
     }
 }
 
+/// ntfy channel config. SECURITY (M8): the topic is a control channel, not just
+/// an alert feed. A correlated reply on this topic auto-resolves a pending
+/// decision and injects the reply text into the node's harness. The correlation
+/// token in the push body is anti-collision only (32 hex chars), NOT a secret --
+/// it travels in cleartext. Anyone who can PUBLISH to the topic can drive input
+/// into your workers, so topic write-access equals fleet control. Use a private,
+/// unguessable `topic` and, where the server supports it, a publish ACL via
+/// `token`. See README "ntfy Notifications".
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NtfyConfig {
     pub server: Option<String>,
@@ -117,5 +219,42 @@ pub struct WorkspaceConfig {
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self { recent_limit: 20 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: a `[harness]` table that sets only some keys must still default
+    // the harness commands to their real names. Field-level `#[serde(default)]`
+    // uses the field TYPE's Default (empty String), NOT `HarnessConfig::default`,
+    // so an omitted `claude_command` used to deserialize to "" — which the Loon
+    // substrate launched as `exec ""` in-guest (exit 126, zero output).
+    #[test]
+    fn partial_harness_table_defaults_commands_to_binary_names() {
+        let cfg: AsylumConfig = toml::from_str(
+            "base_url = \"http://127.0.0.1:7798\"\n[harness]\ndefault_workspace_root = \"/tmp/ws\"\n",
+        )
+        .expect("parse config");
+        assert_eq!(cfg.harness.claude_command, "claude");
+        assert_eq!(cfg.harness.codex_command, "codex");
+    }
+
+    #[test]
+    fn explicit_harness_commands_are_honored() {
+        let cfg: AsylumConfig = toml::from_str(
+            "[harness]\nclaude_command = \"/opt/claude\"\ncodex_command = \"/opt/codex\"\n",
+        )
+        .expect("parse config");
+        assert_eq!(cfg.harness.claude_command, "/opt/claude");
+        assert_eq!(cfg.harness.codex_command, "/opt/codex");
+    }
+
+    #[test]
+    fn absent_harness_table_defaults_commands() {
+        let cfg: AsylumConfig = toml::from_str("base_url = \"x\"\n").expect("parse config");
+        assert_eq!(cfg.harness.claude_command, "claude");
+        assert_eq!(cfg.harness.codex_command, "codex");
     }
 }

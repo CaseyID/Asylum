@@ -5,6 +5,7 @@ use asylum_types::node::CapabilitySnapshot;
 use asylum_types::node::HarnessKind;
 
 use crate::harness::launch_context::LaunchContext;
+use crate::harness::DaemonResolution;
 
 pub struct CodexHarness {
     command: String,
@@ -40,7 +41,11 @@ impl super::HarnessAdapter for CodexHarness {
             send_input: true,
             interrupt: true,
             stop: true,
-            resume: false,
+            // Resume is real on Local (claude --resume / codex resume from the
+            // recorded session id + surviving workspace). create_node overrides
+            // this to false for Loon nodes, whose in-guest workspace does not
+            // survive a daemon restart.
+            resume: true,
             structured_events: false,
             transcript_export: false,
         }
@@ -68,15 +73,25 @@ impl super::HarnessAdapter for CodexHarness {
     fn asylum_control_args(
         &self,
         asylum_binary: &str,
-        socket_path: Option<&str>,
+        resolution: &DaemonResolution,
         node_id: uuid::Uuid,
+        // Codex session ids are not pre-assignable (`codex` has no --session-id);
+        // W1 records the thread-id from the first notify post instead.
+        _session_id: Option<uuid::Uuid>,
     ) -> Vec<String> {
         let mut env_entries = vec![format!(
             "ASYLUM_NODE_ID={}",
             toml_string(&node_id.to_string())
         )];
-        if let Some(socket_path) = socket_path {
-            env_entries.push(format!("ASYLUM_SOCKET_PATH={}", toml_string(socket_path)));
+        match resolution {
+            DaemonResolution::Socket(Some(socket_path)) => {
+                env_entries.push(format!("ASYLUM_SOCKET_PATH={}", toml_string(socket_path)));
+            }
+            DaemonResolution::Socket(None) => {}
+            DaemonResolution::Http { base_url, token } => {
+                env_entries.push(format!("ASYLUM_BASE_URL={}", toml_string(base_url)));
+                env_entries.push(format!("ASYLUM_TOKEN={}", toml_string(token)));
+            }
         }
 
         vec![
@@ -92,7 +107,38 @@ impl super::HarnessAdapter for CodexHarness {
             "mcp_servers.asylum.startup_timeout_sec=10".to_string(),
             "-c".to_string(),
             "mcp_servers.asylum.tool_timeout_sec=60".to_string(),
+            // Route codex's per-turn `agent-turn-complete` notification through the
+            // asylum bridge. Codex appends one argv element of JSON to this command;
+            // the bridge reads it from argv (never stdin) and POSTs the mapped event.
+            // Value is a TOML array of strings, matching how `-c mcp_servers.*.args`
+            // is formatted above.
+            "-c".to_string(),
+            format!(
+                "notify=[{},{},{}]",
+                toml_string(asylum_binary),
+                toml_string("harness-event"),
+                toml_string("codex-notify")
+            ),
         ]
+    }
+
+    fn resume_args(
+        &self,
+        session_id: &str,
+        asylum_binary: &str,
+        resolution: &DaemonResolution,
+        node_id: uuid::Uuid,
+    ) -> Option<Vec<String>> {
+        // Codex resumes via a `resume <thread-id>` subcommand (not a flag), so the
+        // subcommand + id lead the argv. `codex resume` accepts both the
+        // trust-bypass flag and the `-c` config overrides (verified against
+        // codex-cli 0.132.0), so the standard launch args and the Asylum MCP +
+        // notify injection are reused unchanged -- the resumed session keeps its
+        // control surface and its per-turn notify bridge.
+        let mut args = vec!["resume".to_string(), session_id.to_string()];
+        args.extend(self.launch_args.iter().cloned());
+        args.extend(self.asylum_control_args(asylum_binary, resolution, node_id, None));
+        Some(args)
     }
 
     fn pre_trust_workspace(&self, workspace: &str) -> anyhow::Result<()> {

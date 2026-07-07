@@ -7,6 +7,7 @@ import {
   removeRelationship,
   markNotificationRead,
   requestBrowserAttach,
+  resumeNode,
   setStoredOwnerToken,
   stopNode,
 } from "./api";
@@ -245,13 +246,30 @@ describe("H6 — toast nodeId field and reply handler behaviour", () => {
   });
 });
 
-// H7 — resumeNode must no longer exist on the API client surface.
-describe("H7 — resumeNode removed from API surface", () => {
-  it("the api module does not export resumeNode", () => {
-    // The real check: verify the named export is absent at module level.
-    // We imported the module above; TypeScript would have caught it at
-    // compile time. This runtime check gives a clear test-failure message.
-    const apiModule = { interruptNode, archiveNode, stopNode } as Record<string, unknown>;
-    expect("resumeNode" in apiModule).toBe(false);
+// D2 — resumeNode reintroduced against the real POST /api/nodes/:id/resume
+// route (a parallel workstream delivers the daemon side). H7 (2026-04-29)
+// removed the old dead client plumbing for this because no route backed it;
+// this time it is wired to a real Resume button (NodeScreen/Inspector), so
+// the client call is real again and covered by its own tests.
+describe("resumeNode", () => {
+  it("posts to /nodes/:id/resume with an empty JSON body", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await resumeNode("node-42");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/nodes/node-42/resume",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({}) }),
+    );
+  });
+
+  it("propagates a daemon error (e.g. route not yet available) as an ApiError", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response("not found", { status: 404, statusText: "Not Found" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(resumeNode("node-42")).rejects.toThrow(/404/);
   });
 });

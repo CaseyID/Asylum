@@ -26,6 +26,9 @@ export interface GraphProps {
   selectedId?: string;
   onSelect: (n: GraphNode) => void;
   substrates: { id: string; name: string; healthy: boolean; capacity: number }[];
+  // node ids with an unresolved pending decision — renders a small badge on
+  // the node card (W5 decision surfacing).
+  pendingDecisionNodeIds?: Set<string>;
 }
 
 // ─── position map ────────────────────────────────────────────────────
@@ -158,7 +161,7 @@ function edgePathFreeform(p1: Pos, p2: Pos, p1NodeH = NODE_H_BASE): string {
 }
 
 // ─── Graph component ───────────────────────────────────────────────────
-export function Graph({ nodes, layout, selectedId, onSelect, substrates }: GraphProps): ReactElement {
+export function Graph({ nodes, layout, selectedId, onSelect, substrates, pendingDecisionNodeIds }: GraphProps): ReactElement {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const [size, setSize] = useState({ w: 900, h: 600 });
   const [view, setView] = useState({ x: 0, y: 0, k: 1 });
@@ -335,6 +338,7 @@ export function Graph({ nodes, layout, selectedId, onSelect, substrates }: Graph
           const hLabel = harnessLabel(gn.node.harness);
           const uptime = uptimeLabel(gn.node);
           const roleGlyph = ROLE_GLYPH[gn.node.role_hint] ?? ROLE_GLYPH[gn.node.role_hint?.toLowerCase()] ?? "";
+          const pendingDecision = pendingDecisionNodeIds?.has(gn.node.id) ?? false;
 
           return (
             <div
@@ -349,6 +353,29 @@ export function Graph({ nodes, layout, selectedId, onSelect, substrates }: Graph
               style={{ left: p.x, top: p.y }}
               onClick={(e) => { e.stopPropagation(); onSelect(gn); }}
             >
+              {pendingDecision && (
+                <span
+                  className="node-card-decision-badge"
+                  title="pending decision"
+                  style={{
+                    position: "absolute",
+                    top: -6,
+                    right: -6,
+                    width: 16,
+                    height: 16,
+                    borderRadius: "50%",
+                    background: "var(--status-waiting)",
+                    color: "var(--bg)",
+                    fontSize: 10,
+                    fontWeight: 700,
+                    display: "grid",
+                    placeItems: "center",
+                    lineHeight: 1,
+                  }}
+                >
+                  ?
+                </span>
+              )}
               <div className="row1">
                 <span className="nid">{displayId}</span>
                 <span style={{ color: "var(--fg-muted)", fontSize: 14, opacity: 0.7 }}>{roleGlyph}</span>

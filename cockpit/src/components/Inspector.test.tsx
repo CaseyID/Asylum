@@ -1,8 +1,10 @@
-import { describe, it, expect, vi } from "vitest";
-import { render } from "@testing-library/react";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { cleanup, render } from "@testing-library/react";
 import { Inspector } from "./Inspector";
 import { shortNodeId } from "../lib/glyphs";
 import type { AsylumNode, GraphRelationship } from "../types";
+
+afterEach(() => cleanup());
 
 // Minimal node fixture — only fields Inspector reads.
 function makeNode(id: string): AsylumNode {
@@ -105,5 +107,98 @@ describe("Inspector parent display", () => {
     );
 
     expect(queryByText(/^attach$/i)).toBeNull();
+  });
+});
+
+describe("Inspector W5 decision + session surfacing", () => {
+  it("shows a pending-decision affordance that opens the decisions screen", () => {
+    const node = makeNode("worker-abc123");
+    const onOpenDecisions = vi.fn();
+    const { getByRole } = render(
+      <Inspector
+        node={node}
+        onAction={vi.fn()}
+        onOpen={vi.fn()}
+        hasPendingDecision
+        onOpenDecisions={onOpenDecisions}
+      />,
+    );
+
+    const btn = getByRole("button", { name: "pending decision" });
+    btn.click();
+    expect(onOpenDecisions).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not show a pending-decision affordance when there is none pending", () => {
+    const node = makeNode("worker-abc123");
+    const { queryByRole } = render(
+      <Inspector node={node} onAction={vi.fn()} onOpen={vi.fn()} />,
+    );
+
+    expect(queryByRole("button", { name: "pending decision" })).toBeNull();
+  });
+
+  it("shows the harness session id in the overview when present", () => {
+    const node = { ...makeNode("worker-abc123"), harness_session_id: "sess-xyz" };
+    const { container } = render(
+      <Inspector node={node} onAction={vi.fn()} onOpen={vi.fn()} />,
+    );
+
+    expect(container.textContent).toContain("sess-xyz");
+  });
+});
+
+// D2 — the danger "terminate" button was a mislabeled duplicate of "stop"
+// (App.tsx routed both to the same stopNode call); it is now a real "archive"
+// action, and a gated "resume" button appears for stopped-but-resumable nodes.
+describe("Inspector controls (D2 stop/archive/resume truth)", () => {
+  it("no longer offers a 'terminate' action — archive replaces it", () => {
+    const node = makeNode("worker-abc123");
+    const { queryByRole, getByRole } = render(
+      <Inspector node={node} onAction={vi.fn()} onOpen={vi.fn()} />,
+    );
+
+    expect(queryByRole("button", { name: "terminate" })).toBeNull();
+    expect(getByRole("button", { name: "archive" })).toBeDefined();
+  });
+
+  it("archive button calls onAction('archive')", () => {
+    const node = makeNode("worker-abc123");
+    const onAction = vi.fn();
+    const { getByRole } = render(
+      <Inspector node={node} onAction={onAction} onOpen={vi.fn()} />,
+    );
+
+    getByRole("button", { name: "archive" }).click();
+    expect(onAction).toHaveBeenCalledWith("archive");
+  });
+
+  it("shows a resume button for a stopped node with a harness_session_id", () => {
+    const node = { ...makeNode("worker-abc123"), liveness: "stopped" as const, harness_session_id: "sess-1" };
+    const onAction = vi.fn();
+    const { getByRole } = render(
+      <Inspector node={node} onAction={onAction} onOpen={vi.fn()} />,
+    );
+
+    getByRole("button", { name: "resume" }).click();
+    expect(onAction).toHaveBeenCalledWith("resume");
+  });
+
+  it("hides the resume button when the node is running", () => {
+    const node = { ...makeNode("worker-abc123"), liveness: "running" as const, harness_session_id: "sess-1" };
+    const { queryByRole } = render(
+      <Inspector node={node} onAction={vi.fn()} onOpen={vi.fn()} />,
+    );
+
+    expect(queryByRole("button", { name: "resume" })).toBeNull();
+  });
+
+  it("hides the resume button when stopped but no harness_session_id is recorded", () => {
+    const node = { ...makeNode("worker-abc123"), liveness: "stopped" as const };
+    const { queryByRole } = render(
+      <Inspector node={node} onAction={vi.fn()} onOpen={vi.fn()} />,
+    );
+
+    expect(queryByRole("button", { name: "resume" })).toBeNull();
   });
 });

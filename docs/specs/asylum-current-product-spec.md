@@ -222,7 +222,7 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
 | CLI-003 | CLI node commands cover core node operations. | Create/spawn/fork/list/inspect/send/interrupt/stop/archive and session compatibility commands work through daemon capabilities. |
 | CLI-004 | CLI graph commands expose graph state and relationship management. | `graph get` and relationship create/list/remove commands work through daemon capabilities. |
 | CLI-005 | CLI token and notification commands exist. | Operators can issue tokens and send notifications from terminal. |
-| CLI-006 | CLI can reach all root capabilities practical for a terminal. | Terminal commands exist for channels, hooks, recipes, relationships, fork, and remote commands, or the capability has a clear terminal-inapplicable rationale in this spec. |
+| CLI-006 | CLI can reach all root capabilities practical for a terminal. | Terminal commands exist for channels, hooks, decisions, relationships, fork, and remote commands, or the capability has a clear terminal-inapplicable rationale in this spec. |
 | CLI-007 | CLI output is useful for both humans and automation. | Human output is concise; JSON output exists for status and other automation-sensitive commands where practical. |
 | CLI-008 | CLI uses socket transport for local daemon control by default. | Local commands do not require HTTP bearer tokens unless explicitly configured for HTTP remote control. |
 
@@ -243,13 +243,13 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
 | COCKPIT-001 | Cockpit is the primary first-party UI. | Bare `asylum`/`asylum cockpit` opens it after daemon health is ready. |
 | COCKPIT-002 | Cockpit opens graph-first. | Default view shows graph, inline session/command-center area, selected-node inspector, graph controls, and real live counts. |
 | COCKPIT-003 | Cockpit supports first-run empty state. | With zero nodes, it explains the product succinctly and offers launching a real command-center node. |
-| COCKPIT-004 | Cockpit launch flow creates real nodes. | Harness/substrate/role/workspace/prompt/recipe choices call daemon APIs and display errors honestly. |
+| COCKPIT-004 | Cockpit launch flow creates real nodes. | Harness/substrate/role/workspace/prompt choices call daemon APIs and display errors honestly. |
 | COCKPIT-005 | Cockpit command-center chat is a real node session. | The inline panel sends input to the selected command-center node and observes its output/events; it is not a custom chatbot. |
 | COCKPIT-006 | Cockpit can focus any node session. | Selecting a graph/table/chat rail node focuses its real session and can show metadata, events, capabilities, and relationships without a separate attach action. |
 | COCKPIT-007 | Cockpit graph layouts are usable and truthful. | Tree/free/force/swimlane layouts are derived from real node/relationship/substrate data and support pan/zoom. |
 | COCKPIT-008 | Cockpit fleet table is a secondary dense node view. | It supports search/filtering/sorting-style inspection over real node records. |
 | COCKPIT-009 | Cockpit node detail has real tabs. | Session, events, capabilities, relationships, and telemetry tabs display daemon-backed data or honest empty/unsupported states. |
-| COCKPIT-010 | Cockpit controls call real capabilities. | Send input, interrupt, stop, fork, archive, relationship actions, and recipe actions call daemon APIs and surface errors. Cockpit does not expose attach as a normal user workflow. |
+| COCKPIT-010 | Cockpit controls call real capabilities. | Send input, interrupt, stop, fork, archive, and relationship actions call daemon APIs and surface errors. Cockpit does not expose attach as a normal user workflow. |
 | COCKPIT-011 | Cockpit logs show real events/notifications. | Logs/telemetry view uses daemon notifications/events and does not claim a unified stream unless backed by one. |
 | COCKPIT-012 | Cockpit channels screen is real. | Channel CRUD, message history, test send, inbound webhook/manual messages, and subscribe details use daemon endpoints. |
 | COCKPIT-013 | Cockpit hooks screen is real. | Hook CRUD, enable/disable, dry run, event catalog, actions, and firing history use daemon endpoints. |
@@ -272,7 +272,7 @@ Asylum provides control, visibility, durable coordination, and reachable interfa
 | NOTIFY-001 | Notifications are durable and readable. | Notifications can be listed, marked read, displayed in Cockpit, and associated with nodes when applicable. |
 | HOOK-001 | Hooks are daemon-executed event rules. | Hooks match event name plus filter, then execute supported actions and record firings. |
 | HOOK-002 | Hook filters fail closed. | Parse errors block the event and record/log the failure. |
-| HOOK-003 | Hook actions call real capabilities. | `channel`, `spawn`, `tool`, `pause_node`, and `archive` actions call daemon behavior or return explicit unsupported errors. |
+| HOOK-003 | Hook actions call real capabilities. | `channel`, `send_input`, `spawn`, `tool`, `pause_node`, and `archive` actions call daemon behavior or return explicit unsupported errors. |
 | HOOK-004 | Hook dry-run is visibly synthetic. | Dry-run/test behavior may use synthetic payloads only when clearly marked and stored as test firings. |
 | DECISION-001 | Human decision requests are first-class current product behavior. | Harness/substrate events can create decision records tied to nodes and optionally notifications/channels. |
 | DECISION-002 | Decisions are surfaced to operators. | Cockpit, notifications, and remote commands can show pending decisions with context and allowed actions. |

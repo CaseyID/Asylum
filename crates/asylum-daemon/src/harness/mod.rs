@@ -17,6 +17,15 @@ pub enum HarnessError {
     UnknownHarness,
 }
 
+/// How an in-guest / local harness resolves the Asylum daemon for the injected
+/// MCP server and hook bridge. Local nodes use the unauthenticated unix socket;
+/// Loon nodes cross the VM boundary and must resolve over HTTP with a per-node
+/// bearer token.
+pub enum DaemonResolution<'a> {
+    Socket(Option<&'a str>),
+    Http { base_url: &'a str, token: &'a str },
+}
+
 pub trait HarnessAdapter: Send + Sync {
     fn kind(&self) -> HarnessKind;
     fn command(&self) -> &str;
@@ -30,14 +39,49 @@ pub trait HarnessAdapter: Send + Sync {
     fn asylum_control_args(
         &self,
         _asylum_binary: &str,
-        _socket_path: Option<&str>,
+        _resolution: &DaemonResolution,
         _node_id: Uuid,
+        _session_id: Option<Uuid>,
     ) -> Vec<String> {
         Vec::new()
+    }
+
+    /// A harness session id pre-assigned at node-create time so the daemon knows
+    /// the resume key up front (claude `--session-id <uuid>`). Returns `None` for
+    /// harnesses whose session id can only be discovered after launch (codex --
+    /// recorded from the first notify post). Called once per launch; the returned
+    /// id is both stored on the node row and threaded into `asylum_control_args`.
+    fn preassign_session_id(&self) -> Option<Uuid> {
+        None
+    }
+
+    /// Build the COMPLETE argv (everything after the command) to RESUME an
+    /// existing harness session from the node's workspace. Unlike the create
+    /// path, this returns the whole vector -- including trust-bypass flags and
+    /// the Asylum MCP/hook injection -- because the resume shape is
+    /// harness-specific: claude replaces `--session-id <id>` with `--resume
+    /// <id>` (skip-permissions stays leading), while codex uses a `resume
+    /// <thread-id>` subcommand. Returns `None` for harnesses that cannot resume,
+    /// which the daemon surfaces as an honest error.
+    fn resume_args(
+        &self,
+        _session_id: &str,
+        _asylum_binary: &str,
+        _resolution: &DaemonResolution,
+        _node_id: Uuid,
+    ) -> Option<Vec<String>> {
+        None
     }
     /// Idempotently record the workspace path as trusted in the harness's own config
     /// so the first-run trust dialog is skipped when the process spawns.
     fn pre_trust_workspace(&self, workspace: &str) -> anyhow::Result<()>;
+
+    /// Whether the harness reports idleness natively (claude via the Notification
+    /// `idle_prompt` hook). Harnesses that return false rely on the daemon's
+    /// output-quiescence timer for `node.idle` (codex).
+    fn native_idle_signal(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -189,8 +233,12 @@ mod tests {
         let codex = registry.get(&HarnessKind::Codex).unwrap();
         let node_id = Uuid::new_v4();
 
-        let args =
-            codex.asylum_control_args("/usr/local/bin/asylum", Some("/tmp/asylum.sock"), node_id);
+        let args = codex.asylum_control_args(
+            "/usr/local/bin/asylum",
+            &DaemonResolution::Socket(Some("/tmp/asylum.sock")),
+            node_id,
+            None,
+        );
         let joined = args.join("\n");
 
         assert!(joined.contains("mcp_servers.asylum.command=\"/usr/local/bin/asylum\""));
@@ -201,13 +249,69 @@ mod tests {
     }
 
     #[test]
+    fn codex_control_args_route_notify_through_bridge() {
+        let registry = HarnessRegistry::default();
+        let codex = registry.get(&HarnessKind::Codex).unwrap();
+        let node_id = Uuid::new_v4();
+
+        let args = codex.asylum_control_args(
+            "/usr/local/bin/asylum",
+            &DaemonResolution::Socket(Some("/tmp/asylum.sock")),
+            node_id,
+            // Codex ignores a pre-assigned session id (no --session-id equivalent).
+            Some(Uuid::new_v4()),
+        );
+
+        // The notify value is a `-c` override whose value is a TOML array of strings.
+        let notify_pos = args
+            .iter()
+            .position(|arg| arg.starts_with("notify="))
+            .expect("codex launch args should include a notify override");
+        assert_eq!(args[notify_pos - 1], "-c");
+        assert_eq!(
+            args[notify_pos],
+            "notify=[\"/usr/local/bin/asylum\",\"harness-event\",\"codex-notify\"]"
+        );
+
+        // No --session-id / --settings leaks into the codex argv.
+        assert!(!args.iter().any(|a| a == "--session-id"));
+        assert!(!args.iter().any(|a| a == "--settings"));
+    }
+
+    #[test]
+    fn codex_control_args_resolve_over_http_for_loon() {
+        let registry = HarnessRegistry::default();
+        let codex = registry.get(&HarnessKind::Codex).unwrap();
+        let node_id = Uuid::new_v4();
+        let args = codex.asylum_control_args(
+            "/usr/local/bin/asylum",
+            &DaemonResolution::Http {
+                base_url: "http://host.loon.internal:7788",
+                token: "asylum-owner-tok",
+            },
+            node_id,
+            None,
+        );
+        let joined = args.join("\n");
+        assert!(joined.contains("ASYLUM_BASE_URL=\"http://host.loon.internal:7788\""));
+        assert!(joined.contains("ASYLUM_TOKEN=\"asylum-owner-tok\""));
+        assert!(!joined.contains("ASYLUM_SOCKET_PATH"));
+        assert!(joined.contains("mcp_servers.asylum.command=\"/usr/local/bin/asylum\""));
+    }
+
+    #[test]
     fn claude_control_args_register_asylum_mcp_per_launch() -> anyhow::Result<()> {
         let registry = HarnessRegistry::default();
         let claude = registry.get(&HarnessKind::ClaudeCode).unwrap();
         let node_id = Uuid::new_v4();
 
-        let args =
-            claude.asylum_control_args("/opt/asylum/bin/asylum", Some("/tmp/asylum.sock"), node_id);
+        let session_id = Uuid::new_v4();
+        let args = claude.asylum_control_args(
+            "/opt/asylum/bin/asylum",
+            &DaemonResolution::Socket(Some("/tmp/asylum.sock")),
+            node_id,
+            Some(session_id),
+        );
         let config_index = args
             .iter()
             .position(|arg| arg == "--mcp-config")
@@ -230,6 +334,155 @@ mod tests {
         assert!(args.contains(&"--strict-mcp-config".to_string()));
         assert!(args.contains(&"--allowedTools".to_string()));
         assert!(args.contains(&"mcp__asylum__*".to_string()));
+
+        // Pre-assigned session id is passed as `--session-id <uuid>`.
+        let sid_index = args
+            .iter()
+            .position(|arg| arg == "--session-id")
+            .expect("claude launch args should include --session-id");
+        assert_eq!(args[sid_index + 1], session_id.to_string());
+
+        // Reporting hooks + statusline are injected inline via --settings.
+        let settings_index = args
+            .iter()
+            .position(|arg| arg == "--settings")
+            .expect("claude launch args should include --settings");
+        let settings: serde_json::Value = serde_json::from_str(&args[settings_index + 1])?;
+
+        // statusLine invokes the claude-statusline bridge.
+        assert_eq!(settings["statusLine"]["type"], "command");
+        assert_eq!(
+            settings["statusLine"]["command"],
+            "'/opt/asylum/bin/asylum' harness-event claude-statusline"
+        );
+
+        // Every reporting hook fires the claude-hook bridge. Stop/Notification/
+        // SessionStart/SessionEnd are blocking with a short timeout; PostToolUse is
+        // async so it never blocks tool execution. No matchers -> match all.
+        let hooks = &settings["hooks"];
+        for event in ["Stop", "Notification", "SessionStart", "SessionEnd"] {
+            let group = &hooks[event][0];
+            assert!(group.get("matcher").is_none(), "{event} must not set a matcher");
+            let entry = &group["hooks"][0];
+            assert_eq!(entry["type"], "command");
+            assert_eq!(
+                entry["command"],
+                "'/opt/asylum/bin/asylum' harness-event claude-hook"
+            );
+            assert_eq!(entry["timeout"], 10);
+            assert!(
+                entry.get("async").is_none(),
+                "{event} reporting hook must be blocking"
+            );
+        }
+        let post = &hooks["PostToolUse"][0];
+        assert!(post.get("matcher").is_none(), "PostToolUse must match all tools");
+        let post_entry = &post["hooks"][0];
+        assert_eq!(
+            post_entry["command"],
+            "'/opt/asylum/bin/asylum' harness-event claude-hook"
+        );
+        assert_eq!(post_entry["timeout"], 10);
+        assert_eq!(post_entry["async"], true);
+
         Ok(())
+    }
+
+    #[test]
+    fn only_claude_preassigns_a_session_id() {
+        let registry = HarnessRegistry::default();
+        let claude = registry.get(&HarnessKind::ClaudeCode).unwrap();
+        let codex = registry.get(&HarnessKind::Codex).unwrap();
+
+        // claude pre-assigns a fresh uuid per launch; codex has no pre-assignable id.
+        assert!(claude.preassign_session_id().is_some());
+        assert_ne!(claude.preassign_session_id(), claude.preassign_session_id());
+        assert!(codex.preassign_session_id().is_none());
+    }
+
+    #[test]
+    fn claude_control_args_keep_skip_permissions_leading_and_append_user_args() {
+        // Mirror create_node's assembly order: launch_args() (leading trust-bypass
+        // flag + config startup_args) ++ control args ++ per-request launch_args.
+        let registry = HarnessRegistry::default();
+        let claude = registry.get(&HarnessKind::ClaudeCode).unwrap();
+        let node_id = Uuid::new_v4();
+
+        let mut argv = claude.launch_args().to_vec();
+        argv.extend(claude.asylum_control_args(
+            "/opt/asylum/bin/asylum",
+            &DaemonResolution::Socket(Some("/tmp/asylum.sock")),
+            node_id,
+            Some(Uuid::new_v4()),
+        ));
+        argv.extend(["--model".to_string(), "opus".to_string()]);
+
+        // Documented routing quirk: --dangerously-skip-permissions must stay leading.
+        assert_eq!(argv[0], "--dangerously-skip-permissions");
+        // Control args land before the user-supplied trailing args.
+        let settings_pos = argv.iter().position(|a| a == "--settings").unwrap();
+        let model_pos = argv.iter().position(|a| a == "--model").unwrap();
+        assert!(settings_pos < model_pos);
+        assert_eq!(argv.last().unwrap(), "opus");
+    }
+
+    #[test]
+    fn claude_resume_args_swap_session_id_for_resume_and_keep_injection() {
+        let registry = HarnessRegistry::default();
+        let claude = registry.get(&HarnessKind::ClaudeCode).unwrap();
+        let node_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4().to_string();
+
+        let argv = claude
+            .resume_args(
+                &session_id,
+                "/opt/asylum/bin/asylum",
+                &DaemonResolution::Socket(Some("/tmp/asylum.sock")),
+                node_id,
+            )
+            .expect("claude supports resume");
+
+        // Trust-bypass flag stays leading (documented quirk with --resume).
+        assert_eq!(argv[0], "--dangerously-skip-permissions");
+        // --resume <id> present; the create-path --session-id must NOT leak in
+        // (passing both is contradictory).
+        let resume_pos = argv
+            .iter()
+            .position(|a| a == "--resume")
+            .expect("resume argv must include --resume");
+        assert_eq!(argv[resume_pos + 1], session_id);
+        assert!(!argv.iter().any(|a| a == "--session-id"));
+        // The full MCP + hooks/statusline injection survives into resume.
+        assert!(argv.iter().any(|a| a == "--mcp-config"));
+        assert!(argv.iter().any(|a| a == "--strict-mcp-config"));
+        assert!(argv.iter().any(|a| a == "--settings"));
+    }
+
+    #[test]
+    fn codex_resume_args_use_resume_subcommand_first() {
+        let registry = HarnessRegistry::default();
+        let codex = registry.get(&HarnessKind::Codex).unwrap();
+        let node_id = Uuid::new_v4();
+        let thread_id = Uuid::new_v4().to_string();
+
+        let argv = codex
+            .resume_args(
+                &thread_id,
+                "/opt/asylum/bin/asylum",
+                &DaemonResolution::Socket(Some("/tmp/asylum.sock")),
+                node_id,
+            )
+            .expect("codex supports resume");
+
+        // Subcommand + thread id lead the argv.
+        assert_eq!(argv[0], "resume");
+        assert_eq!(argv[1], thread_id);
+        // Trust-bypass flag and the -c MCP/notify injection are reused.
+        assert!(argv
+            .iter()
+            .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+        let joined = argv.join("\n");
+        assert!(joined.contains("mcp_servers.asylum.command="));
+        assert!(joined.contains("notify=["));
     }
 }

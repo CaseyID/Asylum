@@ -15,6 +15,14 @@ pub struct HealthResponse {
     pub database_path: String,
     pub database_size_bytes: u64,
     pub transcripts_dir: String,
+    /// Unix timestamp (seconds) the daemon process started. Fixed for the
+    /// life of the process; lets a client compute elapsed time between polls
+    /// without re-deriving it from anything client-side.
+    pub daemon_started_at_epoch_secs: i64,
+    /// Convenience: `now - daemon_started_at_epoch_secs`, computed daemon-side
+    /// at response time so a single `/health` fetch is enough to render an
+    /// accurate uptime with no client-side clock math against a stored value.
+    pub uptime_seconds: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -25,9 +33,15 @@ pub struct CreateNodeRequest {
     pub workspace: Option<String>,
     pub description: Option<String>,
     pub created_by: Option<String>,
+    /// Optional first instruction delivered to the node as a submitted message
+    /// once its harness is ready (rides W0's launch-prompt path). Lets a
+    /// supervisor hand a worker its opening task at spawn time.
+    #[serde(default)]
+    pub prompt: Option<String>,
     #[serde(default)]
     pub launch_args: Vec<String>,
 }
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeCreateResponse {
@@ -46,11 +60,16 @@ pub struct SpawnPeerRequest {
     pub workspace: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    /// Optional first instruction for the spawned peer, delivered as its opening
+    /// submitted message (routes into CreateNodeRequest.prompt).
+    #[serde(default)]
+    pub prompt: Option<String>,
     #[serde(default)]
     pub relationship_kind: Option<String>,
     #[serde(default)]
     pub relationship_label: Option<String>,
 }
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpawnPeerResponse {
@@ -77,6 +96,29 @@ pub struct NodeEventsResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SendInputRequest {
     pub text: String,
+}
+
+/// A raw harness-native signal posted by the CLI bridge (claude hooks /
+/// statusline, codex notify). The daemon maps `(source, payload)` to a node
+/// event kind; the CLI stays thin and does no interpretation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HarnessEventRequest {
+    /// One of `claude_hook`, `claude_statusline`, `codex_notify`.
+    pub source: String,
+    /// The verbatim harness payload (claude hook stdin JSON, statusline stdin
+    /// JSON, or codex notify argv JSON).
+    pub payload: serde_json::Value,
+}
+
+/// Result of ingesting a harness event: whether it was accepted, the mapped
+/// node event kind (if any fired), and any harness session id recorded.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HarnessEventResponse {
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -237,6 +279,8 @@ pub struct ErrorPayload {
 pub struct TokenIssueResponse {
     pub id: String,
     pub raw_token: String,
+    /// Advisory only (see `security::TokenScope`): v0.1.x is single-user and
+    /// every valid token grants full access regardless of this list.
     pub scope: Vec<String>,
     pub expires_at_epoch_secs: i64,
 }
@@ -309,7 +353,12 @@ pub struct DecisionCreateRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DecisionResolveRequest {
     pub status: String,
+    /// Optional free-text answer injected verbatim into the node's PTY. When
+    /// present it overrides the status-derived affirmative/negative feedback.
+    #[serde(default)]
+    pub answer: Option<String>,
 }
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChannelDescriptor {
@@ -506,37 +555,8 @@ pub struct HookTestResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RecipeDescriptor {
-    pub id: String,
-    pub title: String,
-    pub prompt_template: String,
-    pub kind: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RecipeListResponse {
-    pub recipes: Vec<RecipeDescriptor>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RecipeSpawnRequest {
-    pub harness: String,
-    pub substrate: String,
-    #[serde(default)]
-    pub workspace: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub role_hint: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RecipeSpawnResponse {
-    pub node_ids: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ForkNodeRequest {
+
     #[serde(default)]
     pub role_hint: Option<String>,
     #[serde(default)]

@@ -17,27 +17,21 @@ import type {
   GraphResponse,
   GraphRelationship,
   RelationshipCreateRequest,
-  RelationshipListResponse,
   HarnessDescriptor,
-  HarnessKind,
   HealthResponse,
   HookCreateRequest,
   HookEventCatalogEntry,
   HookFiringRecord,
   HookRule,
   HookUpdateRequest,
-  NativeTargetResponse,
   NotificationRecord,
   SubstrateDescriptor,
-  SubstrateKind,
-  RecipeListResponse,
   TokenListResponse,
+
   TokenRotateResponse,
 } from "./types";
 
 const BASE = "/api";
-
-type Jsonish = Record<string, unknown>;
 
 export class ApiError extends Error {
   status: number;
@@ -119,11 +113,6 @@ export async function fetchNode(id: string): Promise<AsylumNode> {
   return "node" in (data as object) ? (data as { node: AsylumNode }).node : (data as AsylumNode);
 }
 
-export async function listRelationships(): Promise<GraphRelationship[]> {
-  const data = await request<RelationshipListResponse | GraphRelationship[]>("/relationships");
-  return Array.isArray(data) ? data : data.relationships;
-}
-
 export async function createRelationship(req: RelationshipCreateRequest): Promise<GraphRelationship> {
   return request<GraphRelationship>("/relationships", {
     method: "POST",
@@ -156,16 +145,6 @@ export async function fetchNotifications(): Promise<NotificationRecord[]> {
   });
 }
 
-export async function fetchHarnesses(): Promise<HarnessKind[]> {
-  const data = await request<{ items: HarnessKind[] } | HarnessKind[]>("/harnesses");
-  return Array.isArray(data) ? data : data.items;
-}
-
-export async function fetchSubstrates(): Promise<SubstrateKind[]> {
-  const data = await request<{ items: SubstrateKind[] } | SubstrateKind[]>("/substrates");
-  return Array.isArray(data) ? data : data.items;
-}
-
 export async function fetchHarnessDescriptors(): Promise<HarnessDescriptor[]> {
   const data = await request<{ harnesses: HarnessDescriptor[] }>("/harness-descriptors");
   return data.harnesses;
@@ -174,10 +153,6 @@ export async function fetchHarnessDescriptors(): Promise<HarnessDescriptor[]> {
 export async function fetchSubstrateDescriptors(): Promise<SubstrateDescriptor[]> {
   const data = await request<{ substrates: SubstrateDescriptor[] }>("/substrate-descriptors");
   return data.substrates;
-}
-
-export async function fetchSystemMap(): Promise<Record<string, unknown>> {
-  return request<Record<string, unknown>>("/context/system-map");
 }
 
 export async function markNotificationRead(id: string): Promise<void> {
@@ -196,23 +171,8 @@ export async function createNode(payload: CreateNodeRequest): Promise<AsylumNode
   return created as AsylumNode;
 }
 
-async function fallbackPostNodeAction(
-  nodeId: string,
-  action: "interrupt" | "stop" | "archive",
-  body?: Jsonish,
-): Promise<void> {
-  const primary = `/nodes/${nodeId}/${action}`;
-  try {
-    await request<void>(primary, { method: "POST", body: JSON.stringify(body ?? {}) });
-    return;
-  } catch (err) {
-    const message = String((err as Error).message);
-    if (!message.startsWith("404")) throw err;
-  }
-  return request<void>(`/${action}`, {
-    method: "POST",
-    body: JSON.stringify({ node_id: nodeId, ...(body ?? {}) }),
-  });
+async function postNodeAction(nodeId: string, action: "interrupt" | "stop" | "archive" | "resume"): Promise<void> {
+  await request<void>(`/nodes/${nodeId}/${action}`, { method: "POST", body: JSON.stringify({}) });
 }
 
 export async function postNodeInput(nodeId: string, input: string): Promise<void> {
@@ -222,9 +182,14 @@ export async function postNodeInput(nodeId: string, input: string): Promise<void
   });
 }
 
-export const interruptNode = (id: string) => fallbackPostNodeAction(id, "interrupt");
-export const stopNode = (id: string) => fallbackPostNodeAction(id, "stop");
-export const archiveNode = (id: string) => fallbackPostNodeAction(id, "archive");
+export const interruptNode = (id: string) => postNodeAction(id, "interrupt");
+export const stopNode = (id: string) => postNodeAction(id, "stop");
+export const archiveNode = (id: string) => postNodeAction(id, "archive");
+// D2: resume a stopped-but-resumable node (has harness_session_id) via the
+// daemon's POST /api/nodes/:id/resume. The route is delivered by a parallel
+// workstream; this client call is shaped to match the existing node-action
+// endpoints (empty JSON body, same auth/error handling as stop/archive).
+export const resumeNode = (id: string) => postNodeAction(id, "resume");
 
 export async function requestBrowserAttach(nodeId: string): Promise<AttachBrowserResponse> {
   const data = await request<
@@ -269,23 +234,9 @@ export function openAttachSocket(token: string, options: AttachSocketOptions = {
   return ws;
 }
 
-export async function requestNativeTarget(nodeId: string): Promise<NativeTargetResponse> {
-  const data = await request<
-    NativeTargetResponse | { command: string; args: string[]; environment: Record<string, string>; label?: string }
-  >(`/nodes/${nodeId}/attach/native-target`, { method: "POST" });
-  if ("environment" in data) {
-    return { command: data.command, args: data.args, env: data.environment, label: data.label };
-  }
-  return data;
-}
-
 export async function fetchNodeEvents(nodeId: string): Promise<unknown[]> {
   const data = await request<{ events: unknown[] } | unknown[]>(`/nodes/${nodeId}/events`);
   return Array.isArray(data) ? data : data.events;
-}
-
-export async function notifySend(payload: { topic?: string; title: string; body: string }): Promise<unknown> {
-  return request<unknown>("/notify/send", { method: "POST", body: JSON.stringify(payload) });
 }
 
 // — channels —
@@ -300,10 +251,6 @@ export async function createChannel(req: ChannelCreateRequest): Promise<ChannelD
     method: "POST",
     body: JSON.stringify(req),
   });
-}
-
-export async function getChannel(id: string): Promise<ChannelDescriptor> {
-  return request<ChannelDescriptor>(`/channels/${id}`);
 }
 
 export async function updateChannel(id: string, req: ChannelUpdateRequest): Promise<ChannelDescriptor> {
@@ -401,16 +348,8 @@ export async function resolveDecision(id: string, req: DecisionResolveRequest): 
   });
 }
 
-// — recipes —
-
-export async function fetchRecipes(): Promise<RecipeListResponse["recipes"]> {
-  const data = await request<{ recipes: RecipeListResponse["recipes"] } | RecipeListResponse>("/recipes");
-  return Array.isArray((data as { recipes?: unknown })?.recipes)
-    ? ((data as { recipes: RecipeListResponse["recipes"] }).recipes)
-    : (data as RecipeListResponse).recipes;
-}
-
 // — fork —
+
 
 export async function forkNode(id: string, req: ForkNodeRequest = {}): Promise<AsylumNode> {
   const data = await request<AsylumNode | { node: AsylumNode }>(`/nodes/${id}/fork`, {

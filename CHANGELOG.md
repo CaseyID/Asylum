@@ -1,12 +1,42 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-07-07
+
+The completion-mission release: the autonomy loop, Loon microVM parity, and daemon durability delivered by the 2026-07-06/07 completion mission (docs/superpowers/specs/2026-07-06-asylum-completion-mission.md), all live-gated against real Claude Code sessions, a real ntfy round trip, and real Firecracker microVMs.
+
+### Added
+
+- Harness-native event ingestion: new `asylum harness-event <source>` CLI entry point (always exits 0, 2s timeout, socket/HTTP+token target resolution) posting to the new `POST /api/nodes/{id}/harness-event` route. Claude Code hooks (Stop, Notification, SessionStart, SessionEnd, async PostToolUse) plus statusLine, and Codex `notify`, are wired automatically at launch — no harness-output parsing in the daemon.
+- Launch injection: local Claude Code and Codex nodes launch with a pre-assigned harness session id (the resume key), inline `--settings` JSON carrying the hook/statusLine wiring (claude), and `-c notify=[...]` (codex). The node's harness session id is recorded and surfaced.
+- Event catalog for hooks: `graph.spawn`, `node.session_started`, `node.turn_complete`, `node.awaiting_input`, `node.idle`, `node.ctx_pressure`, `node.tool_call`, `node.session_end`, `node.exited`, `node.errored`, `node.resumed`, `channel.inbound`, `schedule.5m`/`schedule.30m`.
+- Hook actions `send_input` and `spawn`, so supervisors can babysit workers (feed stalled sessions, spawn peers) declaratively from hook rules.
+- Decision loop: `node.awaiting_input` now auto-produces a pending decision (DB-enforced one per node); resolving a decision injects the answer back into the session (approve → "yes", deny → "no", answers verbatim); ntfy replies are correlated back to the originating node via reply tokens, so answering from a phone resolves the decision and unblocks the session.
+- A real `node.spawn_peer` capability (API route, CLI `asylum node spawn`, MCP tool) recording an explicit source-to-child graph relationship, plus per-node Asylum MCP server injection so nodes can call Asylum tools directly.
+- Session resume: `POST /nodes/{id}/resume` (CLI/MCP/Cockpit) relaunches a stopped node via `claude --resume` / `codex resume`; resumability is honestly gated on an on-disk transcript probe. Stopping a claude node now tries a graceful `/exit` (5s) before SIGKILL so the transcript persists and the node stays resumable.
+- Startup reconciliation: on boot the daemon marks nodes whose local PTYs are gone as honestly `Stopped` (`reconciled_local_pty_lost`) and tears down + prunes orphaned Loon microVMs — no eternal-`Running` rows after a crash.
+- Loon substrate rewritten against LoonV2 v0.1.5: VM lifecycle over the `loon` CLI (`vm create/stop/rm/prune`, `cp`), PTY exec/attach/exit-stream over the daemon's HTTPS API with a pinned TLS fingerprint, in-guest workspaces (no host bind mounts), a musl `asylum` staged into the guest, and guest harness events/MCP flowing back over HTTP with per-node bearer tokens (revocable, node-scoped).
+- Cockpit: hook-rule action forms matching the exact daemon schemas, decision badges and answer field, daemon uptime, real local capacity (running nodes / available cores), Fleet lineage column from `spawned_for` edges, honest liveness, and a Resume button gated by actual resumability.
+- Launch packet: the supervisor "operating manual" injected at node launch was rewritten around the real tool surface — exact MCP tool names and parameters, the event catalog, hook-action JSON shapes, the decision loop, and channel etiquette — with tests asserting every referenced tool exists.
 
 ### Changed
 
+- PTY input delivery hardened: submits write the body, wait a gap, then send a distinct lone carriage return (defeats bracketed-paste absorption); submits are serialized per node; launch prompts are delivered on a timing-only readiness heuristic instead of output parsing.
 - Replaced the Cargo source workflow aliases with explicit `run-*`, `build-*`, `test-*`, `check-*`, `status-*`, `stop-*`, and `reset-*` naming.
 - Removed Cargo aliases that delegated to the installed product; source checkout work now stays under Cargo, installed product lifecycle stays under the installed `asylum` command.
 - `cargo test-asylum-release` now smoke-tests the local host release archive from `dist/release/vX.Y.Z/`.
+
+### Removed
+
+- The recipes surface (API, CLI, MCP, Cockpit). Launch packets plus hook actions replace it.
+
+### Fixed
+
+- Loon exit honesty: a severed exit stream no longer fabricates a success exit or tears the VM down; the outcome is reported as stream-lost. Attach WebSockets keep alive with pings.
+- Node liveness transitions are compare-and-set, eliminating races between hooks, reconciliation, and manual stops. Decision creation is atomic (no duplicate pending decisions).
+- Partial `[harness]` config tables no longer resolve `claude_command`/`codex_command` to empty strings (which spawned `exec ""` and exited 126); empty harness commands now fail loudly at launch.
+- Claude Notification hook payloads are read from both `notification_type` and legacy `type`, so `awaiting_input`/`idle` fire on current Claude Code versions.
+- ntfy publishes JSON to the server root (not raw text to `/{topic}`), fixing phone-reply correlation.
+- statusline updates dedupe against the node row instead of rewriting hot paths on every event.
 
 ## 0.1.10 — 2026-05-07
 

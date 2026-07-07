@@ -233,6 +233,13 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_events_node_seq ON events(node_id, sequence);
             CREATE UNIQUE INDEX IF NOT EXISTS events_node_seq_unique ON events(node_id, sequence);
+            -- At most one pending decision per node (M6): the awaiting-input
+            -- producer relies on this to dedup, so make it a DB invariant rather
+            -- than a check-then-insert race. NULL node_id decisions are exempt
+            -- (SQLite treats NULLs as distinct), matching operator-raised
+            -- decisions that are not node-scoped.
+            CREATE UNIQUE INDEX IF NOT EXISTS decisions_one_pending_per_node
+                ON decisions(node_id) WHERE status = 'pending' AND node_id IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_artifacts_node ON artifacts(node_id);
             CREATE INDEX IF NOT EXISTS idx_relationships_source ON relationships(source_node_id);
             CREATE INDEX IF NOT EXISTS idx_relationships_target ON relationships(target_node_id);
@@ -241,6 +248,15 @@ impl Store {
         )?;
         ensure_column(&conn, "channel_messages", "node_id", "TEXT")?;
         ensure_column(&conn, "channel_messages", "correlation_token", "TEXT")?;
+        ensure_column(&conn, "nodes", "harness_session_id", "TEXT")?;
+        // m2: persist the per-node create-time launch_args (JSON array of
+        // strings) so resume can reuse the exact extra flags the node was
+        // created with, instead of silently reverting to the adapter baseline.
+        ensure_column(&conn, "nodes", "launch_args", "TEXT")?;
+        // M7: track the ctx_pressure fired-state on the node row so ingest_statusline
+        // never has to load-and-scan every prior harness-event body per post.
+        ensure_column(&conn, "nodes", "ctx_pressure_session", "TEXT")?;
+        ensure_column(&conn, "nodes", "ctx_pressure_max", "REAL")?;
         Ok(())
     }
 
@@ -248,7 +264,7 @@ impl Store {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "
-            SELECT id,harness,substrate,role_hint,liveness,workspace,description,created_at,updated_at,external_id,capabilities_json
+            SELECT id,harness,substrate,role_hint,liveness,workspace,description,created_at,updated_at,external_id,capabilities_json,harness_session_id
             FROM nodes
             ORDER BY created_at DESC
             ",
@@ -267,7 +283,7 @@ impl Store {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "
-            SELECT id,harness,substrate,role_hint,liveness,workspace,description,created_at,updated_at,external_id,capabilities_json
+            SELECT id,harness,substrate,role_hint,liveness,workspace,description,created_at,updated_at,external_id,capabilities_json,harness_session_id
             FROM nodes
             WHERE liveness = ?1
             ORDER BY created_at DESC
@@ -335,7 +351,7 @@ impl Store {
         let id_string = id.to_string();
         let mut stmt = conn.prepare(
             "
-            SELECT id,harness,substrate,role_hint,liveness,workspace,description,created_at,updated_at,external_id,capabilities_json
+            SELECT id,harness,substrate,role_hint,liveness,workspace,description,created_at,updated_at,external_id,capabilities_json,harness_session_id
             FROM nodes
             WHERE id = ?1
             ",
@@ -408,6 +424,144 @@ impl Store {
         Ok(())
     }
 
+    /// Set liveness AND record a single `LivenessChanged` event carrying an
+    /// explicit reason (and optional extra fields). Used by startup
+    /// reconciliation so the honest transition is auditable ("why is this node
+    /// Stopped?") without inventing a new event-catalog kind.
+    pub fn set_node_liveness_with_reason(
+        &self,
+        id: Uuid,
+        liveness: NodeLiveness,
+        reason: &str,
+        extra: JsonValue,
+    ) -> Result<()> {
+        let now = OffsetDateTime::now_utc();
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE nodes SET liveness = ?1, updated_at = ?2 WHERE id = ?3",
+            params![liveness.to_string(), now.unix_timestamp(), id.to_string()],
+        )?;
+        let mut body = serde_json::Map::new();
+        body.insert("liveness".to_string(), JsonValue::String(liveness.to_string()));
+        body.insert("reason".to_string(), JsonValue::String(reason.to_string()));
+        if let JsonValue::Object(extra_map) = extra {
+            for (k, v) in extra_map {
+                body.insert(k, v);
+            }
+        }
+        Self::record_event_with_conn(
+            &conn,
+            id,
+            NodeEventKind::LivenessChanged,
+            JsonValue::Object(body),
+        )?;
+        Ok(())
+    }
+
+    /// Compare-and-set liveness (M1/M2): move the node to `target` ONLY if its
+    /// current liveness is one of `allowed_from`. Returns true iff the row was
+    /// transitioned. A single atomic `UPDATE ... WHERE liveness IN (...)` makes
+    /// the transition race-safe: a concurrent terminal write (exit sink) and a
+    /// stale-snapshot active write (post_harness_event / resume) can no longer
+    /// clobber each other -- whichever CAS runs against a still-matching state
+    /// wins, the other becomes a no-op. Records `LivenessChanged` (with the
+    /// optional reason/extra) only on a real transition.
+    pub fn transition_node_liveness(
+        &self,
+        id: Uuid,
+        target: NodeLiveness,
+        allowed_from: &[NodeLiveness],
+        reason: Option<&str>,
+        extra: JsonValue,
+    ) -> Result<bool> {
+        if allowed_from.is_empty() {
+            return Ok(false);
+        }
+        let now = OffsetDateTime::now_utc();
+        let conn = self.conn()?;
+        let placeholders = std::iter::repeat("?")
+            .take(allowed_from.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE nodes SET liveness = ?1, updated_at = ?2              WHERE id = ?3 AND liveness IN ({placeholders})"
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(target.to_string()),
+            Box::new(now.unix_timestamp()),
+            Box::new(id.to_string()),
+        ];
+        for from in allowed_from {
+            params.push(Box::new(from.to_string()));
+        }
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let affected = conn.execute(&sql, param_refs.as_slice())?;
+        if affected == 0 {
+            return Ok(false);
+        }
+        let mut body = serde_json::Map::new();
+        body.insert("liveness".to_string(), JsonValue::String(target.to_string()));
+        if let Some(reason) = reason {
+            body.insert("reason".to_string(), JsonValue::String(reason.to_string()));
+        }
+        if let JsonValue::Object(extra_map) = extra {
+            for (k, v) in extra_map {
+                body.insert(k, v);
+            }
+        }
+        Self::record_event_with_conn(
+            &conn,
+            id,
+            NodeEventKind::LivenessChanged,
+            JsonValue::Object(body),
+        )?;
+        Ok(true)
+    }
+
+    /// Read the persisted ctx_pressure fired-state for a node (M7): the session
+    /// the state belongs to and the highest threshold already fired in it. Absent
+    /// columns / rows yield (None, None).
+    pub fn ctx_pressure_state(&self, id: Uuid) -> Result<(Option<String>, Option<f64>)> {
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                "SELECT ctx_pressure_session, ctx_pressure_max FROM nodes WHERE id = ?1",
+                params![id.to_string()],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<f64>>(1)?)),
+            )
+            .optional()?;
+        Ok(row.unwrap_or((None, None)))
+    }
+
+    /// Persist the ctx_pressure fired-state for a node (M7).
+    pub fn set_ctx_pressure_state(
+        &self,
+        id: Uuid,
+        session: Option<&str>,
+        max_threshold: f64,
+    ) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE nodes SET ctx_pressure_session = ?1, ctx_pressure_max = ?2 WHERE id = ?3",
+            params![session, max_threshold, id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Revoke every active token whose name matches `name` (M3). Per-node guest
+    /// tokens are named `loon-node-{node_id}`, so this is called on every node
+    /// stop/archive/teardown/reconcile path to kill the guest credential the
+    /// moment its VM is gone. Returns the number of tokens revoked.
+    pub fn revoke_tokens_by_name(&self, name: &str) -> Result<usize> {
+        let conn = self.conn()?;
+        let affected = conn.execute(
+            "UPDATE tokens SET revoked = 1 WHERE name = ?1 AND revoked = 0",
+            params![name],
+        )?;
+        Ok(affected)
+    }
+
     pub fn set_node_external_id(&self, id: Uuid, external_id: Option<String>) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
@@ -415,6 +569,85 @@ impl Store {
             params![external_id, id.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Record the harness-native session id (claude `session_id`, codex
+    /// `thread-id`) on the node row. Used by the harness-event bridge so the
+    /// session can later be resumed.
+    pub fn set_node_harness_session_id(
+        &self,
+        id: Uuid,
+        harness_session_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE nodes SET harness_session_id = ?1 WHERE id = ?2",
+            params![harness_session_id, id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// m2: persist the per-node create-time `launch_args` (the extra flags the
+    /// operator passed at create, e.g. a model override) as a JSON array so
+    /// resume can reproduce the same argv. Empty is stored as NULL.
+    pub fn set_node_launch_args(&self, id: Uuid, launch_args: &[String]) -> Result<()> {
+        let conn = self.conn()?;
+        let json = if launch_args.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(launch_args)?)
+        };
+        conn.execute(
+            "UPDATE nodes SET launch_args = ?1 WHERE id = ?2",
+            params![json, id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// m2: read back the persisted per-node create-time `launch_args`. Absent or
+    /// unparseable rows yield an empty vec (the baseline argv).
+    pub fn get_node_launch_args(&self, id: Uuid) -> Result<Vec<String>> {
+        let conn = self.conn()?;
+        let raw: Option<String> = conn.query_row(
+            "SELECT launch_args FROM nodes WHERE id = ?1",
+            params![id.to_string()],
+            |row| row.get::<_, Option<String>>(0),
+        )?;
+        Ok(raw
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .unwrap_or_default())
+    }
+
+    /// Epoch seconds of the most recent PTY output chunk for a node, or None if
+    /// the node has emitted no output yet. Used by the quiescence idle timer.
+    pub fn last_output_chunk_epoch(&self, node_id: Uuid) -> Result<Option<i64>> {
+        let conn = self.conn()?;
+        let kind = serde_json::to_string(&NodeEventKind::OutputChunk)?;
+        let value: Option<i64> = conn.query_row(
+            "SELECT MAX(created_at) FROM events WHERE node_id = ?1 AND kind = ?2",
+            params![node_id.to_string(), kind],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        Ok(value)
+    }
+
+    /// Bodies of all ingested harness-event records for a node, oldest first.
+    /// Used to dedup `node.ctx_pressure` threshold crossings per session.
+    pub fn harness_event_bodies(&self, node_id: Uuid) -> Result<Vec<JsonValue>> {
+        let conn = self.conn()?;
+        let kind = serde_json::to_string(&NodeEventKind::HarnessEvent)?;
+        let mut stmt = conn.prepare(
+            "SELECT body FROM events WHERE node_id = ?1 AND kind = ?2 ORDER BY created_at ASC",
+        )?;
+        let mut rows = stmt.query(params![node_id.to_string(), kind])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let body_text: String = row.get(0)?;
+            if let Ok(value) = serde_json::from_str::<JsonValue>(&body_text) {
+                out.push(value);
+            }
+        }
+        Ok(out)
     }
 
     pub fn update_node_description(&self, id: Uuid, description: &str) -> Result<()> {
@@ -783,11 +1016,52 @@ impl Store {
         Ok(affected > 0)
     }
 
+    /// The single pending decision for a node, if any. Used to dedup the
+    /// awaiting-input decision producer so at most one pending decision exists
+    /// per node at a time.
+    pub fn pending_decision_for_node(&self, node_id: Uuid) -> Result<Option<DecisionStorageRecord>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "
+            SELECT id,node_id,text,status,created_at,decided_at
+            FROM decisions
+            WHERE node_id = ?1 AND status = 'pending'
+            ORDER BY created_at DESC
+            LIMIT 1
+            ",
+            params![node_id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .context("pending decision for node")
+    }
+
+    /// Refresh the question text of an existing (pending) decision. Used when a
+    /// fresh awaiting-input arrives while a decision is already pending.
+    pub fn update_decision_text(&self, id: &str, text: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        let affected = conn.execute(
+            "UPDATE decisions SET text = ?1 WHERE id = ?2 AND status = 'pending'",
+            params![text, id],
+        )?;
+        Ok(affected > 0)
+    }
+
     pub fn insert_decision(
         &self,
         node_id: Option<Uuid>,
         text: &str,
     ) -> Result<DecisionStorageRecord> {
+
         let id = Uuid::new_v4().to_string();
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let node_id = node_id.map(|id| id.to_string());
@@ -805,6 +1079,68 @@ impl Store {
             now,
             None,
         ))
+    }
+
+    /// Create the single pending decision for a node, or -- if one already exists
+    /// -- refresh its text instead of stacking a second (M6). Atomic against the
+    /// partial unique index `decisions_one_pending_per_node`: two concurrent
+    /// awaiting-input posts for the same node can no longer both insert. Returns
+    /// the decision plus whether it was newly created (so the caller only
+    /// notifies once).
+    pub fn upsert_pending_node_decision(
+        &self,
+        node_id: Uuid,
+        text: &str,
+    ) -> Result<(DecisionStorageRecord, bool)> {
+        let conn = self.conn()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let id = Uuid::new_v4().to_string();
+        let node_id_s = node_id.to_string();
+        let insert = conn.execute(
+            "INSERT INTO decisions(id,node_id,text,status,created_at,decided_at)
+             VALUES(?1,?2,?3,'pending',?4,NULL)",
+            params![id, node_id_s, text, now],
+        );
+        match insert {
+            Ok(_) => Ok((
+                (
+                    id,
+                    Some(node_id_s),
+                    text.to_string(),
+                    "pending".to_string(),
+                    now,
+                    None,
+                ),
+                true,
+            )),
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                // A pending decision already exists for this node: refresh its
+                // text and return it (no duplicate notification).
+                conn.execute(
+                    "UPDATE decisions SET text = ?1 WHERE node_id = ?2 AND status = 'pending'",
+                    params![text, node_id_s],
+                )?;
+                let existing = conn.query_row(
+                    "SELECT id,node_id,text,status,created_at,decided_at FROM decisions
+                     WHERE node_id = ?1 AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+                    params![node_id_s],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )?;
+                Ok((existing, false))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn list_decisions(&self) -> Result<Vec<DecisionStorageRecord>> {
@@ -1379,6 +1715,7 @@ fn row_to_node_record(row: &rusqlite::Row<'_>) -> Result<NodeRecord> {
     let capabilities_json = row.get::<_, String>(10)?;
     let capabilities: CapabilitySnapshot =
         serde_json::from_str(&capabilities_json).context("failed to decode capabilities")?;
+    let harness_session_id = row.get::<_, Option<String>>(11)?;
     Ok(NodeRecord {
         id,
         harness,
@@ -1390,6 +1727,7 @@ fn row_to_node_record(row: &rusqlite::Row<'_>) -> Result<NodeRecord> {
         created_at,
         updated_at,
         external_id,
+        harness_session_id,
         capabilities,
         tokens_in: 0,
         tokens_out: 0,
@@ -1412,6 +1750,9 @@ fn hydrate_node_telemetry(conn: &Connection, node: &mut NodeRecord) -> Result<()
     let mut tool_calls: u64 = 0;
     let mut last_event_created_at: Option<i64> = None;
     let mut last_output_chunk_at: Option<i64> = None;
+    // Harness-reported context usage (claude statusline `used_percentage`),
+    // authoritative over the crude token estimate below when present.
+    let mut harness_used_percentage: Option<f64> = None;
 
     while let Some(row) = rows.next()? {
         let kind_text: String = row.get(0)?;
@@ -1420,6 +1761,16 @@ fn hydrate_node_telemetry(conn: &Connection, node: &mut NodeRecord) -> Result<()
         last_event_created_at = Some(created_at);
 
         let kind = parse_event_kind(&kind_text)?;
+        if matches!(kind, NodeEventKind::HarnessEvent) {
+            if let Some(pct) = serde_json::from_str::<JsonValue>(&body_text)
+                .ok()
+                .as_ref()
+                .and_then(|value| value.get("used_percentage"))
+                .and_then(|value| value.as_f64())
+            {
+                harness_used_percentage = Some(pct);
+            }
+        }
         let text_len = match serde_json::from_str::<JsonValue>(&body_text)
             .ok()
             .as_ref()
@@ -1460,8 +1811,13 @@ fn hydrate_node_telemetry(conn: &Connection, node: &mut NodeRecord) -> Result<()
     node.tokens_in = tokens_in;
     node.tokens_out = tokens_out;
     node.tool_calls = tool_calls;
-    let total = (tokens_in + tokens_out) as f32;
-    node.ctx_pct = (total / 200_000.0).clamp(0.0, 1.0);
+    node.ctx_pct = match harness_used_percentage {
+        Some(pct) => (pct as f32 / 100.0).clamp(0.0, 1.0),
+        None => {
+            let total = (tokens_in + tokens_out) as f32;
+            (total / 200_000.0).clamp(0.0, 1.0)
+        }
+    };
 
     let now = OffsetDateTime::now_utc().unix_timestamp();
     node.idle_seconds = match last_event_created_at {
@@ -1665,6 +2021,7 @@ fn parse_event_kind(raw: &str) -> Result<NodeEventKind> {
             "notification_sent" => NodeEventKind::NotificationSent,
             "remote_command_received" => NodeEventKind::RemoteCommandReceived,
             "attach_issued" => NodeEventKind::AttachIssued,
+            "harness_event" => NodeEventKind::HarnessEvent,
             other => return Err(anyhow::anyhow!("unknown event kind: {other}")),
         })
     })
@@ -1687,6 +2044,139 @@ mod tests {
         assert!(nodes.is_empty());
         assert!(graph.nodes.is_empty());
         assert!(graph.relationships.is_empty());
+    }
+
+    // M1/M2: compare-and-set liveness only transitions FROM an allowed state.
+    #[test]
+    fn transition_node_liveness_is_a_compare_and_set() {
+        let store = Store::open_in_memory().unwrap();
+        let node = store.insert_test_node("worker").unwrap();
+        // Fresh node is Starting. CAS Starting -> Running succeeds.
+        assert!(store
+            .transition_node_liveness(
+                node.id,
+                NodeLiveness::Running,
+                &[NodeLiveness::Starting],
+                None,
+                serde_json::json!({}),
+            )
+            .unwrap());
+        assert_eq!(store.get_node(node.id).unwrap().unwrap().liveness, NodeLiveness::Running);
+
+        // Exit sink wins: Running -> Stopped from the active set.
+        assert!(store
+            .transition_node_liveness(
+                node.id,
+                NodeLiveness::Stopped,
+                &[NodeLiveness::Running, NodeLiveness::Starting, NodeLiveness::WaitingForInput],
+                Some("exited"),
+                serde_json::json!({}),
+            )
+            .unwrap());
+
+        // M2: a stale-snapshot active write (post_harness_event) can no longer
+        // resurrect the now-terminal node -- CAS from the active set no-ops.
+        assert!(!store
+            .transition_node_liveness(
+                node.id,
+                NodeLiveness::Running,
+                &[NodeLiveness::Running, NodeLiveness::Starting, NodeLiveness::WaitingForInput],
+                None,
+                serde_json::json!({}),
+            )
+            .unwrap());
+        assert_eq!(store.get_node(node.id).unwrap().unwrap().liveness, NodeLiveness::Stopped);
+
+        // M1: resume CAS Starting -> Running no-ops once the node is terminal, so
+        // a resumed child that died during launch is not resurrected.
+        store.set_node_liveness(node.id, NodeLiveness::Failed).unwrap();
+        assert!(!store
+            .transition_node_liveness(
+                node.id,
+                NodeLiveness::Running,
+                &[NodeLiveness::Starting],
+                Some("resumed"),
+                serde_json::json!({}),
+            )
+            .unwrap());
+        assert_eq!(store.get_node(node.id).unwrap().unwrap().liveness, NodeLiveness::Failed);
+    }
+
+    // M6: at most one pending decision per node, enforced atomically.
+    #[test]
+    fn upsert_pending_decision_dedups_per_node() {
+        let store = Store::open_in_memory().unwrap();
+        let node = store.insert_test_node("worker").unwrap();
+
+        let (first, created1) = store.upsert_pending_node_decision(node.id, "q1").unwrap();
+        assert!(created1);
+        let (second, created2) = store.upsert_pending_node_decision(node.id, "q2").unwrap();
+        assert!(!created2, "second awaiting-input must refresh, not stack");
+        assert_eq!(first.0, second.0, "same decision id refreshed");
+        assert_eq!(second.2, "q2", "text refreshed");
+
+        // Exactly one pending decision exists for the node.
+        let pending: Vec<_> = store
+            .list_decisions()
+            .unwrap()
+            .into_iter()
+            .filter(|d| d.1.as_deref() == Some(node.id.to_string().as_str()) && d.3 == "pending")
+            .collect();
+        assert_eq!(pending.len(), 1);
+    }
+
+    // M6: a raw INSERT of a second pending decision violates the partial unique
+    // index, proving the DB (not just app logic) enforces the invariant.
+    #[test]
+    fn raw_second_pending_decision_insert_is_rejected_by_db() {
+        let store = Store::open_in_memory().unwrap();
+        let node = store.insert_test_node("worker").unwrap();
+        store.insert_decision(Some(node.id), "first").unwrap();
+        let dup = store.insert_decision(Some(node.id), "second");
+        assert!(dup.is_err(), "DB must reject a second pending decision per node");
+    }
+
+    // m2: per-node create-time launch_args round-trip; absent column reads empty.
+    #[test]
+    fn node_launch_args_round_trip() {
+        let store = Store::open_in_memory().unwrap();
+        let node = store.insert_test_node("worker").unwrap();
+        // Never set: baseline (empty), so resume falls back to the adapter args.
+        assert!(store.get_node_launch_args(node.id).unwrap().is_empty());
+
+        let args = vec!["--model".to_string(), "opus".to_string()];
+        store.set_node_launch_args(node.id, &args).unwrap();
+        assert_eq!(store.get_node_launch_args(node.id).unwrap(), args);
+
+        // Setting empty clears back to NULL/empty.
+        store.set_node_launch_args(node.id, &[]).unwrap();
+        assert!(store.get_node_launch_args(node.id).unwrap().is_empty());
+    }
+
+    // M7: ctx_pressure fired-state round-trips on the node row.
+    #[test]
+    fn ctx_pressure_state_round_trips() {
+        let store = Store::open_in_memory().unwrap();
+        let node = store.insert_test_node("worker").unwrap();
+        assert_eq!(store.ctx_pressure_state(node.id).unwrap(), (None, None));
+        store.set_ctx_pressure_state(node.id, Some("sess-1"), 0.7).unwrap();
+        let (sess, max) = store.ctx_pressure_state(node.id).unwrap();
+        assert_eq!(sess.as_deref(), Some("sess-1"));
+        assert_eq!(max, Some(0.7));
+    }
+
+    // M3: guest tokens revoke by name (loon-node-{id}).
+    #[test]
+    fn revoke_tokens_by_name_revokes_matching_active_tokens() {
+        let store = Store::open_in_memory().unwrap();
+        let id = Uuid::new_v4();
+        store
+            .insert_token(id, "loon-node-abc", "hash-abc", "[\"loon-node\"]", i64::MAX)
+            .unwrap();
+        assert_eq!(store.revoke_tokens_by_name("loon-node-abc").unwrap(), 1);
+        // Already revoked: no-op the second time.
+        assert_eq!(store.revoke_tokens_by_name("loon-node-abc").unwrap(), 0);
+        assert!(store.find_token_by_hash("hash-abc").unwrap().is_none());
     }
 
     #[test]

@@ -35,6 +35,7 @@ fn make_config(ntfy_server: String, ntfy_topic: String) -> AppConfig {
         ntfy_poll_interval_seconds: Some(2),
         harness: core.harness,
         loon: core.loon,
+        autonomy: core.autonomy,
     }
 }
 

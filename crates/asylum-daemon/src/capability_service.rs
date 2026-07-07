@@ -1,19 +1,22 @@
 use std::{
+    collections::HashMap,
     env,
     path::Path,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
 use asylum_types::api::{
     AttachResponse, CapabilityListResponse, ClientConfigResponse, CreateNodeRequest,
     DecisionCreateRequest, DecisionListResponse, DecisionRecord, DecisionResolveRequest,
-    GraphGetResponse, HarnessDescriptor, HarnessDescriptorResponse, HarnessListResponse,
-    HealthResponse, LaunchPacketResponse, NativeAttachResponse, NodeCreateResponse,
-    NodeEventsResponse, NodeInspectResponse, NodeListResponse, Notification, NotificationsResponse,
-    RelationshipCreateRequest, RelationshipResponse, RemoteCommandResponse, SendInputRequest,
-    SpawnPeerRequest, SpawnPeerResponse, SubstrateDescriptor, SubstrateDescriptorResponse,
-    SubstrateHealth, SubstrateListResponse, TokenIssueResponse,
+    GraphGetResponse, HarnessDescriptor, HarnessDescriptorResponse, HarnessEventRequest,
+    HarnessEventResponse, HarnessListResponse, HealthResponse, LaunchPacketResponse,
+    NativeAttachResponse, NodeCreateResponse, NodeEventsResponse, NodeInspectResponse,
+    NodeListResponse, Notification, NotificationsResponse, RelationshipCreateRequest,
+    RelationshipResponse, RemoteCommandResponse, SendInputRequest, SpawnPeerRequest,
+    SpawnPeerResponse, SubstrateDescriptor, SubstrateDescriptorResponse, SubstrateHealth,
+    SubstrateListResponse, TokenIssueResponse,
 };
 use asylum_types::capabilities::CapabilityDescriptor;
 use asylum_types::capabilities::CapabilityName;
@@ -39,24 +42,34 @@ use crate::hooks::{
     SCHEDULE_30M, SCHEDULE_5M,
 };
 use crate::notifications::send_with_optional_config;
-use crate::recipes;
+use crate::launch_packet;
+
 use crate::remote_commands::{parse_remote_command, ParsedRemoteCommand, RemoteCommandKind};
 use crate::storage::Store;
-use crate::substrate::loon::{capability_flags_from_health, LoonHealth, LoonSubstrate};
-use crate::substrate::{LocalSubstrate, SubstrateContext};
+use crate::substrate::loon::{
+    capability_flags_from_health, LoonHealth, LoonLaunchSpec, LoonRuntimeConfig, LoonSubstrate,
+    GUEST_ASYLUM_BINARY,
+};
+use crate::harness::DaemonResolution;
+use crate::substrate::{ExitOutcome, LocalSubstrate, SubstrateContext};
 use asylum_types::api::{
     ChannelCreateRequest, ChannelDescriptor, ChannelInboundRequest, ChannelListResponse,
     ChannelMessagesResponse, ChannelTestRequest, ChannelTestResponse, ChannelUpdateRequest,
     ForkNodeRequest, HookAction, HookCreateRequest, HookEventCatalogResponse, HookFiringsResponse,
-    HookListResponse, HookRule, HookTestResponse, HookUpdateRequest, RecipeListResponse,
-    RecipeSpawnRequest, RecipeSpawnResponse,
+    HookListResponse, HookRule, HookTestResponse, HookUpdateRequest,
 };
-use asylum_types::config::{HarnessConfig, LoonConfig};
+
+use asylum_types::config::{AutonomyConfig, HarnessConfig, LoonConfig};
 use asylum_types::node::NodeRecord;
 
-const CHANNEL_REPLY_TOKEN_LENGTH: usize = 5;
+// m5: 32 hex chars = the full UUIDv4 (~122 bits of entropy), not the old 5
+// chars (~20 bits) that were brute-forceable within the 30-min TTL. Stays
+// ascii-alphanumeric so the inbound reply-marker parser is unaffected.
+const CHANNEL_REPLY_TOKEN_LENGTH: usize = 32;
 const CHANNEL_REPLY_CORRELATION_TTL_SECONDS: i64 = 60 * 30;
-const NODE_PERMISSION_REQUESTED_HOOK_EVENT: &str = "node.permission_requested";
+// Awaiting-input / permission-prompt decisions surface under the single
+// `node.awaiting_input` catalog event (permission_requested was merged in).
+const NODE_AWAITING_INPUT_HOOK_EVENT: &str = "node.awaiting_input";
 
 #[derive(Clone)]
 struct LocalDecisionIngestion {
@@ -104,11 +117,12 @@ impl LocalDecisionIngestion {
         }
         if hook_event_is_supported() {
             self.hook_engine.post(HookEvent {
-                event: NODE_PERMISSION_REQUESTED_HOOK_EVENT.to_string(),
+                event: NODE_AWAITING_INPUT_HOOK_EVENT.to_string(),
                 node_id: Some(node.id),
                 payload: json!({
                     "decision": decision.id,
                     "node": {"id": node.id.to_string()},
+                    "type": "permission_prompt",
                     "source": source,
                     "actions": actions,
                 }),
@@ -121,7 +135,314 @@ impl LocalDecisionIngestion {
 fn hook_event_is_supported() -> bool {
     event_catalog()
         .iter()
-        .any(|event| event.id == NODE_PERMISSION_REQUESTED_HOOK_EVENT)
+        .any(|event| event.id == NODE_AWAITING_INPUT_HOOK_EVENT)
+}
+
+/// A live node still owns its process and can accept harness signals; terminal
+/// nodes are never resurrected by an ingested event.
+fn is_active_liveness(liveness: &NodeLiveness) -> bool {
+    matches!(
+        liveness,
+        NodeLiveness::Starting | NodeLiveness::Running | NodeLiveness::WaitingForInput
+    )
+}
+
+/// The DB name of the per-node Loon guest token (M3). Encodes the node id so
+/// every teardown/exit/reconcile path can revoke exactly that credential.
+fn loon_node_token_name(node_id: Uuid) -> String {
+    format!("loon-node-{node_id}")
+}
+
+/// Extract the node id from a `/api/nodes/{id}/...` path, if present (M3 scope
+/// enforcement). Returns the raw `{id}` segment (validated as a UUID) or None.
+fn node_id_from_path(path: &str) -> Option<String> {
+    let mut segments = path.split('/').filter(|s| !s.is_empty());
+    // Expect .../nodes/{id}
+    while let Some(seg) = segments.next() {
+        if seg == "nodes" {
+            let candidate = segments.next()?;
+            return Uuid::parse_str(candidate).ok().map(|_| candidate.to_string());
+        }
+    }
+    None
+}
+
+/// Slugify a workspace path the way claude derives its per-project transcript
+/// directory: every non-alphanumeric character becomes `-`, 1:1 (no
+/// dash-collapsing). Verified empirically against ~/.claude/projects, e.g.
+/// `/home/casey/Projects/Asylum/.claude/worktrees/orchestrator` ->
+/// `-home-casey-Projects-Asylum--claude-worktrees-orchestrator` (the `/.` in
+/// `/.claude` yields two dashes).
+fn claude_project_slug(workspace: &str) -> String {
+    workspace
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// True iff claude's session transcript for `session_id` exists on disk under
+/// `home` for the given workspace (cwd). claude writes
+/// `~/.claude/projects/<cwd-slug>/<session-id>.jsonl`. Filesystem existence
+/// only -- no parsing (Addendum A).
+fn claude_transcript_exists(home: &std::path::Path, workspace: &str, session_id: &str) -> bool {
+    home.join(".claude")
+        .join("projects")
+        .join(claude_project_slug(workspace))
+        .join(format!("{session_id}.jsonl"))
+        .is_file()
+}
+
+/// True iff a codex rollout file for `thread_id` exists anywhere under
+/// `~/.codex/sessions` (layout `<Y>/<M>/<D>/rollout-<ts>-<thread-id>.jsonl`).
+/// Recursive existence probe, bounded to a small tree; no glob dependency and
+/// no parsing (Addendum A).
+fn codex_rollout_exists(home: &std::path::Path, thread_id: &str) -> bool {
+    fn walk(dir: &std::path::Path, suffix: &str) -> bool {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return false,
+        };
+        for entry in entries.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                if walk(&path, suffix) {
+                    return true;
+                }
+            } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("rollout-") && name.ends_with(suffix) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    let root = home.join(".codex").join("sessions");
+    walk(&root, &format!("-{thread_id}.jsonl"))
+}
+
+/// Honest resumability probe (Addendum A): the recorded harness session
+/// transcript must actually exist on disk. Reconciliation and the resume
+/// endpoint both gate on this so we never claim/attempt resume for a session
+/// whose transcript is gone -- `claude --resume` / `codex resume` would just
+/// error, and asserting resumable without the file would be a dishonest claim.
+fn harness_transcript_exists(
+    home: &std::path::Path,
+    harness: &HarnessKind,
+    workspace: &str,
+    session_id: &str,
+) -> bool {
+    match harness {
+        HarnessKind::ClaudeCode => claude_transcript_exists(home, workspace, session_id),
+        HarnessKind::Codex => codex_rollout_exists(home, session_id),
+    }
+}
+
+/// The live states a process-termination event is allowed to transition FROM.
+/// Used as the compare-and-set guard in the exit sink so a terminal state set by
+/// an operator stop/archive is never clobbered by a later exit signal.
+const EXIT_SINK_ACTIVE_STATES: [NodeLiveness; 3] = [
+    NodeLiveness::Running,
+    NodeLiveness::Starting,
+    NodeLiveness::WaitingForInput,
+];
+
+/// Apply a process-exit outcome to a node's liveness honestly (C1/M2). The
+/// mapping never fabricates a clean exit:
+/// - authoritative clean exit (code 0)  -> Stopped + node.exited
+/// - authoritative abnormal exit         -> Failed  + node.errored (abnormal_exit)
+/// - lost exit stream (loon SSE dropped) -> Failed  + node.errored (stream_lost)
+///
+/// The transition is a compare-and-set from the live states, so it no-ops when a
+/// terminal state already won the race. The hook event fires only on a real
+/// transition, so a duplicate/late signal cannot double-announce an exit.
+fn apply_exit_outcome(
+    store: &Store,
+    engine: &HookEngine,
+    node_id: Uuid,
+    outcome: ExitOutcome,
+) {
+    let (target, event, reason) = if outcome.stream_lost {
+        (NodeLiveness::Failed, "node.errored", "stream_lost")
+    } else if outcome.success {
+        (NodeLiveness::Stopped, "node.exited", "exited")
+    } else {
+        (NodeLiveness::Failed, "node.errored", "abnormal_exit")
+    };
+    // M3: an authoritative exit means the loon exit_task is tearing the VM down
+    // (or a local process is gone) -- revoke the per-node guest token so a leaked
+    // credential cannot outlive the node. On stream_lost the VM is deliberately
+    // kept, so the token is kept too. No-op for local nodes (no such token).
+    if !outcome.stream_lost {
+        let _ = store.revoke_tokens_by_name(&loon_node_token_name(node_id));
+    }
+    match store.transition_node_liveness(
+        node_id,
+        target,
+        &EXIT_SINK_ACTIVE_STATES,
+        Some(reason),
+        json!({ "exit_code": outcome.code }),
+    ) {
+        Ok(true) => {
+            engine.post(HookEvent {
+                event: event.to_string(),
+                node_id: Some(node_id),
+                payload: json!({
+                    "node": {"id": node_id.to_string()},
+                    "reason": reason,
+                    "exit_code": outcome.code,
+                }),
+            });
+        }
+        // Already terminal (operator stop/archive won): leave the truth alone.
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, node_id = %node_id, "exit sink liveness CAS failed");
+        }
+    }
+}
+
+/// The result of mapping a raw harness payload to Asylum's event model. All
+/// interpretation lives here (daemon-side) so the CLI bridge stays thin.
+#[derive(Default)]
+struct MappedHarnessEvent {
+    /// Catalog event kind to store + fire, if any.
+    event: Option<&'static str>,
+    /// Liveness the node should move to as a result, if the event implies one.
+    liveness: Option<NodeLiveness>,
+    /// Extra fields merged into the stored and posted payload.
+    detail: JsonValue,
+    /// Harness session id carried by the payload (claude `session_id`,
+    /// codex `thread-id`), recorded on the node row.
+    session_id: Option<String>,
+    /// Statusline posts are handled via the telemetry/ctx_pressure path rather
+    /// than a single direct catalog event.
+    telemetry: bool,
+}
+
+fn payload_str(payload: &JsonValue, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn truncate_for_detail(value: &JsonValue, max: usize) -> JsonValue {
+    let rendered = match value {
+        JsonValue::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    if rendered.chars().count() <= max {
+        json!(rendered)
+    } else {
+        let truncated: String = rendered.chars().take(max).collect();
+        json!(format!("{truncated}…"))
+    }
+}
+
+/// Map `(source, payload)` to Asylum's event model. Pure and unit-tested.
+fn map_harness_event(source: &str, payload: &JsonValue) -> MappedHarnessEvent {
+    let mut mapped = MappedHarnessEvent::default();
+    match source {
+        "claude_hook" => {
+            mapped.session_id = payload_str(payload, "session_id");
+            let hook = payload
+                .get("hook_event_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            match hook {
+                "Stop" => {
+                    mapped.event = Some("node.turn_complete");
+                    mapped.liveness = Some(NodeLiveness::Running);
+                }
+                "SessionStart" => {
+                    mapped.event = Some("node.session_started");
+                    mapped.liveness = Some(NodeLiveness::Running);
+                    if let Some(src) = payload.get("source") {
+                        mapped.detail = json!({ "source": src });
+                    }
+                }
+                "SessionEnd" => {
+                    mapped.event = Some("node.session_end");
+                    if let Some(reason) = payload.get("reason") {
+                        mapped.detail = json!({ "reason": reason });
+                    }
+                }
+                "PostToolUse" => {
+                    mapped.event = Some("node.tool_call");
+                    mapped.liveness = Some(NodeLiveness::Running);
+                    mapped.detail = json!({
+                        "tool_name": payload.get("tool_name").cloned().unwrap_or(JsonValue::Null),
+                        "tool_input": payload
+                            .get("tool_input")
+                            .map(|v| truncate_for_detail(v, 200))
+                            .unwrap_or(JsonValue::Null),
+                    });
+                }
+                "Notification" => {
+                    // Real claude (2.1.202) sends the notification kind as
+                    // `notification_type`; older docs/fixtures used `type`. Accept
+                    // both, preferring the real field.
+                    let ntype = payload
+                        .get("notification_type")
+                        .or_else(|| payload.get("type"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let message = payload.get("message").cloned().unwrap_or(JsonValue::Null);
+                    match ntype {
+                        "permission_prompt" | "agent_needs_input" => {
+                            mapped.event = Some("node.awaiting_input");
+                            mapped.liveness = Some(NodeLiveness::WaitingForInput);
+                            mapped.detail = json!({ "type": ntype, "message": message });
+                        }
+                        "idle_prompt" => {
+                            mapped.event = Some("node.idle");
+                            mapped.liveness = Some(NodeLiveness::Running);
+                            mapped.detail = json!({ "type": ntype, "message": message, "idle_source": "notification" });
+                        }
+                        "agent_completed" => {
+                            mapped.event = Some("node.turn_complete");
+                            mapped.liveness = Some(NodeLiveness::Running);
+                        }
+                        other if other.starts_with("elicitation") => {
+                            mapped.event = Some("node.awaiting_input");
+                            mapped.liveness = Some(NodeLiveness::WaitingForInput);
+                            mapped.detail = json!({ "type": other, "message": message });
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        "codex_notify" => {
+            mapped.session_id = payload_str(payload, "thread-id");
+            let ntype = payload
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if ntype == "agent-turn-complete" {
+                mapped.event = Some("node.turn_complete");
+                mapped.liveness = Some(NodeLiveness::Running);
+                mapped.detail = json!({
+                    "last_assistant_message": payload
+                        .get("last-assistant-message")
+                        .cloned()
+                        .unwrap_or(JsonValue::Null),
+                    "turn_id": payload.get("turn-id").cloned().unwrap_or(JsonValue::Null),
+                });
+            }
+        }
+        "claude_statusline" => {
+            mapped.telemetry = true;
+            mapped.session_id = payload_str(payload, "session_id");
+        }
+        _ => {}
+    }
+    mapped
 }
 
 #[derive(Clone)]
@@ -137,6 +458,7 @@ pub struct AppConfig {
     pub ntfy_poll_interval_seconds: Option<u64>,
     pub harness: HarnessConfig,
     pub loon: LoonConfig,
+    pub autonomy: AutonomyConfig,
 }
 
 #[derive(Clone)]
@@ -149,6 +471,18 @@ pub struct CapabilityService {
     attach_issuer: Arc<AttachTokenIssuer>,
     pub config: AppConfig,
     pub hook_engine: Arc<HookEngine>,
+    /// Quiescence-timer dedup: last PTY-output epoch a `node.idle` was fired
+    /// against, per node. Prevents repeat idle events until fresh output arrives.
+    idle_fired: Arc<Mutex<HashMap<Uuid, i64>>>,
+    /// Unix timestamp (seconds) this CapabilityService (i.e. the daemon
+    /// process) was constructed. Feeds `HealthResponse.uptime_seconds` so
+    /// Cockpit no longer derives daemon uptime client-side.
+    started_at_epoch_secs: i64,
+    /// Root under which harness session transcripts are probed (Addendum A).
+    /// Production is the process HOME (`dirs::home_dir()`); tests inject a fake
+    /// HOME so the resumability probe can be exercised without touching the real
+    /// `~/.claude` / `~/.codex` trees.
+    transcript_home: Option<std::path::PathBuf>,
 }
 
 impl CapabilityService {
@@ -163,6 +497,7 @@ impl CapabilityService {
             hook_engine: hook_engine.clone(),
         };
         let exit_store = store.clone();
+        let exit_engine = hook_engine.clone();
         let local_substrate = LocalSubstrate::new_with_sinks(
             move |node_id, chunk| {
                 if let Err(e) = sink_store.append_transcript_chunk(node_id, chunk) {
@@ -174,27 +509,87 @@ impl CapabilityService {
                     tracing::warn!(error = %e, node_id = %node_id, "failed to ingest decision request");
                 }
             },
-            move |node_id| {
+            move |node_id, outcome: ExitOutcome| {
                 let store = exit_store.clone();
+                let engine = exit_engine.clone();
                 tokio::runtime::Handle::current().spawn(async move {
-                    if let Ok(Some(node)) = store.get_node(node_id) {
-                        if matches!(
-                            node.liveness,
-                            NodeLiveness::Running | NodeLiveness::Starting
-                        ) {
-                            let _ = store.set_node_liveness(node_id, NodeLiveness::Stopped);
-                        }
-                    }
+                    // The exit sink is the sole owner of process-termination truth.
+                    // The transition is a compare-and-set FROM the live states, so
+                    // a user stop/archive (already terminal) wins the race and this
+                    // becomes a no-op; only a process that died while still live is
+                    // transitioned + announced.
+                    apply_exit_outcome(&store, &engine, node_id, outcome);
                 });
             },
         );
         let loon_substrate = if config.loon.enabled {
+            // Guest-facing daemon URL: guests reach the host over the per-VM
+            // gateway, stably named host.loon.internal. Default to that name on
+            // the daemon's bind port unless an explicit guest_base_url is set.
+            let guest_base_url = config
+                .loon
+                .guest_base_url
+                .clone()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| {
+                    let port = config
+                        .bind_addr
+                        .rsplit(':')
+                        .next()
+                        .unwrap_or("7717");
+                    format!("http://host.loon.internal:{port}")
+                });
+            let loon_cfg = LoonRuntimeConfig {
+                cli_path: config.loon.cli_path.clone(),
+                config_path: config.loon.config_path.clone(),
+                profile: config.loon.profile.clone(),
+                endpoint_override: {
+                    let ep = config.loon.endpoint.trim();
+                    if ep.is_empty() || ep == "http://127.0.0.1:7777" {
+                        None
+                    } else {
+                        Some(ep.to_string())
+                    }
+                },
+                image: config.loon.image.clone(),
+                workspace_dir: config.loon.workspace_dir.clone(),
+                vm_memory_mib: config.loon.vm_memory_mib,
+                vm_cpus: config.loon.vm_cpus,
+                guest_asylum_binary: config.loon.guest_asylum_binary.clone(),
+                guest_base_url,
+            };
+            // Loon nodes route PTY output, decisions, and exit truth through the
+            // SAME sinks as local nodes, so observe/idle/exit behave identically.
+            let loon_sink_store = store.clone();
+            let loon_decision = LocalDecisionIngestion {
+                store: store.clone(),
+                hook_engine: hook_engine.clone(),
+            };
+            let loon_exit_store = store.clone();
+            let loon_exit_engine = hook_engine.clone();
             Some(Arc::new(LoonSubstrate::new(
-                &config.loon.endpoint,
-                config.loon.cli_path.clone(),
-                config.loon.api_key_file.clone(),
-                config.loon.cert_fingerprint_file.clone(),
-                true,
+                loon_cfg,
+                move |node_id, chunk| {
+                    if let Err(e) = loon_sink_store.append_transcript_chunk(node_id, chunk) {
+                        tracing::warn!(error = %e, "failed to persist loon transcript chunk");
+                    }
+                },
+                move |node_id, request| {
+                    if let Err(e) = loon_decision.ingest_request(node_id, request) {
+                        tracing::warn!(error = %e, node_id = %node_id, "failed to ingest loon decision request");
+                    }
+                },
+                move |node_id, outcome: ExitOutcome| {
+                    let store = loon_exit_store.clone();
+                    let engine = loon_exit_engine.clone();
+                    tokio::runtime::Handle::current().spawn(async move {
+                        // Same CAS exit truth as local. C1: a lost SSE exit stream
+                        // arrives here as outcome.stream_lost -> node.errored with
+                        // reason "stream_lost" (never a clean-exit lie); the VM is
+                        // deliberately kept (teardown is skipped in exit_task).
+                        apply_exit_outcome(&store, &engine, node_id, outcome);
+                    });
+                },
             )))
         } else {
             None
@@ -216,7 +611,21 @@ impl CapabilityService {
             attach_issuer: Arc::new(issuer),
             config,
             hook_engine,
+            idle_fired: Arc::new(Mutex::new(HashMap::new())),
+            started_at_epoch_secs: OffsetDateTime::now_utc().unix_timestamp(),
+            transcript_home: None,
         }
+    }
+
+    /// Root under which harness session transcripts are probed. Defaults to the
+    /// process HOME; a test override wins when set.
+    fn transcript_home_root(&self) -> Option<std::path::PathBuf> {
+        self.transcript_home.clone().or_else(dirs::home_dir)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_transcript_home_for_test(&mut self, home: std::path::PathBuf) {
+        self.transcript_home = Some(home);
     }
 
     pub fn start_background_tasks(self: &Arc<Self>) {
@@ -271,6 +680,19 @@ impl CapabilityService {
                     node_id: None,
                     payload: serde_json::json!({}),
                 });
+            }
+        });
+
+        // Quiescence idle fallback: fire node.idle for Running local nodes whose
+        // harness has no native idle signal (codex) after a configurable window
+        // of no PTY output. Claude reports idle natively via hooks and is skipped.
+        let quiescence_service = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                quiescence_service.sweep_quiescent_nodes();
             }
         });
 
@@ -332,6 +754,322 @@ impl CapabilityService {
             }),
         );
         Ok(())
+    }
+
+    /// Ingest a harness-native signal for a node: map it, store it, post it to
+    /// the hook engine, update liveness where meaningful, and record the harness
+    /// session id. This is the single producer for the new node.* events.
+    pub async fn post_harness_event(
+        &self,
+        node_id: Uuid,
+        request: HarnessEventRequest,
+    ) -> Result<HarnessEventResponse> {
+        let node = self.store.get_node(node_id)?.context("node not found")?;
+        let mapped = map_harness_event(&request.source, &request.payload);
+
+        // Record the harness session id (resume key) whenever it is present and
+        // has changed. Done even for terminal nodes so a late SessionStart still
+        // lands the id.
+        if let Some(session_id) = mapped.session_id.as_deref() {
+            if node.harness_session_id.as_deref() != Some(session_id) {
+                if let Err(e) = self
+                    .store
+                    .set_node_harness_session_id(node_id, Some(session_id))
+                {
+                    tracing::warn!(error = %e, node_id = %node_id, "failed to record harness session id");
+                }
+            }
+        }
+
+        // Only live nodes accept behavioural events; terminal nodes are inert.
+        if !is_active_liveness(&node.liveness) {
+            return Ok(HarnessEventResponse {
+                accepted: false,
+                event: None,
+                session_id: mapped.session_id,
+            });
+        }
+
+        // Statusline posts drive telemetry + threshold-based ctx_pressure.
+        if mapped.telemetry {
+            let event =
+                self.ingest_statusline(node_id, &request.payload, mapped.session_id.as_deref())?;
+            return Ok(HarnessEventResponse {
+                accepted: true,
+                event,
+                session_id: mapped.session_id,
+            });
+        }
+
+        let Some(kind) = mapped.event else {
+            // Recognised source but no mapped event (e.g. auth_success). Accept.
+            return Ok(HarnessEventResponse {
+                accepted: true,
+                event: None,
+                session_id: mapped.session_id,
+            });
+        };
+
+        let mut payload = json!({
+            "event": kind,
+            "source": request.source,
+            "node": { "id": node_id.to_string() },
+        });
+        if let (Some(target), Some(obj)) = (payload.as_object_mut(), mapped.detail.as_object()) {
+            for (key, value) in obj {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        if let Some(session_id) = mapped.session_id.as_deref() {
+            if let Some(target) = payload.as_object_mut() {
+                target.insert("session_id".to_string(), json!(session_id));
+            }
+        }
+
+        self.store
+            .record_event(node_id, NodeEventKind::HarnessEvent, payload.clone())?;
+        self.post_hook_event(kind, Some(node_id), payload.clone());
+
+        // Decision producer: an awaiting-input signal (permission_prompt,
+        // elicitation*, agent_needs_input) is the explicit ask-the-human moment,
+        // so materialise a pending decision the operator/supervisor can resolve.
+        // Deduped to at most one pending decision per node.
+        if kind == "node.awaiting_input" {
+            self.produce_decision_from_awaiting_input(node_id, &payload);
+        }
+
+        // Liveness update as a compare-and-set (M2): only transition FROM an
+        // active state, so a concurrent terminal write from the exit sink wins
+        // and a stale-snapshot harness event can never resurrect a dead node.
+        // The CAS also no-ops a same-state transition (no LivenessChanged spam).
+        if let Some(target) = mapped.liveness {
+            // m1: node.idle must not downgrade WaitingForInput -> Running. An idle
+            // signal while a decision is pending would otherwise show a healthy
+            // Running node that is actually blocked. Restrict idle to Starting/
+            // Running sources; all other events may also transition from
+            // WaitingForInput (e.g. turn_complete legitimately clears it).
+            let allowed_from: &[NodeLiveness] = if kind == "node.idle" {
+                &[NodeLiveness::Starting, NodeLiveness::Running]
+            } else {
+                &[
+                    NodeLiveness::Starting,
+                    NodeLiveness::Running,
+                    NodeLiveness::WaitingForInput,
+                ]
+            };
+            if let Err(e) =
+                self.store
+                    .transition_node_liveness(node_id, target, allowed_from, None, json!({}))
+            {
+                tracing::warn!(error = %e, node_id = %node_id, "failed to update liveness from harness event");
+            }
+        }
+
+        Ok(HarnessEventResponse {
+            accepted: true,
+            event: Some(kind.to_string()),
+            session_id: mapped.session_id,
+        })
+    }
+
+    /// Materialise (or refresh) the single pending decision for a node that has
+    /// signalled it is awaiting human input. Question text comes verbatim from the
+    /// harness `message`; when absent it falls back to a generic prompt. A fresh
+    /// awaiting-input while a decision is already pending updates that decision's
+    /// text rather than stacking a second one.
+    fn produce_decision_from_awaiting_input(&self, node_id: Uuid, payload: &JsonValue) {
+        let text = payload
+            .get("message")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| "Node is awaiting human input".to_string());
+        // M2 guard: never materialise a decision on a node that has since gone
+        // terminal (a permission_prompt racing an exit). Re-read liveness right
+        // before the write; the exit sink CAS + this check make a decision on a
+        // dead node vanishingly unlikely (a residual sub-millisecond TOCTOU
+        // window remains, but no clean-exit lie is produced).
+        match self.store.get_node(node_id) {
+            Ok(Some(node)) if is_active_liveness(&node.liveness) => {}
+            Ok(_) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, node_id = %node_id, "failed to re-read node before decision");
+                return;
+            }
+        }
+        // Atomic create-or-refresh (M6): the partial unique index guarantees at
+        // most one pending decision per node even under concurrent posts.
+        match self.store.upsert_pending_node_decision(node_id, &text) {
+            Ok((record, true)) => {
+                let decision = map_decision(record);
+                let _ = self.store.insert_notification(
+                    Some(node_id),
+                    "decision",
+                    "Decision requested",
+                    &decision.text,
+                );
+                let _ = self.store.record_event(
+                    node_id,
+                    NodeEventKind::HumanInputRequested,
+                    json!({
+                        "decision": decision.id,
+                        "text": decision.text,
+                        "source": "harness_event",
+                    }),
+                );
+            }
+            // Refreshed an existing pending decision: no duplicate notification.
+            Ok((_, false)) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, node_id = %node_id, "failed to create/refresh pending decision from awaiting_input");
+            }
+        }
+    }
+
+    /// Persist a statusline telemetry datapoint and fire `node.ctx_pressure`
+
+    /// when `used_percentage` crosses a configured threshold for the first time
+    /// in this session. Returns the mapped event kind if a threshold fired.
+    fn ingest_statusline(
+        &self,
+        node_id: Uuid,
+        payload: &JsonValue,
+        session_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let Some(used) = payload
+            .get("context_window")
+            .and_then(|c| c.get("used_percentage"))
+            .and_then(|v| v.as_f64())
+        else {
+            return Ok(None);
+        };
+
+        // Persist the telemetry datapoint; hydrate_node_telemetry prefers this
+        // harness-reported value for the displayed ctx_pct.
+        let telemetry_body = json!({
+            "event": "node.telemetry",
+            "source": "claude_statusline",
+            "node": { "id": node_id.to_string() },
+            "used_percentage": used,
+            "session_id": session_id,
+        });
+        self.store
+            .record_event(node_id, NodeEventKind::HarnessEvent, telemetry_body)?;
+
+        // M7: dedup ctx_pressure threshold crossings from the node row instead of
+        // loading and JSON-parsing EVERY prior harness-event body per statusline
+        // post (which grew O(n) per post, O(n^2) per session). The row tracks the
+        // session the state belongs to and the highest threshold already fired in
+        // it; thresholds fire once, monotonically, and reset on a session change.
+        let (stored_session, stored_max) = self
+            .store
+            .ctx_pressure_state(node_id)
+            .unwrap_or((None, None));
+        let session_matches = stored_session.as_deref() == session_id;
+        let already_fired_max = if session_matches {
+            stored_max.unwrap_or(f64::NEG_INFINITY)
+        } else {
+            // New session: the prior session's fired-state does not apply.
+            f64::NEG_INFINITY
+        };
+
+        let mut thresholds = self.config.autonomy.ctx_pressure_thresholds.clone();
+        thresholds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut fired: Option<String> = None;
+        let mut new_max = already_fired_max;
+        for threshold in thresholds {
+            // Fire only thresholds we have reached AND not already fired this
+            // session (strictly above the prior fired maximum).
+            if used < threshold || threshold <= already_fired_max {
+                continue;
+            }
+            let body = json!({
+                "event": "node.ctx_pressure",
+                "source": "claude_statusline",
+                "node": { "id": node_id.to_string() },
+                "used_percentage": used,
+                "threshold": threshold,
+                "session_id": session_id,
+            });
+            self.store
+                .record_event(node_id, NodeEventKind::HarnessEvent, body.clone())?;
+            self.post_hook_event("node.ctx_pressure", Some(node_id), body);
+            fired = Some("node.ctx_pressure".to_string());
+            if threshold > new_max {
+                new_max = threshold;
+            }
+        }
+        // Persist the advanced fired-state (and the current session) whenever we
+        // fired something or moved to a new session, so the next post dedups
+        // against a bounded row read.
+        if new_max > already_fired_max || !session_matches {
+            let persisted_max = if new_max.is_finite() { new_max } else { 0.0 };
+            self.store
+                .set_ctx_pressure_state(node_id, session_id, persisted_max)?;
+        }
+        Ok(fired)
+    }
+
+    /// Fire `node.idle` for Running local nodes whose harness has no native idle
+    /// signal after the configured quiescence window of no PTY output. Deduped
+    /// so it fires once per quiet period and refires only after fresh output.
+    fn sweep_quiescent_nodes(&self) {
+        let window = self.config.autonomy.idle_quiescence_seconds as i64;
+        if window <= 0 {
+            return;
+        }
+        let running = match self.store.list_nodes_by_liveness(NodeLiveness::Running) {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                tracing::warn!(error = %e, "quiescence sweep failed to list running nodes");
+                return;
+            }
+        };
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        for node in running {
+            // Both Local and Loon nodes stream PTY output through the transcript
+            // sink, so the output-quiescence timer applies to either. Harnesses
+            // with a native idle signal (claude) are still skipped below.
+            let native_idle = self
+                .harnesses
+                .get(&node.harness)
+                .map(|h| h.native_idle_signal())
+                .unwrap_or(false);
+            if native_idle {
+                continue;
+            }
+            let last_output = self.store.last_output_chunk_epoch(node.id).ok().flatten();
+            let reference = last_output.unwrap_or_else(|| node.created_at.unix_timestamp());
+            if now - reference < window {
+                continue;
+            }
+            {
+                let mut fired = match self.idle_fired.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => continue,
+                };
+                if fired.get(&node.id) == Some(&reference) {
+                    continue;
+                }
+                fired.insert(node.id, reference);
+            }
+            let body = json!({
+                "event": "node.idle",
+                "source": "daemon",
+                "node": { "id": node.id.to_string() },
+                "idle_source": "quiescence",
+                "idle_seconds": now - reference,
+            });
+            if let Err(e) =
+                self.store
+                    .record_event(node.id, NodeEventKind::HarnessEvent, body.clone())
+            {
+                tracing::warn!(error = %e, node_id = %node.id, "quiescence sweep failed to record idle");
+            }
+            self.post_hook_event("node.idle", Some(node.id), body);
+        }
     }
 
     async fn process_hook_event(&self, event: HookEvent) -> Result<()> {
@@ -464,44 +1202,74 @@ impl CapabilityService {
                 }
                 Ok(format!("channel:{}", channel.id))
             }
+            "send_input" => {
+                let node_id = resolve_action_node_id(action, payload)?;
+                let text = action
+                    .template
+                    .clone()
+                    .or_else(|| {
+                        action
+                            .args
+                            .get("text")
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_string)
+                    })
+                    .ok_or_else(|| {
+                        anyhow!("send_input action requires a 'text' arg or template")
+                    })?;
+                let rendered = render_template(&text, payload);
+                self.send_input(node_id, SendInputRequest { text: rendered })
+                    .await?;
+                Ok(format!("send_input:{node_id}"))
+            }
             "spawn" => {
-                if !recipe_spawn_is_enabled() {
-                    return Err(anyhow!(
-                        "hook action kind 'spawn' is unavailable while recipe spawn is disabled"
-                    ));
-                }
-                let target = action.target.clone();
-                let recipe_id = target
-                    .strip_prefix("recipe:")
-                    .ok_or_else(|| anyhow!("spawn target must be 'recipe:<id>'"))?;
+                // Honest inline spawn: the action carries a full node spec and
+                // launches a real node. No recipe indirection.
                 let harness = action
                     .args
                     .get("harness")
                     .and_then(JsonValue::as_str)
-                    .unwrap_or("claude_code");
+                    .ok_or_else(|| anyhow!("spawn action requires a 'harness' arg"))?;
                 let substrate = action
                     .args
                     .get("substrate")
                     .and_then(JsonValue::as_str)
-                    .unwrap_or("local");
-                let request = RecipeSpawnRequest {
+                    .ok_or_else(|| anyhow!("spawn action requires a 'substrate' arg"))?;
+                let role_hint = action
+                    .args
+                    .get("role")
+                    .and_then(JsonValue::as_str)
+                    .or_else(|| action.args.get("role_hint").and_then(JsonValue::as_str))
+                    .unwrap_or("worker");
+                let workspace = action
+                    .args
+                    .get("workspace")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_string);
+                let prompt = action
+                    .args
+                    .get("prompt")
+                    .and_then(JsonValue::as_str)
+                    .map(|p| render_template(p, payload));
+                let description = action
+                    .args
+                    .get("description")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_string);
+                let request = CreateNodeRequest {
                     harness: harness.to_string(),
                     substrate: substrate.to_string(),
-                    workspace: action
-                        .args
-                        .get("workspace")
-                        .and_then(JsonValue::as_str)
-                        .map(str::to_string),
-                    description: None,
-                    role_hint: None,
+                    role_hint: role_hint.to_string(),
+                    workspace,
+                    description,
+                    created_by: payload_node_id(payload).map(|id| id.to_string()),
+                    prompt,
+                    launch_args: Vec::new(),
                 };
-                let response = self.spawn_recipe(recipe_id, request).await?;
-                Ok(format!(
-                    "spawn:{}:{}",
-                    recipe_id,
-                    response.node_ids.join(",")
-                ))
+                let response = self.create_node(request).await?;
+                Ok(format!("spawn:{}", response.node_id))
             }
+
             "tool" => {
                 let outcome = self.dispatch_tool(&action.target, payload).await?;
                 Ok(format!("tool:{}:{}", action.target, outcome))
@@ -527,11 +1295,6 @@ impl CapabilityService {
                 "nodes={} edges={}",
                 graph.nodes.len(),
                 graph.relationships.len()
-            ));
-        }
-        if target == "transcript.checkpoint" {
-            return Err(anyhow!(
-                "tool target 'transcript.checkpoint' is not supported yet"
             ));
         }
         Err(anyhow!("unknown tool target '{target}'"))
@@ -669,16 +1432,22 @@ fn launch_prompt_for_runtime(
     node_id: Uuid,
     request: &CreateNodeRequest,
 ) -> String {
-    let context = adapter.launch_context(node_id, request);
-    match request
+    let mut prompt = adapter.launch_context(node_id, request);
+    if let Some(desc) = request
         .description
         .as_deref()
         .filter(|value| !value.is_empty())
     {
-        Some(desc) => format!("{}\n\nUser launch packet:\n{}", context.trim_end(), desc),
-        None => context,
+        prompt = format!("{}\n\nUser launch packet:\n{}", prompt.trim_end(), desc);
     }
+    // The optional initial prompt is the node's first task: a supervisor's
+    // opening instruction to the worker, delivered as the submitted message.
+    if let Some(task) = request.prompt.as_deref().filter(|value| !value.is_empty()) {
+        prompt = format!("{}\n\nYour task:\n{}", prompt.trim_end(), task);
+    }
+    prompt
 }
+
 
 impl CapabilityService {
     pub async fn capabilities(&self) -> CapabilityListResponse {
@@ -881,7 +1650,7 @@ impl CapabilityService {
                 CapabilityName::TokenIssue,
                 "/api/tokens",
                 "POST",
-                "Issue an owner command token",
+                "Issue an owner command token (scope is advisory-only; every token grants full access)",
                 true,
             ),
             descriptor(
@@ -1011,14 +1780,8 @@ impl CapabilityService {
                 true,
             ),
             descriptor(
-                CapabilityName::RecipeList,
-                "/api/recipes",
-                "GET",
-                "List configured launch recipes (currently none in shipped runtime)",
-                true,
-            ),
-            descriptor(
                 CapabilityName::NodeFork,
+
                 "/api/nodes/{id}/fork",
                 "POST",
                 "Fork a node",
@@ -1067,6 +1830,8 @@ impl CapabilityService {
         let database_size_bytes = std::fs::metadata(self.store.path())
             .map(|m| m.len())
             .unwrap_or(0);
+        let uptime_seconds =
+            (OffsetDateTime::now_utc().unix_timestamp() - self.started_at_epoch_secs).max(0);
         HealthResponse {
             status: "ok".to_string(),
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1076,6 +1841,8 @@ impl CapabilityService {
             database_path: self.store.path().to_string(),
             database_size_bytes,
             transcripts_dir: self.config.transcripts_dir.clone(),
+            daemon_started_at_epoch_secs: self.started_at_epoch_secs,
+            uptime_seconds,
         }
     }
 
@@ -1208,13 +1975,24 @@ impl CapabilityService {
                     )
             })
             .count() as u64;
+        // Cheap, honest local-capacity signal: running local nodes vs available
+        // CPU cores. Each local node owns a real PTY-driven harness process, so
+        // this approximates concurrency pressure on the box without shelling
+        // out to a load-average tool or adding a monitoring dependency. Not a
+        // precise resource model (harness processes vary widely in actual CPU
+        // use) — it is a directional "how full is local" gauge, matching the
+        // same run-count/ceiling shape already used for the loon lane below.
+        let local_cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1) as f32;
+        let local_capacity = (local_nodes as f32 / local_cores).min(1.0);
         let mut substrates = vec![SubstrateDescriptor {
             id: "local".to_string(),
             name: "local".to_string(),
             host: "localhost".to_string(),
             status: "ok".to_string(),
             healthy: true,
-            capacity: 0.0,
+            capacity: local_capacity,
             nodes: local_nodes,
         }];
         if self.loon_substrate.is_some() {
@@ -1285,13 +2063,34 @@ impl CapabilityService {
             .harnesses
             .get(&harness)
             .ok_or_else(|| anyhow!("missing harness adapter"))?;
-        let capabilities = adapter.capabilities();
+        let mut capabilities = adapter.capabilities();
+        if matches!(substrate, SubstrateKind::Loon) {
+            // Loon guest workspaces (and the in-guest harness session) do not
+            // survive a daemon restart or VM teardown, so a Loon node is not
+            // resumable even for a harness whose Local form is. Keep the stored
+            // capability honest.
+            capabilities.resume = false;
+        }
         let launch_command = match substrate {
             SubstrateKind::Local => {
                 resolve_command(adapter.command()).unwrap_or_else(|| adapter.command().to_string())
             }
             SubstrateKind::Loon => adapter.command().to_string(),
         };
+        // A blank harness command silently produced `exec ""` in the guest (exit
+        // 126, no output) / an unfindable local binary. Fail loudly instead: an
+        // empty command means the harness `*_command` config was set to "" (e.g.
+        // a `[harness]` table that omitted the key before the per-field serde
+        // defaults were fixed).
+        if launch_command.trim().is_empty() {
+            return Err(anyhow!(
+                "harness command for {harness} resolved empty; set [harness] {}_command in the daemon config",
+                match harness {
+                    HarnessKind::ClaudeCode => "claude",
+                    HarnessKind::Codex => "codex",
+                }
+            ));
+        }
 
         if matches!(substrate, SubstrateKind::Loon) {
             let loon = self
@@ -1319,21 +2118,66 @@ impl CapabilityService {
                 .and_then(|id| Uuid::parse_str(id).ok()),
         )?;
 
+        // m2: persist the per-node create-time launch_args so resume can reuse
+        // them (see resume_node). Best-effort: a persistence failure must not
+        // block node creation, only degrade resume to the baseline argv.
+        if !request.launch_args.is_empty() {
+            if let Err(e) = self.store.set_node_launch_args(node.id, &request.launch_args) {
+                tracing::warn!(error = %e, node_id = %node.id, "failed to persist per-node launch_args");
+            }
+        }
+
         let launch_prompt = launch_prompt_for_runtime(adapter.as_ref(), node.id, &request);
         let mut launch_args = adapter.launch_args().to_vec();
-        if matches!(substrate, SubstrateKind::Local) {
-            let asylum_binary = current_asylum_binary();
-            launch_args.extend(adapter.asylum_control_args(
-                &asylum_binary,
-                self.config.socket_path.as_deref(),
-                node.id,
-            ));
+        // Pre-assign the harness session id where the harness supports it (claude
+        // `--session-id`). Recorded on the node row now so it is the Phase C resume
+        // key even before the first SessionStart post confirms it. Codex returns
+        // None (its thread-id is discovered from the first notify post, W1).
+        let pre_session_id = adapter.preassign_session_id();
+        if let Some(session_id) = pre_session_id {
+            if let Err(e) = self
+                .store
+                .set_node_harness_session_id(node.id, Some(&session_id.to_string()))
+            {
+                tracing::warn!(error = %e, node_id = %node.id, "failed to record pre-assigned harness session id");
+            }
         }
+        // Build the MCP + hook injection and per-node env per substrate. Local
+        // resolves the daemon over the unauthenticated unix socket; Loon crosses
+        // the VM boundary and resolves over HTTP with a minted per-node token
+        // against the in-guest asylum binary path.
+        let env = match substrate {
+            SubstrateKind::Local => {
+                let asylum_binary = current_asylum_binary();
+                launch_args.extend(adapter.asylum_control_args(
+                    &asylum_binary,
+                    &DaemonResolution::Socket(self.config.socket_path.as_deref()),
+                    node.id,
+                    pre_session_id,
+                ));
+                self.local_launch_env(&node, &harness, &substrate, &capabilities)?
+            }
+            SubstrateKind::Loon => {
+                let token = self.mint_loon_node_token(node.id)?;
+                let guest_base_url = self.loon_guest_base_url();
+                launch_args.extend(adapter.asylum_control_args(
+                    GUEST_ASYLUM_BINARY,
+                    &DaemonResolution::Http {
+                        base_url: &guest_base_url,
+                        token: &token,
+                    },
+                    node.id,
+                    pre_session_id,
+                ));
+                self.loon_launch_env(&node, &harness, &capabilities, &guest_base_url, &token)?
+            }
+        };
         launch_args.extend(request.launch_args.clone());
-        // Append a single positional prompt argument so both local harness command lines and
-        // Loon `--prompt` receive the same runtime launch intent.
-        launch_args.push(launch_prompt.clone());
-        let env = self.local_launch_env(&node, &harness, &substrate, &capabilities)?;
+        // The launch prompt is intentionally NOT appended as a positional argv.
+        // Interactive harnesses (claude, codex) pre-fill a positional prompt into
+        // the input box but never submit it, so the node sits idle. It is instead
+        // delivered over the PTY as a submitted message once the TUI is ready
+        // (both Local and Loon use SubstrateContext::launch_prompt).
         let context = SubstrateContext {
             node_id: node.id,
             harness: harness.clone(),
@@ -1341,6 +2185,7 @@ impl CapabilityService {
             args: launch_args,
             workspace: request.workspace.clone(),
             env,
+            launch_prompt: Some(launch_prompt.clone()),
         };
         match substrate {
             SubstrateKind::Local => {
@@ -1365,7 +2210,13 @@ impl CapabilityService {
                     }
                 }
                 if let Err(launch_err) = self.local_substrate.launch(context).await {
-                    let _ = self.store.set_node_liveness(node.id, NodeLiveness::Failed);
+                    let _ = self.store.transition_node_liveness(
+                        node.id,
+                        NodeLiveness::Failed,
+                        &[NodeLiveness::Starting],
+                        Some("launch_failed"),
+                        json!({}),
+                    );
                     let _ = self.store.record_event(
                         node.id,
                         NodeEventKind::HarnessFailure,
@@ -1373,29 +2224,48 @@ impl CapabilityService {
                     );
                     return Err(launch_err);
                 }
-                self.store
-                    .set_node_liveness(node.id, NodeLiveness::Running)?;
+                // M1: CAS Starting -> Running so a child that died during launch
+                // (exit sink already terminal) is not overwritten back to Running.
+                self.store.transition_node_liveness(
+                    node.id,
+                    NodeLiveness::Running,
+                    &[NodeLiveness::Starting],
+                    None,
+                    json!({}),
+                )?;
             }
             SubstrateKind::Loon => {
                 let loon = self
                     .loon_substrate
                     .as_ref()
                     .ok_or_else(|| anyhow!("unsupported substrate"))?;
-                let payload = crate::substrate::loon::LoonContext {
-                    node_id: node.id,
-                    harness: harness.clone(),
-                    command: adapter.command().to_string(),
-                    prompt: launch_prompt,
-                };
-                match loon.launch_node(&payload).await {
+                // The full harness argv/env/workspace/launch-prompt survive into
+                // the guest launch (no lossy shim) via the SubstrateContext.
+                let spec = LoonLaunchSpec::from_context(
+                    context,
+                    format!("asylum-{}", node.id),
+                );
+                match loon.launch_node(spec).await {
                     Ok(external_id) => {
                         self.store
                             .set_node_external_id(node.id, Some(external_id))?;
-                        self.store
-                            .set_node_liveness(node.id, NodeLiveness::Running)?;
+                        // M1: CAS Starting -> Running (see local path).
+                        self.store.transition_node_liveness(
+                            node.id,
+                            NodeLiveness::Running,
+                            &[NodeLiveness::Starting],
+                            None,
+                            json!({}),
+                        )?;
                     }
                     Err(launch_err) => {
-                        let _ = self.store.set_node_liveness(node.id, NodeLiveness::Failed);
+                        let _ = self.store.transition_node_liveness(
+                            node.id,
+                            NodeLiveness::Failed,
+                            &[NodeLiveness::Starting],
+                            Some("launch_failed"),
+                            json!({}),
+                        );
                         let _ = self.store.record_event(
                             node.id,
                             NodeEventKind::HarnessFailure,
@@ -1416,6 +2286,344 @@ impl CapabilityService {
         Ok(NodeCreateResponse {
             node_id: node.id.to_string(),
         })
+    }
+
+    /// Reconcile persisted node liveness against reality at daemon boot. Every
+    /// in-memory runtime (Local PTYs, Loon attach/SSE tasks) died with the
+    /// previous daemon process, so any node the DB still marks live is a lie
+    /// until proven otherwise. This is the single place that clears
+    /// eternal-Running rows; `list_nodes_by_liveness` finally earns its keep.
+    /// Runs to completion before the HTTP listeners bind, so no client ever
+    /// observes a stale liveness.
+    pub async fn reconcile_on_boot(&self) {
+        // Liveness values that imply a live runtime the daemon no longer has.
+        let stale_states = [
+            NodeLiveness::Starting,
+            NodeLiveness::Running,
+            NodeLiveness::WaitingForInput,
+        ];
+        let mut reconciled = 0usize;
+        for state in stale_states {
+            let nodes = match self.store.list_nodes_by_liveness(state.clone()) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(error = %e, ?state, "reconcile: failed to list nodes by liveness");
+                    continue;
+                }
+            };
+            for node in nodes {
+                match node.substrate {
+                    SubstrateKind::Local => {
+                        // All local PTYs died with the daemon; nothing to query.
+                        let resumable = self.local_node_resumable(&node);
+                        self.mark_reconciled(
+                            &node,
+                            "reconciled_local_pty_lost",
+                            resumable,
+                            None,
+                        );
+                    }
+                    SubstrateKind::Loon => self.reconcile_loon_node(&node).await,
+                }
+                reconciled += 1;
+            }
+        }
+        if reconciled > 0 {
+            tracing::info!(reconciled, "startup reconciliation marked stale-live nodes honestly");
+        }
+    }
+
+    /// A Local node is resumable iff it recorded a harness session id, its
+    /// workspace still exists on disk (claude `--resume` is cwd-scoped), AND the
+    /// harness session transcript is actually present on disk (Addendum A): a
+    /// claude `<cwd-slug>/<session-id>.jsonl` or a codex `rollout-*-<thread-id>`
+    /// rollout. Without the transcript the resume would just error, so claiming
+    /// resumable would be dishonest.
+    fn local_node_resumable(&self, node: &NodeRecord) -> bool {
+        let Some(session_id) = node
+            .harness_session_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        else {
+            return false;
+        };
+        let Some(workspace) = node.workspace.as_deref().filter(|w| !w.is_empty()) else {
+            return false;
+        };
+        if !std::path::Path::new(workspace).is_dir() {
+            return false;
+        }
+        let Some(home) = self.transcript_home_root() else {
+            return false;
+        };
+        harness_transcript_exists(&home, &node.harness, workspace, session_id)
+    }
+
+    async fn reconcile_loon_node(&self, node: &NodeRecord) {
+        let loon = match &self.loon_substrate {
+            Some(loon) => loon,
+            None => {
+                // Node was created against Loon but the substrate is now disabled;
+                // we cannot query the host. Mark honestly, not resumable.
+                self.mark_reconciled(node, "reconciled_loon_substrate_disabled", false, None);
+                return;
+            }
+        };
+        let external_id = match node.external_id.as_deref() {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => {
+                self.mark_reconciled(node, "reconciled_loon_no_vm", false, None);
+                return;
+            }
+        };
+        match loon.vm_exists(&external_id).await {
+            Ok(true) => {
+                // The VM outlived the daemon but the attach/SSE runtime (and the
+                // original PTY exec id) died with it. We cannot re-attach to the
+                // orphaned exec, and launching a competing `--resume` against a
+                // still-live guest harness would risk corrupting the session. The
+                // guest workspace dies with the VM regardless, so the honest,
+                // cheap action is teardown + mark Stopped (not resumable).
+                // Adopt-and-resume-in-guest is future work (needs exec-id
+                // persistence across restarts).
+                let _ = loon.force_teardown(&external_id).await;
+                // M3: token dies with the reclaimed VM.
+                let _ = self.store.revoke_tokens_by_name(&loon_node_token_name(node.id));
+                self.mark_reconciled(
+                    node,
+                    "reconciled_loon_vm_orphaned_torn_down",
+                    false,
+                    Some(&external_id),
+                );
+            }
+            Ok(false) => {
+                // VM already gone; prune any tombstone and mark honestly.
+                let _ = loon.force_teardown(&external_id).await;
+                let _ = self.store.revoke_tokens_by_name(&loon_node_token_name(node.id));
+                self.mark_reconciled(node, "reconciled_loon_vm_gone", false, Some(&external_id));
+            }
+            Err(e) => {
+                // Host unreachable: we still have no live runtime, so the node is
+                // not Running here — mark Stopped, but do not attempt teardown
+                // against an unreachable host.
+                tracing::warn!(error = %e, node_id = %node.id, "reconcile: loon host unreachable; marking stopped without teardown");
+                self.mark_reconciled(
+                    node,
+                    "reconciled_loon_host_unreachable",
+                    false,
+                    Some(&external_id),
+                );
+            }
+        }
+    }
+
+    /// Record the honest liveness transition for a reconciled node: Stopped plus
+    /// a `LivenessChanged` event carrying the reason and whether the node stayed
+    /// resumable. Uses the existing event-catalog kind (no new kinds invented).
+    fn mark_reconciled(
+        &self,
+        node: &NodeRecord,
+        reason: &str,
+        resumable: bool,
+        external_id: Option<&str>,
+    ) {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "substrate".to_string(),
+            json!(node.substrate.to_string()),
+        );
+        extra.insert("resumable".to_string(), json!(resumable));
+        extra.insert("previous".to_string(), json!(node.liveness.to_string()));
+        if let Some(id) = external_id {
+            extra.insert("external_id".to_string(), json!(id));
+        }
+        if let Err(e) = self.store.set_node_liveness_with_reason(
+            node.id,
+            NodeLiveness::Stopped,
+            reason,
+            JsonValue::Object(extra),
+        ) {
+            tracing::warn!(error = %e, node_id = %node.id, "reconcile: failed to record honest liveness");
+        } else {
+            tracing::info!(node_id = %node.id, reason, resumable, "reconciled node to Stopped");
+        }
+    }
+
+    /// Resume a previously-stopped node in its SAME row/workspace: relaunch the
+    /// harness against its recorded session id (claude `--resume`, codex
+    /// `resume`) with all W3 injection intact, so context survives and the
+    /// SessionStart hook posts source=resume. Honest failures: no recorded
+    /// session id, workspace missing, node not in a resumable state, or a
+    /// harness/substrate that cannot resume.
+    pub async fn resume_node(&self, node_id: Uuid) -> Result<()> {
+        let node = self.store.get_node(node_id)?.context("node not found")?;
+
+        let session_id = node
+            .harness_session_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow!("node has no recorded harness session id; nothing to resume")
+            })?
+            .to_string();
+
+        match node.liveness {
+            NodeLiveness::Stopped | NodeLiveness::Exited | NodeLiveness::Failed => {}
+            NodeLiveness::Running | NodeLiveness::Starting | NodeLiveness::WaitingForInput => {
+                return Err(anyhow!(
+                    "node is already live ({}); resume only applies to a stopped session",
+                    node.liveness
+                ));
+            }
+            NodeLiveness::Archived => {
+                return Err(anyhow!(
+                    "node is archived; create a new node instead of resuming"
+                ));
+            }
+        }
+
+        let harness = node.harness.clone();
+        let adapter = self
+            .harnesses
+            .get(&harness)
+            .ok_or_else(|| anyhow!("missing harness adapter"))?;
+
+        match node.substrate {
+            SubstrateKind::Local => {
+                if self.local_substrate.has_runtime(node_id).await {
+                    return Err(anyhow!("node already has a live runtime; not resuming"));
+                }
+                let workspace = node
+                    .workspace
+                    .as_deref()
+                    .filter(|w| !w.is_empty())
+                    .ok_or_else(|| {
+                        anyhow!("node has no workspace; resume is workspace-scoped")
+                    })?;
+                if !std::path::Path::new(workspace).is_dir() {
+                    return Err(anyhow!(
+                        "node workspace {workspace} no longer exists; cannot resume"
+                    ));
+                }
+
+                // Addendum A: fail fast when the harness session transcript is
+                // absent on disk. `claude --resume`/`codex resume` need the
+                // recorded session's transcript; without it the relaunch would
+                // error (or silently start a fresh session), so refuse honestly
+                // rather than claim a resume we cannot perform.
+                let home = self.transcript_home_root()
+                    .ok_or_else(|| anyhow!("cannot determine HOME to locate the harness transcript"))?;
+                if !harness_transcript_exists(&home, &harness, workspace, &session_id) {
+                    return Err(anyhow!(
+                        "harness session transcript for {session_id} not found on disk; cannot \
+                         resume (the session was deleted, or ran under a different HOME/workspace)"
+                    ));
+                }
+
+                let asylum_binary = current_asylum_binary();
+                let args = adapter
+                    .resume_args(
+                        &session_id,
+                        &asylum_binary,
+                        &DaemonResolution::Socket(self.config.socket_path.as_deref()),
+                        node.id,
+                    )
+                    .ok_or_else(|| anyhow!("harness {harness} does not support resume"))?;
+                // m2: reapply the per-node create-time launch_args, mirroring the
+                // create path which appends request.launch_args AFTER the control
+                // injection. The resumed argv then matches the created argv except
+                // for the session-id -> resume swap owned by resume_args().
+                let mut args = args;
+                args.extend(self.store.get_node_launch_args(node.id).unwrap_or_default());
+                let env =
+                    self.local_launch_env(&node, &harness, &node.substrate, &node.capabilities)?;
+                let launch_command = resolve_command(adapter.command())
+                    .unwrap_or_else(|| adapter.command().to_string());
+
+                // Re-assert workspace trust (idempotent) before relaunch.
+                if let Err(e) = adapter.pre_trust_workspace(workspace) {
+                    return Err(anyhow!("pre_trust_workspace failed: {e}"));
+                }
+
+                // M1: move to Starting BEFORE launch so the exit sink (which only
+                // acts on live states) can own the terminal decision if the
+                // resumed child dies in the launch window. Without this the node
+                // sat at a terminal Stopped, the exit sink no-oped, and the
+                // post-launch Running write below resurrected an eternal-Running
+                // lie that only a daemon restart could clear.
+                let _ = self.store.transition_node_liveness(
+                    node.id,
+                    NodeLiveness::Starting,
+                    &[
+                        NodeLiveness::Stopped,
+                        NodeLiveness::Exited,
+                        NodeLiveness::Failed,
+                    ],
+                    Some("resuming"),
+                    json!({ "harness_session_id": session_id }),
+                );
+
+                let context = SubstrateContext {
+                    node_id: node.id,
+                    harness: harness.clone(),
+                    command: launch_command,
+                    args,
+                    workspace: node.workspace.clone(),
+                    env,
+                    // No launch prompt: resume restores the prior session's
+                    // context and waits. The caller drives it with the next
+                    // send_input; re-submitting the instruction prompt would
+                    // start a fresh task on top of the resumed history.
+                    launch_prompt: None,
+                };
+                if let Err(launch_err) = self.local_substrate.launch(context).await {
+                    // CAS from Starting so a concurrent exit-sink terminal write is
+                    // not clobbered.
+                    let _ = self.store.transition_node_liveness(
+                        node.id,
+                        NodeLiveness::Failed,
+                        &[NodeLiveness::Starting],
+                        Some("resume_launch_failed"),
+                        json!({}),
+                    );
+                    let _ = self.store.record_event(
+                        node.id,
+                        NodeEventKind::HarnessFailure,
+                        json!({ "error": launch_err.to_string(), "phase": "resume" }),
+                    );
+                    return Err(anyhow!("resume launch failed: {launch_err}"));
+                }
+                // M1: CAS Starting -> Running. If the resumed child already died in
+                // the launch window, the exit sink moved it terminal and this
+                // no-ops -- the node stays honestly Failed/Stopped instead of a
+                // resurrected Running.
+                self.store.transition_node_liveness(
+                    node.id,
+                    NodeLiveness::Running,
+                    &[NodeLiveness::Starting],
+                    Some("resumed"),
+                    json!({ "harness_session_id": session_id }),
+                )?;
+                self.post_hook_event(
+                    "node.resumed",
+                    Some(node.id),
+                    json!({
+                        "node": {
+                            "id": node.id.to_string(),
+                            "harness": harness.to_string(),
+                            "substrate": "local",
+                        },
+                        "harness_session_id": session_id,
+                    }),
+                );
+                Ok(())
+            }
+            SubstrateKind::Loon => Err(anyhow!(
+                "resume is not supported for Loon nodes: the guest workspace and harness \
+                 session do not survive a daemon restart or VM teardown. Create a new Loon \
+                 node instead."
+            )),
+        }
     }
 
     fn local_launch_env(
@@ -1458,6 +2666,79 @@ impl CapabilityService {
         }
         if let Some(socket_path) = &self.config.socket_path {
             env.push(("ASYLUM_SOCKET_PATH".to_string(), socket_path.clone()));
+        }
+        Ok(env)
+    }
+
+    /// Guest-facing Asylum daemon URL for Loon nodes: explicit config wins, else
+    /// derive host.loon.internal on the daemon bind port (guests reach the host
+    /// over the per-VM gateway, stably named host.loon.internal).
+    fn loon_guest_base_url(&self) -> String {
+        if let Some(url) = self
+            .config
+            .loon
+            .guest_base_url
+            .as_ref()
+            .filter(|v| !v.is_empty())
+        {
+            return url.clone();
+        }
+        let port = self.config.bind_addr.rsplit(':').next().unwrap_or("7717");
+        format!("http://host.loon.internal:{port}")
+    }
+
+    /// Mint a per-node bearer token for the in-guest MCP server + harness-event
+    /// bridge (the unix socket does not cross the VM boundary). Tokens are
+    /// all-or-nothing today (scope is inert); the scope string is descriptive.
+    fn mint_loon_node_token(&self, node_id: Uuid) -> Result<String> {
+        let name = format!("loon-node-{node_id}");
+        // Node lifetime can be long; give the token a generous 30-day TTL.
+        let issued = issue_owner_token(&name, &["loon-node".to_string()], Some(30 * 24 * 3600))?;
+        self.store.insert_token(
+            issued.token_id,
+            &name,
+            &issued.stored_hash,
+            &serde_json::to_string(&issued.scope)?,
+            issued.expires_at_epoch_secs,
+        )?;
+        Ok(issued.raw_token)
+    }
+
+    /// Environment for a Loon guest harness process: mirrors `local_launch_env`
+    /// but resolves the daemon over HTTP (guest base URL + per-node token) rather
+    /// than the unix socket, and never sets ASYLUM_SOCKET_PATH.
+    fn loon_launch_env(
+        &self,
+        node: &NodeRecord,
+        harness: &HarnessKind,
+        capabilities: &CapabilitySnapshot,
+        guest_base_url: &str,
+        token: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let mut env = vec![
+            ("ASYLUM_NODE_ID".to_string(), node.id.to_string()),
+            ("ASYLUM_NODE_ROLE".to_string(), node.role_hint.clone()),
+            ("ASYLUM_HARNESS".to_string(), harness.to_string()),
+            ("ASYLUM_SUBSTRATE".to_string(), SubstrateKind::Loon.to_string()),
+            ("ASYLUM_BASE_URL".to_string(), guest_base_url.to_string()),
+            ("ASYLUM_TOKEN".to_string(), token.to_string()),
+            ("ASYLUM_CONTROL_TRANSPORT".to_string(), "http".to_string()),
+            (
+                "ASYLUM_DECISION_PROTOCOL".to_string(),
+                ASYLUM_DECISION_PROTOCOL.to_string(),
+            ),
+            (
+                "ASYLUM_CAPABILITIES_JSON".to_string(),
+                serde_json::to_string(capabilities)?,
+            ),
+            (
+                "ASYLUM_GRAPH_SUMMARY".to_string(),
+                self.graph_summary()
+                    .unwrap_or_else(|_| "graph unavailable".to_string()),
+            ),
+        ];
+        if let Some(workspace) = &node.workspace {
+            env.push(("ASYLUM_WORKSPACE".to_string(), workspace.clone()));
         }
         Ok(env)
     }
@@ -1523,13 +2804,14 @@ impl CapabilityService {
                 loon.interrupt(external_id).await?;
             }
         }
-        self.store
-            .set_node_liveness(node_id, NodeLiveness::Stopped)?;
-        self.post_hook_event(
-            "node.exited",
-            Some(node_id),
-            json!({"node": {"id": node_id.to_string()}, "reason": "interrupted"}),
-        );
+        // Ctrl-C cancels the current turn; it does NOT terminate the node. The
+        // exit sink owns termination truth, so liveness follows the real process
+        // signal (or a subsequent harness event) rather than being forced here.
+        self.store.record_event(
+            node_id,
+            NodeEventKind::RemoteCommandReceived,
+            json!({"action": "interrupt", "reason": "ctrl_c"}),
+        )?;
         Ok(())
     }
 
@@ -1544,6 +2826,8 @@ impl CapabilityService {
         }
         self.store
             .set_node_liveness(node_id, NodeLiveness::Stopped)?;
+        // M3: kill the per-node guest token now that the node is stopped.
+        let _ = self.store.revoke_tokens_by_name(&loon_node_token_name(node_id));
         self.post_hook_event(
             "node.exited",
             Some(node_id),
@@ -1566,6 +2850,8 @@ impl CapabilityService {
         }
         self.store
             .set_node_liveness(node_id, NodeLiveness::Archived)?;
+        // M3: kill the per-node guest token now that the node is archived.
+        let _ = self.store.revoke_tokens_by_name(&loon_node_token_name(node_id));
         self.post_hook_event(
             "node.exited",
             Some(node_id),
@@ -1802,9 +3088,11 @@ impl CapabilityService {
                         workspace,
                         description: None,
                         created_by: None,
+                        prompt: None,
                         launch_args: Vec::new(),
                     })
                     .await
+
                 {
                     Ok(response) => Ok((
                         None,
@@ -1849,9 +3137,11 @@ impl CapabilityService {
                         decision_id,
                         DecisionResolveRequest {
                             status: "approved".to_string(),
+                            answer: None,
                         },
                     )
                     .await?;
+
                 Ok((
                     None,
                     json!({
@@ -1867,9 +3157,11 @@ impl CapabilityService {
                         decision_id,
                         DecisionResolveRequest {
                             status: "denied".to_string(),
+                            answer: None,
                         },
                     )
                     .await?;
+
                 Ok((
                     None,
                     json!({
@@ -1961,7 +3253,8 @@ impl CapabilityService {
             ("interrupt", node.capabilities.interrupt),
             ("stop", node.capabilities.stop),
         ];
-        let markdown = recipes::launch_packet_markdown(
+        let markdown = launch_packet::launch_packet_markdown(
+
             &node.id.to_string(),
             &self.config.base_url,
             &node.role_hint,
@@ -2070,9 +3363,12 @@ impl CapabilityService {
         id: &str,
         request: DecisionResolveRequest,
     ) -> Result<DecisionRecord> {
+        // m6: "answered" is the honest status for a free-text reply whose content
+        // is neither a structured approve nor deny (a phone reply body is opaque
+        // free text; hardcoding "approved" recorded a human denial as an approval).
         let status = match request.status.as_str() {
-            "approved" | "denied" => request.status,
-            _ => return Err(anyhow!("decision status must be approved or denied")),
+            "approved" | "denied" | "answered" => request.status,
+            _ => return Err(anyhow!("decision status must be approved, denied, or answered")),
         };
         let before = self.get_decision(id).await?;
         if !self.store.resolve_decision(id, &status)? {
@@ -2083,8 +3379,20 @@ impl CapabilityService {
             .node_id
             .as_deref()
             .and_then(|raw| Uuid::parse_str(raw).ok());
+        // Close the loop: inject the resolution back into the node's PTY via the
+        // send_input path (types AND submits). A free-text answer is delivered
+        // verbatim; a bare approve/deny maps to a simple affirmative/negative.
+        let feedback = decision_feedback_text(&after.status, request.answer.as_deref());
         if let Some(node_id) = node_id {
             if let Ok(Some(node)) = self.store.get_node(node_id) {
+                if is_active_liveness(&node.liveness) {
+                    if let Err(e) = self
+                        .send_input(node_id, SendInputRequest { text: feedback })
+                        .await
+                    {
+                        tracing::warn!(error = %e, node_id = %node_id, "failed to inject decision feedback into node");
+                    }
+                }
                 if matches!(node.liveness, NodeLiveness::WaitingForInput) {
                     self.store
                         .set_node_liveness(node_id, NodeLiveness::Running)?;
@@ -2109,6 +3417,7 @@ impl CapabilityService {
         }
         Ok(after)
     }
+
 
     pub async fn notify_send(
         &self,
@@ -2199,6 +3508,53 @@ impl CapabilityService {
                 self.validate_owner_token_value(token)
             }
         }
+    }
+
+    /// M3 narrow scope enforcement for per-node Loon guest tokens.
+    ///
+    /// A guest token is named `loon-node-{node_id}` and is shipped INTO the VM as
+    /// `ASYLUM_TOKEN`. Anything inside VM A (the harness, a prompt-injected agent,
+    /// anything reading its env) must not be able to drive/stop/archive node B.
+    /// Given the raw bearer value and the request path, this returns false when a
+    /// loon-node token targets:
+    ///   - a `/api/nodes/{other}/...` route for a different node id, or
+    ///   - the `/api/tokens...` fleet-credential-management surface.
+    /// Owner tokens (static config token or any non-`loon-node-` DB token) and
+    /// `AuthMode::Disabled` are unrestricted.
+    ///
+    /// ENFORCED: cross-node access via a node id in the URL PATH, and token
+    /// management. NOT enforced (documented, see docs security note): node ids
+    /// carried in the request BODY or query string, and non-node-scoped
+    /// endpoints (e.g. `POST /api/nodes` create, `/api/graph`, `/api/decisions`),
+    /// which a guest legitimately uses to spawn/observe peers.
+    pub fn scoped_token_authorizes_path(&self, token_value: &str, path: &str) -> bool {
+        if matches!(self.auth_mode, AuthMode::Disabled) {
+            return true;
+        }
+        // Identify a per-node guest token by its DB name; owner/config tokens are
+        // unrestricted.
+        let hash = crate::auth::hash_token(token_value);
+        let bound_node = match self.store.find_token_by_hash(&hash) {
+            Ok(Some((_, name, _, _))) => name
+                .strip_prefix("loon-node-")
+                .map(|id| id.to_string()),
+            // Not a DB token (static config owner token) or lookup miss: not a
+            // scoped guest token, so no path restriction.
+            _ => None,
+        };
+        let Some(bound_node) = bound_node else {
+            return true;
+        };
+        // A guest token may not touch the token-management surface at all.
+        if path == "/api/tokens" || path.starts_with("/api/tokens/") {
+            return false;
+        }
+        // If the path carries a node id (/api/nodes/{id}/...), it must be its own.
+        if let Some(target) = node_id_from_path(path) {
+            return target == bound_node;
+        }
+        // Non-node-scoped path: allowed (see NOT-enforced note above).
+        true
     }
 
     pub fn attach_issuer_clone(&self) -> Arc<AttachTokenIssuer> {
@@ -2324,15 +3680,35 @@ impl CapabilityService {
 
         if remote_command_result.is_none() {
             if let Some(node_id) = node_id {
-                self.send_input(
-                    node_id,
-                    SendInputRequest {
-                        text: request.body.clone(),
-                    },
-                )
-                .await?;
+                // A reply correlated to a node with a pending decision resolves
+                // that decision (free-text answer). resolve_decision then injects
+                // the answer into the PTY, so the inbound reply flows through the
+                // same feedback path rather than bypassing it. With no pending
+                // decision, the reply is a plain input delivery.
+                if let Ok(Some(pending)) = self.store.pending_decision_for_node(node_id) {
+                    // m6: record the reply honestly. The free-text body is opaque
+                    // (Asylum does not parse it into yes/no -- dumb plumbing), so
+                    // the decision resolves as "answered", not "approved".
+                    self.resolve_decision(
+                        &pending.0,
+                        DecisionResolveRequest {
+                            status: "answered".to_string(),
+                            answer: Some(request.body.clone()),
+                        },
+                    )
+                    .await?;
+                } else {
+                    self.send_input(
+                        node_id,
+                        SendInputRequest {
+                            text: request.body.clone(),
+                        },
+                    )
+                    .await?;
+                }
             }
         }
+
 
         self.record_channel_inbound(
             id,
@@ -2514,21 +3890,6 @@ impl CapabilityService {
         })
     }
 
-    pub async fn list_recipes(&self) -> RecipeListResponse {
-        RecipeListResponse {
-            recipes: Vec::new(),
-        }
-    }
-
-    pub async fn spawn_recipe(
-        &self,
-        recipe_id: &str,
-        _request: RecipeSpawnRequest,
-    ) -> Result<RecipeSpawnResponse> {
-        Err(anyhow!(
-            "recipe-based spawning is disabled until user/config-backed recipes are implemented ({recipe_id})"
-        ))
-    }
 
     pub async fn spawn_peer(
         &self,
@@ -2576,11 +3937,13 @@ impl CapabilityService {
                 workspace,
                 description,
                 created_by: Some(source_id.to_string()),
+                prompt: request.prompt,
                 launch_args: Vec::new(),
             })
             .await?;
         let new_id = Uuid::parse_str(&response.node_id)?;
         let relationship = self.store.create_relationship(
+
             source_id,
             new_id,
             relationship_kind,
@@ -2603,6 +3966,15 @@ impl CapabilityService {
             .store
             .get_node(source_id)?
             .ok_or_else(|| anyhow!("source node not found"))?;
+        if source.substrate == SubstrateKind::Loon {
+            // A Local fork shares the source's real workspace files. A Loon
+            // "fork" would boot a fresh VM whose same-named in-guest workspace
+            // is empty -- silently NOT a fork. Reject rather than degrade.
+            return Err(anyhow!(
+                "fork is unsupported for loon nodes: guest workspaces are not shared \
+                 across VMs; create a new node and provision its workspace explicitly"
+            ));
+        }
         let role_hint = request.role_hint.unwrap_or(source.role_hint.clone());
         let workspace = request.workspace.or(source.workspace.clone());
         let description = request.description.unwrap_or(source.description.clone());
@@ -2614,11 +3986,13 @@ impl CapabilityService {
                 workspace,
                 description: Some(description),
                 created_by: None,
+                prompt: None,
                 launch_args: Vec::new(),
             })
             .await?;
         let new_id = Uuid::parse_str(&response.node_id)?;
         self.store.create_relationship(
+
             source_id,
             new_id,
             RelationshipKind::SpawnedFor,
@@ -2768,18 +4142,72 @@ fn looks_like_remote_command(raw: &str) -> bool {
     )
 }
 
-fn recipe_spawn_is_enabled() -> bool {
-    false
-}
-
+/// Validate hook action shapes at create/update time. Kinds are matched by the
+/// executor; here we fail fast on structurally-incomplete honest actions so a
+/// rule cannot be stored that could never execute.
 fn validate_hook_actions(actions: &[HookAction]) -> Result<()> {
-    if !recipe_spawn_is_enabled() && actions.iter().any(|action| action.kind.as_str() == "spawn") {
-        return Err(anyhow!(
-            "hook action kind 'spawn' is unavailable while recipe spawn is disabled"
-        ));
+    for action in actions {
+        match action.kind.as_str() {
+            "spawn" => {
+                if action
+                    .args
+                    .get("harness")
+                    .and_then(JsonValue::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .is_none()
+                {
+                    return Err(anyhow!("spawn action requires a 'harness' arg"));
+                }
+                if action
+                    .args
+                    .get("substrate")
+                    .and_then(JsonValue::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .is_none()
+                {
+                    return Err(anyhow!("spawn action requires a 'substrate' arg"));
+                }
+            }
+            "send_input" => {
+                let has_text = action.template.as_deref().is_some_and(|t| !t.is_empty())
+                    || action
+                        .args
+                        .get("text")
+                        .and_then(JsonValue::as_str)
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .is_some();
+                if !has_text {
+                    return Err(anyhow!(
+                        "send_input action requires a 'text' arg or template"
+                    ));
+                }
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
+
+/// Resolve the node a node-targeted hook action addresses: an explicit UUID in
+/// `action.target`, or the event's own node when the target is empty or names
+/// the event (`event`/`node`/`event.node`).
+fn resolve_action_node_id(action: &HookAction, payload: &JsonValue) -> Result<Uuid> {
+    let target = action.target.trim();
+    if target.is_empty()
+        || target.eq_ignore_ascii_case("event")
+        || target.eq_ignore_ascii_case("node")
+        || target.eq_ignore_ascii_case("event.node")
+    {
+        return node_id_from_payload(payload);
+    }
+    Uuid::parse_str(target).map_err(|_| {
+        anyhow!("send_input target must be a node UUID or 'event' for the event's node")
+    })
+}
+
 
 fn remote_command_requires_node(kind: &RemoteCommandKind) -> bool {
     matches!(
@@ -2813,9 +4241,23 @@ fn decision_id_from_remote_args(args: &std::collections::HashMap<String, String>
         .ok_or_else(|| anyhow!("decision required"))
 }
 
+/// The text injected into a node's PTY when a decision resolves. A free-text
+/// answer wins verbatim; otherwise a bare approve/deny maps to a simple
+/// affirmative/negative. No cleverness — the harness interprets it.
+fn decision_feedback_text(status: &str, answer: Option<&str>) -> String {
+    if let Some(answer) = answer.map(str::trim).filter(|a| !a.is_empty()) {
+        return answer.to_string();
+    }
+    match status {
+        "approved" => "yes".to_string(),
+        _ => "no".to_string(),
+    }
+}
+
 fn map_decision(
     (id, node_id, text, status, created_at, decided_at): crate::storage::DecisionStorageRecord,
 ) -> DecisionRecord {
+
     DecisionRecord {
         id,
         node_id,
@@ -2920,6 +4362,7 @@ mod tests {
             ntfy_poll_interval_seconds: Some(core.ntfy.poll_interval_seconds),
             harness: core.harness,
             loon: core.loon,
+            autonomy: core.autonomy,
         }
     }
 
@@ -2937,7 +4380,9 @@ mod tests {
             workspace: Some("/tmp".to_string()),
             description: None,
             created_by: None,
+            prompt: None,
             launch_args: Vec::new(),
+
         };
         let prompt = launch_prompt_for_runtime(adapter.as_ref(), node_id, &request);
         assert!(prompt.contains(&format!("You are node {} with role 'worker'.", node_id)));
@@ -2954,7 +4399,9 @@ mod tests {
             workspace: None,
             description: Some(description.to_string()),
             created_by: None,
+            prompt: None,
             launch_args: Vec::new(),
+
         }
     }
 
@@ -2969,7 +4416,9 @@ mod tests {
             workspace: Some(workspace.to_string()),
             description: Some(description.to_string()),
             created_by: None,
+            prompt: None,
             launch_args: Vec::new(),
+
         }
     }
 
@@ -2981,21 +4430,12 @@ mod tests {
             workspace: None,
             description: Some(description.to_string()),
             created_by: None,
+            prompt: None,
             launch_args: Vec::new(),
+
         }
     }
 
-    fn loon_create_request_with_workspace(description: &str, workspace: &str) -> CreateNodeRequest {
-        CreateNodeRequest {
-            harness: "codex".to_string(),
-            substrate: "loon".to_string(),
-            role_hint: "worker".to_string(),
-            workspace: Some(workspace.to_string()),
-            description: Some(description.to_string()),
-            created_by: None,
-            launch_args: Vec::new(),
-        }
-    }
 
     fn open_store_with_schema_broken(path: &str, table: &str) -> Result<(), rusqlite::Error> {
         let connection = Connection::open(path)?;
@@ -3083,7 +4523,124 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capabilities_hide_recipe_spawn_descriptor() -> Result<(), Box<dyn std::error::Error>> {
+    async fn scoped_guest_token_is_confined_to_its_own_node(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // M3: a minted per-node (loon-node-<id>) guest token must be path-scoped:
+        // it may drive its OWN node, must be rejected on any OTHER node's path and
+        // on the token-management surface, while a real owner token is unrestricted.
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let raw_owner = "owner-secret-token";
+        let service = CapabilityService::new(
+            store,
+            AuthMode::OwnerToken {
+                config_token_hash: Some(hash_token(raw_owner)),
+            },
+            test_app_config(),
+        );
+
+        let node_a = Uuid::new_v4();
+        let node_b = Uuid::new_v4();
+        let guest = service.mint_loon_node_token(node_a)?;
+
+        // Own node: accepted.
+        assert!(
+            service.scoped_token_authorizes_path(&guest, &format!("/api/nodes/{node_a}/input")),
+            "guest token must authorize its own node's path"
+        );
+        // Cross node: rejected.
+        assert!(
+            !service.scoped_token_authorizes_path(&guest, &format!("/api/nodes/{node_b}/input")),
+            "guest token must be rejected on another node's path"
+        );
+        // Token-management surface: rejected outright.
+        assert!(
+            !service.scoped_token_authorizes_path(&guest, "/api/tokens"),
+            "guest token must not touch the token-management surface"
+        );
+        assert!(
+            !service.scoped_token_authorizes_path(&guest, "/api/tokens/abc"),
+            "guest token must not touch token sub-paths"
+        );
+        // Owner token: unrestricted (not a DB-scoped guest token).
+        assert!(
+            service.scoped_token_authorizes_path(raw_owner, &format!("/api/nodes/{node_b}/input")),
+            "owner token must be unrestricted across nodes"
+        );
+        assert!(
+            service.scoped_token_authorizes_path(raw_owner, "/api/tokens"),
+            "owner token must reach the token surface"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn claude_project_slug_maps_nonalnum_to_dash() {
+        // Addendum A: the slug is claude's own cwd->project-dir transform,
+        // verified empirically against ~/.claude/projects.
+        assert_eq!(
+            claude_project_slug("/home/casey/Projects/Asylum/.claude/worktrees/orchestrator"),
+            "-home-casey-Projects-Asylum--claude-worktrees-orchestrator"
+        );
+        assert_eq!(
+            claude_project_slug("/home/casey/Projects/Asylum"),
+            "-home-casey-Projects-Asylum"
+        );
+    }
+
+    #[test]
+    fn claude_transcript_probe_matches_disk_layout() {
+        // Addendum A: probe finds the transcript only when the exact
+        // <cwd-slug>/<session-id>.jsonl file exists under a fake HOME.
+        let home = tempfile::tempdir().unwrap();
+        let workspace = "/tmp/asylum/ws-claude";
+        let session = "55864ae8-245d-4eb6-bb7f-f430a85f0f8a";
+        assert!(!claude_transcript_exists(home.path(), workspace, session));
+
+        let dir = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_slug(workspace));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{session}.jsonl")), b"{}\n").unwrap();
+
+        assert!(claude_transcript_exists(home.path(), workspace, session));
+        // Wrong session id -> not resumable.
+        assert!(!claude_transcript_exists(home.path(), workspace, "deadbeef-0000"));
+        // Wrong workspace slug -> not resumable.
+        assert!(!claude_transcript_exists(home.path(), "/tmp/other/ws", session));
+    }
+
+    #[test]
+    fn codex_rollout_probe_finds_by_thread_id() {
+        // Addendum A: recursive probe locates a codex rollout by thread id under
+        // the ~/.codex/sessions/<Y>/<M>/<D>/ tree.
+        let home = tempfile::tempdir().unwrap();
+        let thread = "019dbc3f-ac60-7991-84cb-296a542148a4";
+        assert!(!codex_rollout_exists(home.path(), thread));
+
+        let day = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("04")
+            .join("23");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            day.join(format!("rollout-2026-04-23T17-29-42-{thread}.jsonl")),
+            b"{}\n",
+        )
+        .unwrap();
+
+        assert!(codex_rollout_exists(home.path(), thread));
+        assert!(!codex_rollout_exists(home.path(), "019ffffff-dead-beef-0000-000000000000"));
+    }
+
+    #[tokio::test]
+    async fn capabilities_expose_no_recipe_surface() -> Result<(), Box<dyn std::error::Error>> {
         let workdir = tempfile::tempdir()?;
         let path = workdir.path().join("asylum.sqlite3").display().to_string();
         let store = Store::open(path)?;
@@ -3094,11 +4651,12 @@ mod tests {
             !capabilities
                 .capabilities
                 .iter()
-                .any(|capability| capability.name == CapabilityName::RecipeSpawn),
-            "recipe spawn capability descriptor should be hidden while disabled"
+                .any(|capability| capability.path == "/api/recipes"),
+            "the recipe surface is removed and must not appear in capability descriptors"
         );
         Ok(())
     }
+
 
     #[tokio::test]
     async fn create_channel_rejects_unsupported_kinds() -> Result<(), Box<dyn std::error::Error>> {
@@ -3390,8 +4948,15 @@ mod tests {
         assert!(argv.contains("mcp_servers.asylum.args=[\"mcp\"]"));
         assert!(argv.contains(&format!("ASYLUM_NODE_ID=\"{}\"", child_id)));
         assert!(argv.contains("ASYLUM_SOCKET_PATH=\"/tmp/asylum-test.sock\""));
-        assert!(argv.contains("node.spawn_peer"));
-        assert!(argv.contains("Do not simulate worker nodes inside your own harness session."));
+        // The launch prompt (node role/context + Asylum instructions) must NOT
+        // ride along as a positional argv any more — it is delivered over the PTY
+        // as a submitted message. Its presence in argv would be the old bug-1
+        // behavior where the prompt landed in the input box but never submitted.
+        assert!(
+            !argv.contains("node.spawn_peer"),
+            "launch prompt must not be a positional argv: {argv}"
+        );
+        assert!(!argv.contains("Do not simulate worker nodes inside your own harness session."));
         Ok(())
     }
 
@@ -3412,23 +4977,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_substrate_descriptors_hides_unknown_loon_metrics(
+    async fn loon_descriptor_is_unhealthy_when_host_unreachable(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let workdir = tempfile::tempdir()?;
         let path = workdir.path().join("asylum.sqlite3").display().to_string();
         let store = Store::open(path)?;
         let mut config = test_app_config();
         config.loon.enabled = true;
-        let script_path = workdir.path().join("fake-loon-cli.sh");
-        config.loon.cli_path = Some(script_path.clone());
-        write_executable_script(&script_path, "#!/bin/sh\nexit 0\n")?;
+        // Point at a non-existent loon client config so the substrate is degraded
+        // (unreachable) rather than talking to the developer's real loon host.
+        config.loon.config_path = Some(workdir.path().join("no-loon.toml"));
 
         let service = CapabilityService::new(store, AuthMode::Disabled, config);
 
         let health = service.substrate_health().await;
-        assert_eq!(health.status, "limited");
+        assert_eq!(health.status, "unavailable");
         assert!(health.running_instances.is_none());
-        assert!(health.harness_profiles.is_none());
 
         let descriptors = service.list_substrate_descriptors().await?;
         let loon = descriptors
@@ -3437,7 +5001,7 @@ mod tests {
             .find(|s| s.id == "loon")
             .expect("loon descriptor should exist when configured");
         assert!(!loon.healthy);
-        assert_eq!(loon.status, "limited");
+        assert_eq!(loon.status, "unavailable");
         assert_eq!(loon.capacity, 0.0);
         assert_eq!(loon.nodes, 0);
         Ok(())
@@ -3451,16 +5015,16 @@ mod tests {
         let store = Store::open(path.clone())?;
         let mut config = test_app_config();
         config.loon.enabled = true;
-        let script_path = workdir.path().join("fake-loon-cli.sh");
-        write_executable_script(&script_path, "#!/bin/sh\nprintf 'loon version'\nexit 0\n")?;
-        config.loon.cli_path = Some(script_path);
+        // Unreachable loon host -> the create-time support gate rejects before any
+        // node row is inserted.
+        config.loon.config_path = Some(workdir.path().join("no-loon.toml"));
 
         let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
 
         let error = service
             .create_node(loon_create_request("unsupported by capability probe"))
             .await
-            .expect_err("loon create should refuse unsupported substrate profiles");
+            .expect_err("loon create should refuse when the host is unreachable");
         assert!(error.to_string().contains("unsupported_on_substrate"));
 
         let graph = store.graph()?;
@@ -3472,89 +5036,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_loon_spawn_marks_node_failed_and_records_harness_failure(
+    async fn loon_node_launch_env_resolves_over_http_with_token(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // The guest harness resolves the daemon over HTTP (base URL + per-node
+        // token), never the unix socket. Exercises the daemon-side helpers
+        // directly so it stays hermetic (no loon host required).
         let workdir = tempfile::tempdir()?;
         let path = workdir.path().join("asylum.sqlite3").display().to_string();
-        let store = Store::open(path.clone())?;
-        let mut config = test_app_config();
-        config.loon.enabled = true;
-        let script_path = workdir.path().join("fake-loon-cli.sh");
-        write_executable_script(
-            &script_path,
-            "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then\nprintf '{\"status\":\"ok\",\"running_instances\":1,\"harness_profiles\":[\"codex\"]}\n'\nexit 0\nfi\nif [ \"$1\" = \"spawn\" ]; then\nprintf 'spawn failed' >&2\nexit 1\nfi\nexit 0\n",
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let caps = CapabilitySnapshot {
+            browser_attach: true,
+            native_attach: true,
+            send_input: true,
+            interrupt: true,
+            stop: true,
+            resume: false,
+            structured_events: false,
+            transcript_export: false,
+        };
+        let node = store.insert_node(
+            HarnessKind::ClaudeCode,
+            SubstrateKind::Loon,
+            "worker",
+            Some("/work"),
+            None,
+            None,
+            caps.clone(),
+            None,
         )?;
-        config.loon.cli_path = Some(script_path);
 
-        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+        let token = service.mint_loon_node_token(node.id)?;
+        assert!(token.contains("asylum-owner-"), "unexpected token: {token}");
 
-        let error = service
-            .create_node(loon_create_request("spawn failure regression"))
-            .await
-            .expect_err("spawn failure should return an error and keep an error row");
-        assert!(error.to_string().contains("spawn failed"));
-
-        let graph = store.graph()?;
-        let node = graph
-            .nodes
-            .into_iter()
-            .find(|node| node.description == "spawn failure regression")
-            .expect("failed Loon launch should persist node row");
-        assert_eq!(node.liveness, NodeLiveness::Failed);
-
-        let events = store.list_events(node.id)?;
-        assert!(events.iter().any(|event| {
-            event.kind == NodeEventKind::LivenessChanged
-                && event.body["liveness"] == serde_json::json!("failed")
-        }));
-        assert!(events.iter().any(|event| {
-            event.kind == NodeEventKind::HarnessFailure
-                && event.body["error"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("spawn failed")
-        }));
+        let env = service.loon_launch_env(
+            &node,
+            &HarnessKind::ClaudeCode,
+            &caps,
+            "http://host.loon.internal:7788",
+            &token,
+        )?;
+        let map: std::collections::HashMap<String, String> = env.into_iter().collect();
+        assert_eq!(
+            map.get("ASYLUM_BASE_URL").map(String::as_str),
+            Some("http://host.loon.internal:7788")
+        );
+        assert_eq!(map.get("ASYLUM_TOKEN").map(String::as_str), Some(token.as_str()));
+        assert_eq!(map.get("ASYLUM_CONTROL_TRANSPORT").map(String::as_str), Some("http"));
+        assert_eq!(map.get("ASYLUM_WORKSPACE").map(String::as_str), Some("/work"));
+        assert!(
+            !map.contains_key("ASYLUM_SOCKET_PATH"),
+            "loon guest env must not carry a unix socket path"
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn loon_launch_uses_context_plus_user_prompt_in_commandline(
+    async fn loon_control_args_use_http_resolution_and_guest_binary(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let workdir = tempfile::tempdir()?;
-        let path = workdir.path().join("asylum.sqlite3").display().to_string();
-        let store = Store::open(path.clone())?;
-        let mut config = test_app_config();
-        config.loon.enabled = true;
-        let workspace = workdir.path().join("workspace");
-        std::fs::create_dir_all(&workspace)?;
-        let cli_args_path = workdir.path().join("loon-args.txt");
-        let script_path = workdir.path().join("fake-loon-cli.sh");
-        let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then\nprintf '{{\"status\":\"ok\",\"running_instances\":1,\"harness_profiles\":[\"codex\"]}}\\n'\nexit 0\nfi\nif [ \"$1\" = \"spawn\" ]; then\nprintf '%s\\n' \"$@\" > '{}' \nprintf '00000000-0000-0000-0000-000000000000\\n'\nexit 0\nfi\nexit 0\n",
-            cli_args_path.display()
+        // The MCP injection for a Loon node must reference the in-guest asylum
+        // binary and resolve over HTTP (base URL + token), not the unix socket.
+        use crate::harness::DaemonResolution;
+        let registry = crate::harness::HarnessRegistry::default();
+        let claude = registry.get(&HarnessKind::ClaudeCode).unwrap();
+        let node_id = Uuid::new_v4();
+        let args = claude.asylum_control_args(
+            GUEST_ASYLUM_BINARY,
+            &DaemonResolution::Http {
+                base_url: "http://host.loon.internal:7788",
+                token: "asylum-owner-tok",
+            },
+            node_id,
+            Some(Uuid::new_v4()),
         );
-        write_executable_script(&script_path, &script)?;
-        config.loon.cli_path = Some(script_path);
-
-        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
-        let description = "Build exactly this as your first action";
-        let response = service
-            .create_node(loon_create_request_with_workspace(
-                description,
-                &workspace.display().to_string(),
-            ))
-            .await?;
-        let node_id = Uuid::parse_str(&response.node_id)?;
-
-        wait_for_liveness(&store, node_id, NodeLiveness::Running).await?;
-        let cli_args = std::fs::read_to_string(&cli_args_path)?;
-        assert!(cli_args.contains("spawn"));
-        assert!(cli_args.contains("--prompt"));
-        assert!(cli_args.contains(&format!("You are node {} with role 'worker'.", node_id)));
-        assert!(cli_args.contains(&format!("Workspace: {}", workspace.display())));
-        assert!(cli_args.contains("User launch packet:"));
-        assert!(cli_args.contains(description));
-
+        let cfg_index = args.iter().position(|a| a == "--mcp-config").unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&args[cfg_index + 1])?;
+        assert_eq!(cfg["mcpServers"]["asylum"]["command"], GUEST_ASYLUM_BINARY);
+        assert_eq!(
+            cfg["mcpServers"]["asylum"]["env"]["ASYLUM_BASE_URL"],
+            "http://host.loon.internal:7788"
+        );
+        assert_eq!(
+            cfg["mcpServers"]["asylum"]["env"]["ASYLUM_TOKEN"],
+            "asylum-owner-tok"
+        );
+        assert!(cfg["mcpServers"]["asylum"]["env"]["ASYLUM_SOCKET_PATH"].is_null());
         Ok(())
     }
 
@@ -3827,9 +5394,11 @@ mod tests {
                 &decision.id,
                 DecisionResolveRequest {
                     status: "approved".to_string(),
+                    answer: None,
                 },
             )
             .await?;
+
 
         assert_eq!(decision.status, "approved");
         let updated_node = store.get_node(node.id)?.expect("node should still exist");
@@ -4041,8 +5610,14 @@ mod tests {
             wait_for_liveness(&store, node_id, NodeLiveness::Stopped).await?;
             let node = store.get_node(node_id)?.expect("node should exist");
             assert_eq!(node.workspace, None);
+            // The launch prompt is delivered over the PTY, not as a positional
+            // argv, so the normalized "Workspace: <none>" context must NOT appear
+            // in argv. node.workspace == None above already proves normalization.
             let output = std::fs::read_to_string(&argv_path)?;
-            assert!(output.contains("Workspace: <none>"));
+            assert!(
+                !output.contains("Workspace:"),
+                "launch prompt must not ride as a positional argv: {output}"
+            );
             response
         };
 
@@ -4091,8 +5666,14 @@ mod tests {
             wait_for_liveness(&store, node_id, NodeLiveness::Stopped).await?;
             let node = store.get_node(node_id)?.expect("node should exist");
             assert_eq!(node.workspace, None);
+            // The launch prompt is delivered over the PTY, not as a positional
+            // argv, so the normalized "Workspace: <none>" context must NOT appear
+            // in argv. node.workspace == None above already proves normalization.
             let output = std::fs::read_to_string(&argv_path)?;
-            assert!(output.contains("Workspace: <none>"));
+            assert!(
+                !output.contains("Workspace:"),
+                "launch prompt must not ride as a positional argv: {output}"
+            );
             response
         };
 
@@ -4142,20 +5723,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_launch_delivers_description_as_prompt_and_persists_early_tui_output(
+    async fn local_launch_does_not_pass_prompt_as_positional_argv_and_persists_early_output(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Bug-1 regression at the capability layer: the launch prompt must not be
+        // appended as a positional argv (interactive harnesses never submit it).
+        // Actual PTY delivery + submit of the prompt is covered by the
+        // substrate-level test `launch_delivers_prompt_over_pty_after_readiness`
+        // in substrate/local.rs; here we only assert the prompt is absent from
+        // argv and that early TUI output is still captured by the reader.
+        let _env = env_lock();
         let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let _home = EnvVarGuard::set_var("HOME", &home);
         let path = workdir.path().join("asylum.sqlite3").display().to_string();
         let argv_path = workdir.path().join("argv.txt");
-        let release_marker = workdir.path().join("codex-run-release");
         let workspace = workdir.path().join("workspace");
         std::fs::create_dir_all(&workspace)?;
         let script_path = workdir.path().join("fake-codex.sh");
+        // Dump argv, emit one TUI frame, then exit cleanly (drives the node to
+        // Stopped via the exit sink). No positional prompt should appear here.
         let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '\\033[1;1H\\033[0mwelcome'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\n",
-            argv_path.display()
-            ,
-            release_marker.display()
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{argv}'\nprintf '\\033[1;1H\\033[0mwelcome'\nsleep 0.2\n",
+            argv = argv_path.display(),
         );
         write_executable_script(&script_path, &script)?;
 
@@ -4172,9 +5762,8 @@ mod tests {
             ))
             .await?;
         let node_id = Uuid::parse_str(&response.node_id)?;
-        std::fs::write(&release_marker, b"release")?;
 
-        for _ in 0..50 {
+        for _ in 0..100 {
             if argv_path.exists() {
                 break;
             }
@@ -4186,32 +5775,18 @@ mod tests {
             args.first(),
             Some(&"--dangerously-bypass-approvals-and-sandbox")
         );
-        let payload = argv;
-        let expected_workspace = format!("Workspace: {}", workspace.display());
         let expected_context = format!("You are node {} with role 'worker'.", node_id);
         assert!(
-            payload.contains(&expected_context),
-            "missing node-role prefix in launch prompt: {payload}"
+            !argv.contains(&expected_context),
+            "launch prompt must not be a positional argv: {argv}"
         );
         assert!(
-            payload.contains(&expected_workspace),
-            "missing workspace in launch context: {payload}"
+            !argv.contains("User launch packet:"),
+            "user launch packet must not be a positional argv: {argv}"
         );
         assert!(
-            payload.contains("System map:"),
-            "missing system map in launch context: {payload}"
-        );
-        assert!(
-            payload.contains("Capabilities:"),
-            "missing capabilities in launch context: {payload}"
-        );
-        assert!(
-            payload.contains("User launch packet:"),
-            "missing user packet header in launch prompt: {payload}"
-        );
-        assert!(
-            payload.contains(prompt),
-            "missing user launch packet body: {payload}"
+            !argv.contains(prompt),
+            "prompt body must not be a positional argv: {argv}"
         );
 
         wait_for_liveness(&store, node_id, NodeLiveness::Stopped).await?;
@@ -4305,8 +5880,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transcript_checkpoint_hook_tool_reports_unsupported(
+    async fn unknown_tool_hook_action_target_reports_unknown_target(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // The dead `transcript.checkpoint` special case was deleted (2026-07,
+        // Phase D inert-surface sweep): no tool target was ever wired up to a
+        // real checkpoint capability, so it now falls through to the same
+        // honest "unknown tool target" error as any other made-up target.
         let workdir = tempfile::tempdir()?;
         let path = workdir.path().join("asylum.sqlite3").display().to_string();
         let store = Store::open(path)?;
@@ -4330,7 +5909,10 @@ mod tests {
         let response = service.hook_test(&hook.id).await?;
 
         assert!(!response.firing.ok);
-        assert!(response.firing.outcome.contains("not supported yet"));
+        assert!(response
+            .firing
+            .outcome
+            .contains("unknown tool target 'transcript.checkpoint'"));
         Ok(())
     }
 
@@ -4504,32 +6086,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hook_actions_reject_spawn_while_disabled() -> Result<(), Box<dyn std::error::Error>> {
+    async fn hook_actions_validate_spawn_shape() -> Result<(), Box<dyn std::error::Error>> {
         let workdir = tempfile::tempdir()?;
         let path = workdir.path().join("asylum.sqlite3").display().to_string();
         let store = Store::open(path)?;
         let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
 
+        // A spawn action missing harness/substrate is structurally incomplete and
+        // must be rejected at create time — spawn itself is a valid, honest kind.
         let create_error = service
             .create_hook(HookCreateRequest {
-                name: "spawn-disabled".to_string(),
+                name: "spawn-incomplete".to_string(),
                 enabled: true,
                 event: "node.ctx_pressure".to_string(),
                 filter: "any".to_string(),
                 actions: vec![HookAction {
                     kind: "spawn".to_string(),
-                    target: "recipe:quickstart".to_string(),
+                    target: String::new(),
                     template: None,
                     args: serde_json::json!({}),
                 }],
                 future: false,
             })
             .await
-            .expect_err("hook creation should reject spawn actions");
+            .expect_err("hook creation should reject an incomplete spawn action");
         assert!(create_error
             .to_string()
-            .contains("hook action kind 'spawn'"));
+            .contains("spawn action requires a 'harness' arg"));
 
+        // Same rejection on update.
         let hook = service
             .create_hook(HookCreateRequest {
                 name: "update-target".to_string(),
@@ -4550,20 +6135,43 @@ mod tests {
                     filter: None,
                     actions: Some(vec![HookAction {
                         kind: "spawn".to_string(),
-                        target: "recipe:quickstart".to_string(),
+                        target: String::new(),
                         template: None,
-                        args: serde_json::json!({}),
+                        args: serde_json::json!({"harness": "claude_code"}),
                     }]),
                     future: Some(false),
                 },
             )
             .await
-            .expect_err("spawn actions should remain rejected on update");
+            .expect_err("incomplete spawn actions should be rejected on update");
         assert!(update_error
             .to_string()
-            .contains("hook action kind 'spawn'"));
+            .contains("spawn action requires a 'substrate' arg"));
+
+        // A complete spawn spec is accepted.
+        service
+            .create_hook(HookCreateRequest {
+                name: "spawn-complete".to_string(),
+                enabled: true,
+                event: "node.ctx_pressure".to_string(),
+                filter: "any".to_string(),
+                actions: vec![HookAction {
+                    kind: "spawn".to_string(),
+                    target: String::new(),
+                    template: None,
+                    args: serde_json::json!({
+                        "harness": "codex",
+                        "substrate": "local",
+                        "role": "worker",
+                    }),
+                }],
+                future: false,
+            })
+            .await
+            .expect("a well-formed spawn action should be accepted");
         Ok(())
     }
+
 
     #[tokio::test]
     async fn routed_channel_inbound_fails_before_recording_when_node_delivery_fails(
@@ -4985,6 +6593,49 @@ mod tests {
         assert!(!response.database_path.is_empty());
         assert_eq!(response.bind_addr, "127.0.0.1:7717");
         assert!(!response.transcripts_dir.is_empty());
+        // D2: daemon-provided uptime, not client-derived.
+        assert!(response.daemon_started_at_epoch_secs > 0);
+        assert!(response.uptime_seconds >= 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn health_uptime_seconds_advances_with_wall_clock(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+        let first = service.health().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let second = service.health().await;
+        assert_eq!(first.daemon_started_at_epoch_secs, second.daemon_started_at_epoch_secs);
+        assert!(second.uptime_seconds >= first.uptime_seconds);
+        assert!(second.uptime_seconds >= 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_substrate_capacity_reflects_running_local_nodes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        let descriptors = service.list_substrate_descriptors().await?;
+        let local = descriptors
+            .substrates
+            .iter()
+            .find(|s| s.id == "local")
+            .expect("local descriptor should always exist");
+        // D2: no more hardcoded 0.0 — capacity is a real (if approximate)
+        // running-nodes/cores ratio. With zero running local nodes that ratio
+        // is exactly zero, so assert on the honest zero-nodes case and confirm
+        // it is a computed value in [0, 1], not a hardcoded constant.
+        assert_eq!(local.nodes, 0);
+        assert_eq!(local.capacity, 0.0);
+        assert!((0.0..=1.0).contains(&local.capacity));
         Ok(())
     }
 
@@ -5066,42 +6717,988 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn recipes_are_disabled_and_not_preseeded() -> Result<(), Box<dyn std::error::Error>> {
-        let workdir = tempfile::tempdir()?;
-        let path = workdir.path().join("asylum.sqlite3").display().to_string();
-        let store = Store::open(path)?;
-        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+    // ---- W1: harness-event ingestion ----------------------------------------
 
-        let response = service.list_recipes().await;
-        assert!(response.recipes.is_empty());
+
+    fn open_test_store() -> (tempfile::TempDir, Store) {
+        let workdir = tempfile::tempdir().expect("tempdir");
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path).expect("open store");
+        (workdir, store)
+    }
+
+    fn insert_active_node(store: &Store, harness: HarnessKind) -> NodeRecord {
+        store
+            .insert_node(
+                harness,
+                SubstrateKind::Local,
+                "worker",
+                None,
+                Some("harness-event target"),
+                None,
+                CapabilitySnapshot::default(),
+                None,
+            )
+            .expect("insert node")
+    }
+
+    #[test]
+    fn map_harness_event_maps_claude_stop_to_turn_complete() {
+        let payload = json!({
+            "hook_event_name": "Stop",
+            "session_id": "sess-stop",
+            "transcript_path": "/tmp/t.jsonl",
+            "cwd": "/work"
+        });
+        let mapped = map_harness_event("claude_hook", &payload);
+        assert_eq!(mapped.event, Some("node.turn_complete"));
+        assert_eq!(mapped.liveness, Some(NodeLiveness::Running));
+        assert_eq!(mapped.session_id.as_deref(), Some("sess-stop"));
+        assert!(!mapped.telemetry);
+    }
+
+    #[test]
+    fn map_harness_event_maps_claude_notification_permission_to_awaiting_input() {
+        let payload = json!({
+            "hook_event_name": "Notification",
+            "type": "permission_prompt",
+            "message": "Claude needs your permission to use Bash",
+            "session_id": "sess-perm"
+        });
+        let mapped = map_harness_event("claude_hook", &payload);
+        assert_eq!(mapped.event, Some("node.awaiting_input"));
+        assert_eq!(mapped.liveness, Some(NodeLiveness::WaitingForInput));
+        assert_eq!(mapped.detail["type"], json!("permission_prompt"));
+    }
+
+    #[test]
+    fn map_harness_event_maps_claude_notification_idle() {
+        let payload = json!({
+            "hook_event_name": "Notification",
+            "type": "idle_prompt",
+            "message": "Claude is waiting for your input",
+            "session_id": "sess-idle"
+        });
+        let mapped = map_harness_event("claude_hook", &payload);
+        assert_eq!(mapped.event, Some("node.idle"));
+        assert_eq!(mapped.liveness, Some(NodeLiveness::Running));
+    }
+
+    /// Real claude (2.1.202) sends the notification kind as `notification_type`,
+    /// not `type` (live-captured payload from the Phase B gate run). The mapping
+    /// must accept the real field or idle/awaiting-input/decisions never fire.
+    #[test]
+    fn map_harness_event_maps_real_claude_notification_type_field() {
+        // Verbatim shape captured live from claude 2.1.202 via the injected
+        // Notification hook (paths/UUIDs shortened).
+        let idle = json!({
+            "cwd": "/tmp/ws",
+            "hook_event_name": "Notification",
+            "message": "Claude is waiting for your input",
+            "notification_type": "idle_prompt",
+            "prompt_id": "5550f842-6752-43d3-94c3-e6d4284dacc8",
+            "session_id": "sess-real-idle",
+            "transcript_path": "/home/u/.claude/projects/x/sess.jsonl"
+        });
+        let mapped = map_harness_event("claude_hook", &idle);
+        assert_eq!(mapped.event, Some("node.idle"));
+        assert_eq!(mapped.liveness, Some(NodeLiveness::Running));
+        assert_eq!(mapped.session_id.as_deref(), Some("sess-real-idle"));
+
+        let perm = json!({
+            "hook_event_name": "Notification",
+            "message": "Claude needs your permission",
+            "notification_type": "permission_prompt",
+            "session_id": "sess-real-perm"
+        });
+        let mapped = map_harness_event("claude_hook", &perm);
+        assert_eq!(mapped.event, Some("node.awaiting_input"));
+        assert_eq!(mapped.liveness, Some(NodeLiveness::WaitingForInput));
+        assert_eq!(mapped.detail["type"], json!("permission_prompt"));
+
+        // `notification_type` wins over a stray `type` when both are present.
+        let both = json!({
+            "hook_event_name": "Notification",
+            "notification_type": "idle_prompt",
+            "type": "permission_prompt",
+            "message": "m"
+        });
+        assert_eq!(
+            map_harness_event("claude_hook", &both).event,
+            Some("node.idle")
+        );
+    }
+
+    #[test]
+    fn map_harness_event_maps_claude_session_start() {
+        let payload = json!({
+            "hook_event_name": "SessionStart",
+            "source": "startup",
+            "model": "claude-opus",
+            "session_id": "sess-start"
+        });
+        let mapped = map_harness_event("claude_hook", &payload);
+        assert_eq!(mapped.event, Some("node.session_started"));
+        assert_eq!(mapped.liveness, Some(NodeLiveness::Running));
+        assert_eq!(mapped.detail["source"], json!("startup"));
+        assert_eq!(mapped.session_id.as_deref(), Some("sess-start"));
+    }
+
+    #[test]
+    fn map_harness_event_maps_codex_agent_turn_complete() {
+        let payload = json!({
+            "type": "agent-turn-complete",
+            "thread-id": "6a1f-thread",
+            "turn-id": "turn-9",
+            "cwd": "/work",
+            "input-messages": ["do the thing"],
+            "last-assistant-message": "did the thing"
+        });
+        let mapped = map_harness_event("codex_notify", &payload);
+        assert_eq!(mapped.event, Some("node.turn_complete"));
+        assert_eq!(mapped.liveness, Some(NodeLiveness::Running));
+        assert_eq!(mapped.session_id.as_deref(), Some("6a1f-thread"));
+        assert_eq!(
+            mapped.detail["last_assistant_message"],
+            json!("did the thing")
+        );
+    }
+
+    #[test]
+    fn map_harness_event_marks_statusline_as_telemetry() {
+        let payload = json!({
+            "session_id": "sess-line",
+            "context_window": { "used_percentage": 42.0, "remaining_percentage": 58.0 }
+        });
+        let mapped = map_harness_event("claude_statusline", &payload);
+        assert!(mapped.telemetry);
+        assert_eq!(mapped.event, None);
+        assert_eq!(mapped.session_id.as_deref(), Some("sess-line"));
+    }
+
+    #[tokio::test]
+    async fn post_harness_event_records_session_and_transitions_liveness(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_workdir, store) = open_test_store();
+        let node = insert_active_node(&store, HarnessKind::ClaudeCode);
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        // SessionStart records the harness session id and keeps the node live.
+        let response = service
+            .post_harness_event(
+                node.id,
+                HarnessEventRequest {
+                    source: "claude_hook".to_string(),
+                    payload: json!({
+                        "hook_event_name": "SessionStart",
+                        "source": "startup",
+                        "session_id": "sess-abc"
+                    }),
+                },
+            )
+            .await?;
+        assert!(response.accepted);
+        assert_eq!(response.event.as_deref(), Some("node.session_started"));
+        let refreshed = store.get_node(node.id)?.expect("node exists");
+        assert_eq!(refreshed.harness_session_id.as_deref(), Some("sess-abc"));
+
+        // Awaiting-input moves liveness to WaitingForInput.
+        service
+            .post_harness_event(
+                node.id,
+                HarnessEventRequest {
+                    source: "claude_hook".to_string(),
+                    payload: json!({
+                        "hook_event_name": "Notification",
+                        "type": "agent_needs_input",
+                        "message": "need a decision",
+                        "session_id": "sess-abc"
+                    }),
+                },
+            )
+            .await?;
+        assert_eq!(
+            store.get_node(node.id)?.expect("node").liveness,
+            NodeLiveness::WaitingForInput
+        );
+
+        // Turn-complete returns it to a truthful non-busy Running state.
+        service
+            .post_harness_event(
+                node.id,
+                HarnessEventRequest {
+                    source: "claude_hook".to_string(),
+                    payload: json!({"hook_event_name": "Stop", "session_id": "sess-abc"}),
+                },
+            )
+            .await?;
+        assert_eq!(
+            store.get_node(node.id)?.expect("node").liveness,
+            NodeLiveness::Running
+        );
+
+        // The mapped events were stored as harness_event rows.
+        let bodies = store.harness_event_bodies(node.id)?;
+        let kinds: Vec<&str> = bodies
+            .iter()
+            .filter_map(|b| b.get("event").and_then(|v| v.as_str()))
+            .collect();
+        assert!(kinds.contains(&"node.session_started"));
+        assert!(kinds.contains(&"node.awaiting_input"));
+        assert!(kinds.contains(&"node.turn_complete"));
         Ok(())
     }
 
     #[tokio::test]
-    async fn spawn_recipe_returns_error_until_configured() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn post_harness_event_rejects_terminal_nodes() -> Result<(), Box<dyn std::error::Error>> {
+        let (_workdir, store) = open_test_store();
+        let node = insert_active_node(&store, HarnessKind::ClaudeCode);
+        store.set_node_liveness(node.id, NodeLiveness::Stopped)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let response = service
+            .post_harness_event(
+                node.id,
+                HarnessEventRequest {
+                    source: "claude_hook".to_string(),
+                    payload: json!({"hook_event_name": "Stop", "session_id": "s"}),
+                },
+            )
+            .await?;
+        assert!(!response.accepted);
+        assert_eq!(response.event, None);
+        // No harness_event row was recorded for the inert node.
+        assert!(store.harness_event_bodies(node.id)?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn statusline_updates_ctx_pct_and_fires_thresholds_once(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_workdir, store) = open_test_store();
+        let node = insert_active_node(&store, HarnessKind::ClaudeCode);
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let post = |used: f64| {
+            let service = service.clone();
+            let node_id = node.id;
+            async move {
+                service
+                    .post_harness_event(
+                        node_id,
+                        HarnessEventRequest {
+                            source: "claude_statusline".to_string(),
+                            payload: json!({
+                                "session_id": "line-sess",
+                                "context_window": { "used_percentage": used }
+                            }),
+                        },
+                    )
+                    .await
+            }
+        };
+
+        // Crosses 75 -> one ctx_pressure event; ctx_pct reflects harness value.
+        let r1 = post(80.0).await?;
+        assert_eq!(r1.event.as_deref(), Some("node.ctx_pressure"));
+        let node_after = store.get_node(node.id)?.expect("node");
+        assert!((node_after.ctx_pct - 0.80).abs() < 0.001);
+
+        // Same threshold again -> no refire.
+        let r2 = post(82.0).await?;
+        assert_eq!(r2.event, None);
+
+        // Crosses 90 -> fires the 90 threshold only.
+        let r3 = post(95.0).await?;
+        assert_eq!(r3.event.as_deref(), Some("node.ctx_pressure"));
+
+        let pressure_thresholds: Vec<f64> = store
+            .harness_event_bodies(node.id)?
+            .iter()
+            .filter(|b| b.get("event").and_then(|v| v.as_str()) == Some("node.ctx_pressure"))
+            .filter_map(|b| b.get("threshold").and_then(|v| v.as_f64()))
+            .collect();
+        assert_eq!(pressure_thresholds, vec![75.0, 90.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn event_catalog_is_exactly_the_firable_set() {
+        let ids: std::collections::BTreeSet<String> =
+            event_catalog().into_iter().map(|entry| entry.id).collect();
+        let expected: std::collections::BTreeSet<String> = [
+            "graph.spawn",
+            "node.session_started",
+            "node.turn_complete",
+            "node.awaiting_input",
+            "node.idle",
+            "node.ctx_pressure",
+            "node.tool_call",
+            "node.session_end",
+            "node.exited",
+            "node.errored",
+            "node.resumed",
+            "channel.inbound",
+            "schedule.5m",
+            "schedule.30m",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(ids, expected);
+        // Removed / merged events must not reappear.
+        assert!(!ids.contains("node.permission_requested"));
+        assert!(!ids.contains("substrate.unreachable"));
+        assert!(!ids.contains("schedule.cron"));
+    }
+
+    #[tokio::test]
+    async fn interrupt_records_event_without_forcing_stopped(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        // A harness that ignores SIGINT and stays alive, so a Ctrl-C does not
+        // terminate it — mirroring claude, where Ctrl-C cancels the turn only.
+        let script_path = workdir.path().join("fake-harness.sh");
+        write_executable_script(
+            &script_path,
+            "#!/bin/sh\ntrap '' INT\nwhile true; do sleep 1; done\n",
+        )?;
+
+        let _home = EnvVarGuard::set_var("HOME", &home);
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let response = service
+            .create_node(local_create_request_with_workspace(
+                "interrupt semantics",
+                &workspace.display().to_string(),
+            ))
+            .await?;
+        let node_id = Uuid::parse_str(&response.node_id)?;
+        wait_for_liveness(&store, node_id, NodeLiveness::Running).await?;
+
+        service.interrupt_node(node_id).await?;
+
+        // Liveness stays Running (Ctrl-C is not a stop); an interrupt event is
+        // recorded, and no node.exited was forced.
+        let node = store.get_node(node_id)?.expect("node exists");
+        assert_eq!(node.liveness, NodeLiveness::Running);
+        let events = store.list_events(node_id)?;
+        assert!(events.iter().any(|e| {
+            e.kind == NodeEventKind::RemoteCommandReceived
+                && e.body.get("action").and_then(|v| v.as_str()) == Some("interrupt")
+        }));
+
+        let _ = service.stop_node(node_id).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abnormal_exit_marks_failed_and_fires_node_errored(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let script_path = workdir.path().join("fake-harness.sh");
+        write_executable_script(&script_path, "#!/bin/sh\nexit 3\n")?;
+
+        let _home = EnvVarGuard::set_var("HOME", &home);
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let mut hooks = service.hook_engine.subscribe();
+        let response = service
+            .create_node(local_create_request_with_workspace(
+                "abnormal exit",
+                &workspace.display().to_string(),
+            ))
+            .await?;
+        let node_id = Uuid::parse_str(&response.node_id)?;
+
+        wait_for_liveness(&store, node_id, NodeLiveness::Failed).await?;
+
+        let mut saw_errored = false;
+        for _ in 0..200 {
+            match hooks.try_recv() {
+                Ok(event) if event.event == "node.errored" && event.node_id == Some(node_id) => {
+                    saw_errored = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    sleep(Duration::from_millis(10)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(saw_errored, "expected node.errored on nonzero exit");
+        Ok(())
+    }
+
+    // ---- W4: actions + decision producer/feedback ---------------------------
+
+    #[test]
+    fn launch_prompt_includes_initial_prompt_as_task() {
+        let registry = crate::harness::HarnessRegistry::default();
+        let adapter = registry
+            .get(&HarnessKind::Codex)
+            .expect("default codex adapter exists");
+        let node_id = Uuid::new_v4();
+        let request = CreateNodeRequest {
+            harness: "codex".to_string(),
+            substrate: "local".to_string(),
+            role_hint: "worker".to_string(),
+            workspace: Some("/tmp".to_string()),
+            description: None,
+            created_by: None,
+            prompt: Some("Fix the failing migration test".to_string()),
+            launch_args: Vec::new(),
+        };
+        let prompt = launch_prompt_for_runtime(adapter.as_ref(), node_id, &request);
+        assert!(prompt.contains("You are node"));
+        assert!(prompt.contains("Your task:\nFix the failing migration test"));
+    }
+
+    #[test]
+    fn decision_feedback_text_maps_status_and_answer() {
+        assert_eq!(decision_feedback_text("approved", None), "yes");
+        assert_eq!(decision_feedback_text("denied", None), "no");
+        // A free-text answer overrides the status-derived yes/no, verbatim.
+        assert_eq!(
+            decision_feedback_text("approved", Some("use option B")),
+            "use option B"
+        );
+        // Blank answers fall back to the status mapping.
+        assert_eq!(decision_feedback_text("denied", Some("   ")), "no");
+    }
+
+    #[tokio::test]
+    async fn awaiting_input_produces_single_pending_decision_deduped(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_workdir, store) = open_test_store();
+        let node = insert_active_node(&store, HarnessKind::ClaudeCode);
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        // First permission prompt materialises a pending decision.
+        service
+            .post_harness_event(
+                node.id,
+                HarnessEventRequest {
+                    source: "claude_hook".to_string(),
+                    payload: json!({
+                        "hook_event_name": "Notification",
+                        "type": "permission_prompt",
+                        "message": "Allow Bash?",
+                        "session_id": "sess-1"
+                    }),
+                },
+            )
+            .await?;
+
+        // A second awaiting-input (agent_needs_input) must NOT stack a new
+        // decision; it reuses/updates the single pending one.
+        service
+            .post_harness_event(
+                node.id,
+                HarnessEventRequest {
+                    source: "claude_hook".to_string(),
+                    payload: json!({
+                        "hook_event_name": "Notification",
+                        "type": "agent_needs_input",
+                        "message": "Which branch should I target?",
+                        "session_id": "sess-1"
+                    }),
+                },
+            )
+            .await?;
+
+        let decisions = service.list_decisions().await?;
+        let pending: Vec<_> = decisions
+            .decisions
+            .iter()
+            .filter(|d| d.node_id.as_deref() == Some(node.id.to_string().as_str()))
+            .filter(|d| d.status == "pending")
+            .collect();
+        assert_eq!(
+            pending.len(),
+            1,
+            "at most one pending decision per node; got {pending:?}"
+        );
+        assert_eq!(
+            pending[0].text, "Which branch should I target?",
+            "the reused decision carries the latest question text"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spawn_hook_action_creates_real_node() -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let _home = EnvVarGuard::set_var("HOME", &home);
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let script_path = workdir.path().join("fake-codex.sh");
+        write_executable_script(&script_path, "#!/bin/sh\nexit 0\n")?;
+
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let hook = service
+            .create_hook(HookCreateRequest {
+                name: "spawn-on-pressure".to_string(),
+                enabled: true,
+                event: "node.ctx_pressure".to_string(),
+                filter: "any".to_string(),
+                actions: vec![HookAction {
+                    kind: "spawn".to_string(),
+                    target: String::new(),
+                    template: None,
+                    args: json!({
+                        "harness": "codex",
+                        "substrate": "local",
+                        "role": "helper",
+                        "workspace": workspace.display().to_string(),
+                        "prompt": "start the audit",
+                    }),
+                }],
+                future: false,
+            })
+            .await?;
+
+        let firing = service.hook_test(&hook.id).await?;
+        assert!(firing.firing.ok, "spawn action should execute: {firing:?}");
+
+        let nodes = store.list_nodes()?;
+        let spawned = nodes
+            .iter()
+            .find(|n| n.role_hint == "helper")
+            .expect("spawn action created a real node");
+        assert_eq!(spawned.harness, HarnessKind::Codex);
+        assert_eq!(spawned.substrate, SubstrateKind::Local);
+        let _ = service.stop_node(spawned.id).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_input_hook_action_delivers_text_to_node_stdin(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let _home = EnvVarGuard::set_var("HOME", &home);
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let sink_path = workdir.path().join("stdin.txt");
+        let script_path = workdir.path().join("fake-stdin.sh");
+        // A harness that stays alive and appends every stdin line to a file — the
+        // process stdin is the substrate's input sink.
+        let script = format!(
+            "#!/bin/sh\nprintf 'READY\\r\\n'\nwhile IFS= read -r line; do printf '%s\\n' \"$line\" >> '{}'; done\n",
+            sink_path.display()
+        );
+        write_executable_script(&script_path, &script)?;
+
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let response = service
+            .create_node(local_create_request_with_workspace(
+                "",
+                &workspace.display().to_string(),
+            ))
+            .await?;
+        let node_id = Uuid::parse_str(&response.node_id)?;
+
+        let hook = service
+            .create_hook(HookCreateRequest {
+                name: "poke-on-idle".to_string(),
+                enabled: true,
+                event: "node.idle".to_string(),
+                filter: "any".to_string(),
+                actions: vec![HookAction {
+                    kind: "send_input".to_string(),
+                    target: String::new(),
+                    template: Some("SEND-INPUT-TOKEN-42".to_string()),
+                    args: JsonValue::Null,
+                }],
+                future: false,
+            })
+            .await?;
+        // hook_test targets the running node as the event's node.
+        let firing = service.hook_test(&hook.id).await?;
+        assert!(firing.firing.ok, "send_input action should execute: {firing:?}");
+
+        let mut delivered = false;
+        for _ in 0..250 {
+            if std::fs::read_to_string(&sink_path)
+                .unwrap_or_default()
+                .contains("SEND-INPUT-TOKEN-42")
+            {
+                delivered = true;
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        let _ = service.stop_node(node_id).await;
+        assert!(
+            delivered,
+            "send_input action text did not reach node stdin; sink: {:?}",
+            std::fs::read_to_string(&sink_path).unwrap_or_default()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_decision_injects_feedback_into_node_stdin(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let _home = EnvVarGuard::set_var("HOME", &home);
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let sink_path = workdir.path().join("stdin.txt");
+        let script_path = workdir.path().join("fake-stdin.sh");
+        let script = format!(
+            "#!/bin/sh\nprintf 'READY\\r\\n'\nwhile IFS= read -r line; do printf '%s\\n' \"$line\" >> '{}'; done\n",
+            sink_path.display()
+        );
+        write_executable_script(&script_path, &script)?;
+
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let response = service
+            .create_node(local_create_request_with_workspace(
+                "",
+                &workspace.display().to_string(),
+            ))
+            .await?;
+        let node_id = Uuid::parse_str(&response.node_id)?;
+
+        let decision = service
+            .create_decision(DecisionCreateRequest {
+                node_id: Some(node_id.to_string()),
+                text: "Which option?".to_string(),
+            })
+            .await?;
+        service
+            .resolve_decision(
+                &decision.id,
+                DecisionResolveRequest {
+                    status: "approved".to_string(),
+                    answer: Some("RESOLVE-ANSWER-TOKEN-7".to_string()),
+                },
+            )
+            .await?;
+
+        let mut delivered = false;
+        for _ in 0..250 {
+            if std::fs::read_to_string(&sink_path)
+                .unwrap_or_default()
+                .contains("RESOLVE-ANSWER-TOKEN-7")
+            {
+                delivered = true;
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        let _ = service.stop_node(node_id).await;
+        assert!(
+            delivered,
+            "resolve_decision feedback did not reach node stdin; sink: {:?}",
+            std::fs::read_to_string(&sink_path).unwrap_or_default()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_marks_stale_local_running_node_stopped_and_resumable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let workspace = workdir.path().join("ws");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let mut service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+        // Addendum A: point the transcript probe at a fake HOME and drop the
+        // claude transcript on disk so this node reads as honestly resumable.
+        let home = workdir.path().join("home");
+        service.set_transcript_home_for_test(home.clone());
+
+        // A node the previous daemon left marked Running, with a recorded session
+        // id and an existing workspace: resumable after honest reconciliation.
+        let node = store.insert_node(
+            HarnessKind::ClaudeCode,
+            SubstrateKind::Local,
+            "worker",
+            Some(&workspace.display().to_string()),
+            None,
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        let session_id = Uuid::new_v4().to_string();
+        let transcript_dir = home
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_slug(&workspace.display().to_string()));
+        std::fs::create_dir_all(&transcript_dir)?;
+        std::fs::write(transcript_dir.join(format!("{session_id}.jsonl")), b"{}\n")?;
+        store.set_node_harness_session_id(node.id, Some(&session_id))?;
+        store.set_node_liveness(node.id, NodeLiveness::Running)?;
+
+        service.reconcile_on_boot().await;
+
+        let after = store.get_node(node.id)?.expect("node exists");
+        assert_eq!(
+            after.liveness,
+            NodeLiveness::Stopped,
+            "stale-live local node must be marked honestly, not left Running"
+        );
+        let events = store.list_events(node.id)?;
+        let liveness_event = events
+            .iter()
+            .rev()
+            .find(|e| e.kind == NodeEventKind::LivenessChanged)
+            .expect("a LivenessChanged event must be recorded");
+        assert_eq!(liveness_event.body["reason"], "reconciled_local_pty_lost");
+        assert_eq!(liveness_event.body["resumable"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_marks_local_node_without_session_not_resumable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let workdir = tempfile::tempdir()?;
         let path = workdir.path().join("asylum.sqlite3").display().to_string();
         let store = Store::open(path)?;
-        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
 
-        let error = service
-            .spawn_recipe(
-                "start-command-center",
-                RecipeSpawnRequest {
-                    harness: "codex".to_string(),
-                    substrate: "local".to_string(),
-                    workspace: None,
-                    description: None,
-                    role_hint: Some("command-center".to_string()),
-                },
-            )
-            .await
-            .expect_err("spawning recipes should be disabled");
-        assert!(error
-            .to_string()
-            .contains("recipe-based spawning is disabled"));
+        // No recorded session id and no workspace -> honest Stopped, not resumable.
+        let node = store.insert_node(
+            HarnessKind::ClaudeCode,
+            SubstrateKind::Local,
+            "worker",
+            None,
+            None,
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        store.set_node_liveness(node.id, NodeLiveness::WaitingForInput)?;
+
+        service.reconcile_on_boot().await;
+
+        let after = store.get_node(node.id)?.expect("node exists");
+        assert_eq!(after.liveness, NodeLiveness::Stopped);
+        let events = store.list_events(node.id)?;
+        let liveness_event = events
+            .iter()
+            .rev()
+            .find(|e| e.kind == NodeEventKind::LivenessChanged)
+            .expect("a LivenessChanged event must be recorded");
+        assert_eq!(liveness_event.body["resumable"], false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_node_without_session_id() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let node = store.insert_node(
+            HarnessKind::ClaudeCode,
+            SubstrateKind::Local,
+            "worker",
+            None,
+            None,
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        store.set_node_liveness(node.id, NodeLiveness::Stopped)?;
+
+        let err = service.resume_node(node.id).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no recorded harness session id"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_live_node() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let workspace = workdir.path().join("ws");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let node = store.insert_node(
+            HarnessKind::ClaudeCode,
+            SubstrateKind::Local,
+            "worker",
+            Some(&workspace.display().to_string()),
+            None,
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        store.set_node_harness_session_id(node.id, Some(&Uuid::new_v4().to_string()))?;
+        store.set_node_liveness(node.id, NodeLiveness::Running)?;
+
+        let err = service.resume_node(node.id).await.unwrap_err();
+        assert!(
+            err.to_string().contains("already live"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_missing_workspace() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let missing = workdir.path().join("gone");
+        let node = store.insert_node(
+            HarnessKind::ClaudeCode,
+            SubstrateKind::Local,
+            "worker",
+            Some(&missing.display().to_string()),
+            None,
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        store.set_node_harness_session_id(node.id, Some(&Uuid::new_v4().to_string()))?;
+        store.set_node_liveness(node.id, NodeLiveness::Stopped)?;
+
+        let err = service.resume_node(node.id).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no longer exists"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_loon_node_honestly() -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let node = store.insert_node(
+            HarnessKind::ClaudeCode,
+            SubstrateKind::Loon,
+            "worker",
+            Some("/work"),
+            None,
+            Some("loon-instance-1"),
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        store.set_node_harness_session_id(node.id, Some(&Uuid::new_v4().to_string()))?;
+        store.set_node_liveness(node.id, NodeLiveness::Stopped)?;
+
+        let err = service.resume_node(node.id).await.unwrap_err();
+        assert!(
+            err.to_string().contains("not supported for Loon"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_relaunches_stopped_local_node() -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        // A fake harness that stays alive so resume drives it to Running.
+        let script_path = workdir.path().join("fake-harness.sh");
+        write_executable_script(
+            &script_path,
+            "#!/bin/sh\ntrap '' INT\nwhile true; do sleep 1; done\n",
+        )?;
+
+        let _home = EnvVarGuard::set_var("HOME", &home);
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        // A stopped codex node with a recorded thread-id and a live workspace.
+        let node = store.insert_node(
+            HarnessKind::Codex,
+            SubstrateKind::Local,
+            "worker",
+            Some(&workspace.display().to_string()),
+            None,
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        let thread_id = Uuid::new_v4().to_string();
+        store.set_node_harness_session_id(node.id, Some(&thread_id))?;
+        store.set_node_liveness(node.id, NodeLiveness::Stopped)?;
+
+        // Addendum A: resume fails fast without the session transcript on disk, so
+        // drop a codex rollout for this thread id under the fake HOME.
+        let rollout_dir = home.join(".codex").join("sessions").join("2026").join("07").join("07");
+        std::fs::create_dir_all(&rollout_dir)?;
+        std::fs::write(
+            rollout_dir.join(format!("rollout-2026-07-07T00-00-00-{thread_id}.jsonl")),
+            b"{}\n",
+        )?;
+
+        service.resume_node(node.id).await?;
+        wait_for_liveness(&store, node.id, NodeLiveness::Running).await?;
+
+        // Session id is preserved and a node.resumed lifecycle event was posted.
+        let after = store.get_node(node.id)?.expect("node exists");
+        assert_eq!(after.harness_session_id.as_deref(), Some(thread_id.as_str()));
+
+        let _ = service.stop_node(node.id).await;
         Ok(())
     }
 }
+

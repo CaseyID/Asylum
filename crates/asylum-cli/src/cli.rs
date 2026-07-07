@@ -13,6 +13,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::client::AsylumClient;
+use crate::harness_event;
 use crate::host::{
     command_exists, config_dir_path, require_binary, select_backend, service_state_from_health,
     HostState, PortInUse, ServiceBackend, ServiceManager, ServiceState,
@@ -173,6 +174,10 @@ pub async fn run(action: CliAction) -> Result<()> {
                 client.send_input(node_id, text).await?;
                 println!("input sent");
             }
+            NodeCommand::Resume { node_id } => {
+                client.resume_node(node_id).await?;
+                println!("node resumed");
+            }
             NodeCommand::Interrupt { node_id } => {
                 client.interrupt_node(node_id).await?;
                 println!("node interrupted");
@@ -329,13 +334,8 @@ pub async fn run(action: CliAction) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&response.firing)?);
             }
         },
-        Command::Recipe { command } => match command {
-            RecipeCommand::List => {
-                let response = client.list_recipes().await?;
-                println!("{}", serde_json::to_string_pretty(&response.recipes)?);
-            }
-        },
         Command::RemoteCommand { command } => {
+
             let request = RemoteCommandRequest {
                 command: command.into_raw_command()?,
             };
@@ -361,7 +361,9 @@ pub async fn run(action: CliAction) -> Result<()> {
                         &decision_id,
                         DecisionResolveRequest {
                             status: "approved".to_string(),
+                            answer: None,
                         },
+
                     )
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&decision)?);
@@ -372,7 +374,9 @@ pub async fn run(action: CliAction) -> Result<()> {
                         &decision_id,
                         DecisionResolveRequest {
                             status: "denied".to_string(),
+                            answer: None,
                         },
+
                     )
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&decision)?);
@@ -400,6 +404,15 @@ pub async fn run(action: CliAction) -> Result<()> {
         Command::Mcp => {
             mcp::run_stdio_server(Arc::new(client)).await?;
         }
+        Command::HarnessEvent { command } => match command {
+            HarnessEventCommand::ClaudeHook => harness_event::run_claude_hook(&paths).await,
+            HarnessEventCommand::ClaudeStatusline => {
+                harness_event::run_claude_statusline(&paths).await
+            }
+            HarnessEventCommand::CodexNotify { payload } => {
+                harness_event::run_codex_notify(payload, &paths).await
+            }
+        },
     }
 
     Ok(())
@@ -517,12 +530,8 @@ enum Command {
         #[command(subcommand)]
         command: HookCommand,
     },
-    /// List configured recipes.
-    Recipe {
-        #[command(subcommand)]
-        command: RecipeCommand,
-    },
     /// Send a remote command through the daemon's command receiver.
+
     #[command(name = "remote-command", alias = "remote")]
     RemoteCommand {
         #[command(subcommand)]
@@ -545,6 +554,32 @@ enum Command {
     },
     /// Run the MCP server over stdio (for editor integrations).
     Mcp,
+    /// Bridge harness-native signals (claude hooks/statusline, codex notify) to the daemon.
+    /// Invoked by injected Claude Code hooks/statusline and Codex's `notify` config from
+    /// inside a running node's environment; never interprets the payload, just forwards it.
+    #[command(name = "harness-event")]
+    HarnessEvent {
+        #[command(subcommand)]
+        command: HarnessEventCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum HarnessEventCommand {
+    /// Claude Code hook payload (Stop, Notification, SessionStart, SessionEnd,
+    /// PostToolUse) piped on stdin.
+    #[command(name = "claude-hook")]
+    ClaudeHook,
+    /// Claude Code statusLine payload piped on stdin; always prints a single
+    /// status line to stdout afterward (Claude Code renders that stdout as the
+    /// status bar text), regardless of whether forwarding to the daemon succeeded.
+    #[command(name = "claude-statusline")]
+    ClaudeStatusline,
+    /// Codex `notify` payload, appended by Codex as a single trailing argv
+    /// element (Codex nulls stdin/stdout/stderr for the notify subprocess, so
+    /// this must never be read from stdin).
+    #[command(name = "codex-notify")]
+    CodexNotify { payload: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -687,6 +722,8 @@ enum TokenCommand {
     Issue {
         #[arg(long)]
         name: String,
+        /// Advisory labels only: every issued token grants full access in
+        /// v0.1.x. Recorded for future per-route enforcement, not enforced today.
         #[arg(long)]
         scope: Vec<String>,
         #[arg(long)]
@@ -882,13 +919,8 @@ impl HookCreateArgs {
 }
 
 #[derive(Subcommand)]
-enum RecipeCommand {
-    /// List configured recipes (currently returns an empty list in shipped builds).
-    List,
-}
-
-#[derive(Subcommand)]
 enum RemoteCommand {
+
     Status(RemoteCommandTokenArgs),
     Attach(RemoteCommandNodeArgs),
     Send(RemoteCommandSendArgs),
@@ -1075,6 +1107,8 @@ enum NodeCommand {
     Inspect { node_id: Uuid },
     Send { node_id: Uuid, text: String },
     Interrupt { node_id: Uuid },
+    /// Resume a stopped node's harness session in place (same row/workspace).
+    Resume { node_id: Uuid },
     Stop { node_id: Uuid },
     Archive { node_id: Uuid },
 }
@@ -1091,7 +1125,11 @@ struct NodeCreateArgs {
     workspace: Option<String>,
     #[arg(long)]
     description: Option<String>,
+    /// First instruction delivered to the node as a submitted message once ready.
+    #[arg(long)]
+    prompt: Option<String>,
 }
+
 
 #[derive(Args)]
 struct NodeForkArgs {
@@ -1117,11 +1155,15 @@ struct NodeSpawnArgs {
     workspace: Option<String>,
     #[arg(long)]
     description: Option<String>,
+    /// First instruction for the spawned peer, delivered as its opening message.
+    #[arg(long)]
+    prompt: Option<String>,
     #[arg(long, default_value = "spawned_for")]
     relationship_kind: String,
     #[arg(long)]
     relationship_label: Option<String>,
 }
+
 
 impl NodeForkArgs {
     fn into_request(self) -> (Uuid, ForkNodeRequest) {
@@ -1146,9 +1188,11 @@ impl NodeSpawnArgs {
                 role_hint: self.role,
                 workspace: self.workspace,
                 description: self.description,
+                prompt: self.prompt,
                 relationship_kind: Some(self.relationship_kind),
                 relationship_label: self.relationship_label,
             },
+
         )
     }
 }
@@ -1162,9 +1206,11 @@ impl NodeCreateArgs {
             workspace: self.workspace,
             description: self.description,
             created_by: None,
+            prompt: self.prompt,
             launch_args: Vec::new(),
         }
     }
+
 }
 
 fn default_file_config_for_paths(paths: &RuntimePaths) -> AsylumFileConfig {
@@ -2751,17 +2797,61 @@ mod tests {
         assert_eq!(cli.config, Some(PathBuf::from("/tmp/config.toml")));
         let cli = Cli::try_parse_from(["asylum", "--config", "/tmp/config.toml", "status"])?;
         assert_eq!(cli.config, Some(PathBuf::from("/tmp/config.toml")));
-        let cli = Cli::try_parse_from(["asylum", "recipe", "list"])?;
+        assert!(
+            Cli::try_parse_from(["asylum", "recipe", "list"]).is_err(),
+            "recipe command surface is removed"
+        );
+        Ok(())
+    }
+
+
+    #[test]
+    fn harness_event_subcommands_parse_expected_shapes() -> Result<()> {
+        let cli = Cli::try_parse_from(["asylum", "harness-event", "claude-hook"])?;
         assert!(matches!(
             cli.command,
-            Some(Command::Recipe {
-                command: RecipeCommand::List
+            Some(Command::HarnessEvent {
+                command: HarnessEventCommand::ClaudeHook
             })
         ));
-        assert!(
-            Cli::try_parse_from(["asylum", "recipe", "spawn"]).is_err(),
-            "recipe spawn command should be hidden while disabled"
+
+        let cli = Cli::try_parse_from(["asylum", "harness-event", "claude-statusline"])?;
+        assert!(matches!(
+            cli.command,
+            Some(Command::HarnessEvent {
+                command: HarnessEventCommand::ClaudeStatusline
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "asylum",
+            "harness-event",
+            "codex-notify",
+            r#"{"type":"agent-turn-complete","thread-id":"abc"}"#,
+        ])?;
+        let payload = match cli.command {
+            Some(Command::HarnessEvent {
+                command: HarnessEventCommand::CodexNotify { payload },
+            }) => payload,
+            _ => panic!("expected a HarnessEvent(CodexNotify) command"),
+        };
+        assert_eq!(
+            payload.as_deref(),
+            Some(r#"{"type":"agent-turn-complete","thread-id":"abc"}"#)
         );
+
+        // Codex always appends exactly one argv element, but the CLI stays
+        // defensive: a missing trailing payload must still parse (not a clap
+        // hard-error / nonzero exit) so a misconfigured launch never breaks
+        // the harness process that invokes it.
+        let cli = Cli::try_parse_from(["asylum", "harness-event", "codex-notify"])?;
+        assert!(matches!(
+            cli.command,
+            Some(Command::HarnessEvent {
+                command: HarnessEventCommand::CodexNotify { payload: None }
+            })
+        ));
+
         Ok(())
     }
 
@@ -2773,12 +2863,15 @@ mod tests {
             role: "command-center".to_string(),
             workspace: Some(".".to_string()),
             description: None,
+            prompt: Some("start on the migration".to_string()),
         };
         let request = args.into_request();
         assert_eq!(request.harness, "codex");
         assert_eq!(request.role_hint, "command-center");
         assert_eq!(request.substrate, "local");
+        assert_eq!(request.prompt.as_deref(), Some("start on the migration"));
     }
+
 
     #[test]
     fn setup_runtime_is_idempotent() -> Result<()> {
@@ -2921,7 +3014,13 @@ mod tests {
         env::set_var("ASYLUM_TOKEN", "inherited-token");
         env::set_var("ASYLUM_SOCKET_PATH", &socket_path);
 
-        let paths = RuntimePaths::from_values(Some(tempdir.path().to_path_buf()), None, None, None);
+        let paths = RuntimePaths::from_values_with_socket_override(
+            Some(tempdir.path().to_path_buf()),
+            None,
+            None,
+            None,
+            Some(socket_path.clone()),
+        );
         write_config_with_listen(&paths, "127.0.0.1:9021")?;
 
         let client = runtime_client(&paths)?;

@@ -13,3 +13,4 @@ target/
 .asylum-dev/
 .agents/
 .codex/
+.claude/

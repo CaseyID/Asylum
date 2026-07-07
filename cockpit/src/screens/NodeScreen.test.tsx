@@ -50,6 +50,86 @@ function node(overrides: Partial<AsylumNode> = {}): AsylumNode {
   };
 }
 
+describe("NodeScreen W5 decision + session surfacing", () => {
+  beforeEach(() => {
+    apiMocks.fetchHarnessDescriptors.mockReset();
+    apiMocks.fetchHarnessDescriptors.mockResolvedValue([]);
+    apiMocks.fetchNodeEvents.mockReset();
+    apiMocks.fetchNodeEvents.mockResolvedValue([]);
+  });
+
+  afterEach(() => cleanup());
+
+  it("shows a pending-decision affordance and routes it to the decisions screen", async () => {
+    const onOpenDecisions = vi.fn();
+    const props = {
+      node: node(),
+      nodes: [node()],
+      relationships: [],
+      onBack: vi.fn(),
+      onOpen: vi.fn(),
+      onAction: vi.fn(),
+      onGraphRefresh: vi.fn(),
+      hasPendingDecision: true,
+      onOpenDecisions,
+    };
+
+    const { getByRole, container } = render(<NodeScreen {...props} />);
+
+    await waitFor(() => expect(container.textContent).toContain("command-center"));
+    const btn = getByRole("button", { name: "pending decision" });
+    fireEvent.click(btn);
+    expect(onOpenDecisions).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not show a pending-decision affordance when there is none", () => {
+    const props = {
+      node: node(),
+      nodes: [node()],
+      relationships: [],
+      onBack: vi.fn(),
+      onOpen: vi.fn(),
+      onAction: vi.fn(),
+      onGraphRefresh: vi.fn(),
+      hasPendingDecision: false,
+    };
+
+    const { queryByRole } = render(<NodeScreen {...props} />);
+    expect(queryByRole("button", { name: "pending decision" })).toBeNull();
+  });
+
+  it("shows the harness_session_id when the daemon provides one", async () => {
+    const props = {
+      node: node({ harness_session_id: "sess-abc-123" }),
+      nodes: [node({ harness_session_id: "sess-abc-123" })],
+      relationships: [],
+      onBack: vi.fn(),
+      onOpen: vi.fn(),
+      onAction: vi.fn(),
+      onGraphRefresh: vi.fn(),
+    };
+
+    const { container } = render(<NodeScreen {...props} />);
+    await waitFor(() => expect(container.textContent).toContain("sess-abc-123"));
+  });
+
+  it("falls back to an em dash when no harness_session_id is recorded", async () => {
+    const props = {
+      node: node({ harness_session_id: undefined }),
+      nodes: [node({ harness_session_id: undefined })],
+      relationships: [],
+      onBack: vi.fn(),
+      onOpen: vi.fn(),
+      onAction: vi.fn(),
+      onGraphRefresh: vi.fn(),
+    };
+
+    const { container } = render(<NodeScreen {...props} />);
+    await waitFor(() => expect(container.textContent).toContain("command-center"));
+    expect(container.textContent).toMatch(/session:\s*—/);
+  });
+});
+
 describe("NodeScreen selection transition", () => {
   beforeEach(() => {
     apiMocks.requestBrowserAttach.mockReset();
@@ -138,7 +218,83 @@ describe("NodeScreen selection transition", () => {
 
     fireEvent.click(archive);
 
-    expect(queryByText("archived · transcript exported")).toBeNull();
+    expect(queryByText("archived · stopped, no resume")).toBeNull();
     await waitFor(() => expect(queryByText("archive failed: daemon unavailable")).toBeDefined());
+  });
+});
+
+// D2 — Resume affordance. Shown only for a stopped, non-archived node that
+// carries a harness_session_id (the resume key a real POST /nodes/:id/resume
+// route — delivered by a parallel workstream — needs). Fetch is mocked at the
+// module level (apiMocks) so this exercises purely the button-gating logic.
+describe("NodeScreen resume affordance (D2)", () => {
+  afterEach(() => cleanup());
+
+  it("shows a resume button for a stopped node with a harness_session_id", async () => {
+    const onAction = vi.fn().mockResolvedValue(undefined);
+    const props = {
+      node: node({ liveness: "stopped", harness_session_id: "sess-resume-1" }),
+      nodes: [node({ liveness: "stopped", harness_session_id: "sess-resume-1" })],
+      relationships: [],
+      onBack: vi.fn(),
+      onOpen: vi.fn(),
+      onAction,
+      onGraphRefresh: vi.fn(),
+    };
+
+    const { getByRole, container } = render(<NodeScreen {...props} />);
+    await waitFor(() => expect(container.textContent).toContain("command-center"));
+
+    const resume = getByRole("button", { name: "resume" });
+    fireEvent.click(resume);
+    expect(onAction).toHaveBeenCalledWith("resume");
+  });
+
+  it("hides the resume button for a running node", async () => {
+    const props = {
+      node: node({ liveness: "running", harness_session_id: "sess-resume-1" }),
+      nodes: [node({ liveness: "running", harness_session_id: "sess-resume-1" })],
+      relationships: [],
+      onBack: vi.fn(),
+      onOpen: vi.fn(),
+      onAction: vi.fn(),
+      onGraphRefresh: vi.fn(),
+    };
+
+    const { queryByRole, container } = render(<NodeScreen {...props} />);
+    await waitFor(() => expect(container.textContent).toContain("command-center"));
+    expect(queryByRole("button", { name: "resume" })).toBeNull();
+  });
+
+  it("hides the resume button for a stopped node with no harness_session_id", async () => {
+    const props = {
+      node: node({ liveness: "stopped", harness_session_id: undefined }),
+      nodes: [node({ liveness: "stopped", harness_session_id: undefined })],
+      relationships: [],
+      onBack: vi.fn(),
+      onOpen: vi.fn(),
+      onAction: vi.fn(),
+      onGraphRefresh: vi.fn(),
+    };
+
+    const { queryByRole, container } = render(<NodeScreen {...props} />);
+    await waitFor(() => expect(container.textContent).toContain("command-center"));
+    expect(queryByRole("button", { name: "resume" })).toBeNull();
+  });
+
+  it("hides the resume button for an archived node even with a harness_session_id", async () => {
+    const props = {
+      node: node({ liveness: "archived", harness_session_id: "sess-resume-1" }),
+      nodes: [node({ liveness: "archived", harness_session_id: "sess-resume-1" })],
+      relationships: [],
+      onBack: vi.fn(),
+      onOpen: vi.fn(),
+      onAction: vi.fn(),
+      onGraphRefresh: vi.fn(),
+    };
+
+    const { queryByRole, container } = render(<NodeScreen {...props} />);
+    await waitFor(() => expect(container.textContent).toContain("command-center"));
+    expect(queryByRole("button", { name: "resume" })).toBeNull();
   });
 });

@@ -18,6 +18,9 @@ export interface NavProps {
   hookCount: number;
   daemonVersion?: string;
   bindAddr?: string;
+  // D2: daemon-provided uptime label (from /health uptime_seconds), rendered
+  // alongside version/bind addr — no longer derived client-side.
+  daemonUptime?: string;
   onPick: (id: ScreenId | "__launch") => void;
 }
 
@@ -29,6 +32,7 @@ export function Nav({
   hookCount,
   daemonVersion,
   bindAddr,
+  daemonUptime,
   onPick,
 }: NavProps): JSX.Element {
   const mainItems: NavItem[] = [
@@ -92,6 +96,7 @@ export function Nav({
         <div className="footer-info">
           <div>{daemonVersion ?? "asylum"}</div>
           {bindAddr && <div className="muted">{bindAddr}</div>}
+          {daemonUptime && <div className="muted">up {daemonUptime}</div>}
         </div>
       )}
     </div>

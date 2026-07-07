@@ -1,6 +1,7 @@
 import { Fragment, type JSX } from "react";
 import { Btn, KV, Pill } from "../lib/ui";
 import {
+  canResumeNode,
   harnessLabel,
   roleGlyph,
   shortNodeId,
@@ -17,14 +18,17 @@ export type InspectorAction =
   | "interrupt"
   | "fork"
   | "stop"
-  | "terminate"
-  | "archive";
+  | "archive"
+  | "resume";
 
 export interface InspectorProps {
   node?: AsylumNode;
   onAction: (action: InspectorAction, payload?: string) => void;
   onOpen: (node: AsylumNode) => void;
   relationships?: GraphRelationship[];
+  // true when the node has an unresolved pending decision (W5 decision surfacing).
+  hasPendingDecision?: boolean;
+  onOpenDecisions?: () => void;
 }
 
 const CAPABILITY_KEYS: Array<keyof AsylumNode["capabilities"]> = [
@@ -36,7 +40,14 @@ const CAPABILITY_KEYS: Array<keyof AsylumNode["capabilities"]> = [
   "transcript_export",
 ];
 
-export function Inspector({ node, onAction, onOpen, relationships }: InspectorProps): JSX.Element {
+export function Inspector({
+  node,
+  onAction,
+  onOpen,
+  relationships,
+  hasPendingDecision,
+  onOpenDecisions,
+}: InspectorProps): JSX.Element {
   if (!node) {
     return (
       <div className="inspector">
@@ -68,6 +79,11 @@ export function Inspector({ node, onAction, onOpen, relationships }: InspectorPr
           </div>
         </div>
         <Pill status={uiState}>{uiStateLabel(uiState)}</Pill>
+        {hasPendingDecision && (
+          <Btn size="sm" kind="secondary" icon="help-circle" onClick={onOpenDecisions}>
+            pending decision
+          </Btn>
+        )}
       </div>
 
       <div className="inspector-body">
@@ -82,6 +98,7 @@ export function Inspector({ node, onAction, onOpen, relationships }: InspectorPr
               ["workspace", node.workspace ?? "—"],
               ["parent", parentLabel],
               ["uptime", uptimeLabel(node)],
+              ["harness session", node.harness_session_id ?? "—"],
             ]}
           />
         </div>
@@ -169,11 +186,20 @@ export function Inspector({ node, onAction, onOpen, relationships }: InspectorPr
             <Btn
               size="sm"
               kind="danger"
-              icon="x"
-              onClick={() => onAction("terminate")}
+              icon="archive"
+              onClick={() => onAction("archive")}
             >
-              terminate
+              archive
             </Btn>
+            {canResumeNode(node) && (
+              <Btn
+                size="sm"
+                icon="play"
+                onClick={() => onAction("resume")}
+              >
+                resume
+              </Btn>
+            )}
           </div>
           <div style={{ marginTop: 10 }}>
             <Btn
