@@ -330,13 +330,8 @@ pub async fn run(action: CliAction) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&response.firing)?);
             }
         },
-        Command::Recipe { command } => match command {
-            RecipeCommand::List => {
-                let response = client.list_recipes().await?;
-                println!("{}", serde_json::to_string_pretty(&response.recipes)?);
-            }
-        },
         Command::RemoteCommand { command } => {
+
             let request = RemoteCommandRequest {
                 command: command.into_raw_command()?,
             };
@@ -362,7 +357,9 @@ pub async fn run(action: CliAction) -> Result<()> {
                         &decision_id,
                         DecisionResolveRequest {
                             status: "approved".to_string(),
+                            answer: None,
                         },
+
                     )
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&decision)?);
@@ -373,7 +370,9 @@ pub async fn run(action: CliAction) -> Result<()> {
                         &decision_id,
                         DecisionResolveRequest {
                             status: "denied".to_string(),
+                            answer: None,
                         },
+
                     )
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&decision)?);
@@ -527,12 +526,8 @@ enum Command {
         #[command(subcommand)]
         command: HookCommand,
     },
-    /// List configured recipes.
-    Recipe {
-        #[command(subcommand)]
-        command: RecipeCommand,
-    },
     /// Send a remote command through the daemon's command receiver.
+
     #[command(name = "remote-command", alias = "remote")]
     RemoteCommand {
         #[command(subcommand)]
@@ -918,13 +913,8 @@ impl HookCreateArgs {
 }
 
 #[derive(Subcommand)]
-enum RecipeCommand {
-    /// List configured recipes (currently returns an empty list in shipped builds).
-    List,
-}
-
-#[derive(Subcommand)]
 enum RemoteCommand {
+
     Status(RemoteCommandTokenArgs),
     Attach(RemoteCommandNodeArgs),
     Send(RemoteCommandSendArgs),
@@ -1127,7 +1117,11 @@ struct NodeCreateArgs {
     workspace: Option<String>,
     #[arg(long)]
     description: Option<String>,
+    /// First instruction delivered to the node as a submitted message once ready.
+    #[arg(long)]
+    prompt: Option<String>,
 }
+
 
 #[derive(Args)]
 struct NodeForkArgs {
@@ -1153,11 +1147,15 @@ struct NodeSpawnArgs {
     workspace: Option<String>,
     #[arg(long)]
     description: Option<String>,
+    /// First instruction for the spawned peer, delivered as its opening message.
+    #[arg(long)]
+    prompt: Option<String>,
     #[arg(long, default_value = "spawned_for")]
     relationship_kind: String,
     #[arg(long)]
     relationship_label: Option<String>,
 }
+
 
 impl NodeForkArgs {
     fn into_request(self) -> (Uuid, ForkNodeRequest) {
@@ -1182,9 +1180,11 @@ impl NodeSpawnArgs {
                 role_hint: self.role,
                 workspace: self.workspace,
                 description: self.description,
+                prompt: self.prompt,
                 relationship_kind: Some(self.relationship_kind),
                 relationship_label: self.relationship_label,
             },
+
         )
     }
 }
@@ -1198,9 +1198,11 @@ impl NodeCreateArgs {
             workspace: self.workspace,
             description: self.description,
             created_by: None,
+            prompt: self.prompt,
             launch_args: Vec::new(),
         }
     }
+
 }
 
 fn default_file_config_for_paths(paths: &RuntimePaths) -> AsylumFileConfig {
@@ -2787,19 +2789,13 @@ mod tests {
         assert_eq!(cli.config, Some(PathBuf::from("/tmp/config.toml")));
         let cli = Cli::try_parse_from(["asylum", "--config", "/tmp/config.toml", "status"])?;
         assert_eq!(cli.config, Some(PathBuf::from("/tmp/config.toml")));
-        let cli = Cli::try_parse_from(["asylum", "recipe", "list"])?;
-        assert!(matches!(
-            cli.command,
-            Some(Command::Recipe {
-                command: RecipeCommand::List
-            })
-        ));
         assert!(
-            Cli::try_parse_from(["asylum", "recipe", "spawn"]).is_err(),
-            "recipe spawn command should be hidden while disabled"
+            Cli::try_parse_from(["asylum", "recipe", "list"]).is_err(),
+            "recipe command surface is removed"
         );
         Ok(())
     }
+
 
     #[test]
     fn harness_event_subcommands_parse_expected_shapes() -> Result<()> {
@@ -2859,12 +2855,15 @@ mod tests {
             role: "command-center".to_string(),
             workspace: Some(".".to_string()),
             description: None,
+            prompt: Some("start on the migration".to_string()),
         };
         let request = args.into_request();
         assert_eq!(request.harness, "codex");
         assert_eq!(request.role_hint, "command-center");
         assert_eq!(request.substrate, "local");
+        assert_eq!(request.prompt.as_deref(), Some("start on the migration"));
     }
+
 
     #[test]
     fn setup_runtime_is_idempotent() -> Result<()> {

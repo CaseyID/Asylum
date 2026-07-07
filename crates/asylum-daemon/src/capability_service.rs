@@ -42,7 +42,8 @@ use crate::hooks::{
     SCHEDULE_30M, SCHEDULE_5M,
 };
 use crate::notifications::send_with_optional_config;
-use crate::recipes;
+use crate::launch_packet;
+
 use crate::remote_commands::{parse_remote_command, ParsedRemoteCommand, RemoteCommandKind};
 use crate::storage::Store;
 use crate::substrate::loon::{capability_flags_from_health, LoonHealth, LoonSubstrate};
@@ -51,9 +52,9 @@ use asylum_types::api::{
     ChannelCreateRequest, ChannelDescriptor, ChannelInboundRequest, ChannelListResponse,
     ChannelMessagesResponse, ChannelTestRequest, ChannelTestResponse, ChannelUpdateRequest,
     ForkNodeRequest, HookAction, HookCreateRequest, HookEventCatalogResponse, HookFiringsResponse,
-    HookListResponse, HookRule, HookTestResponse, HookUpdateRequest, RecipeListResponse,
-    RecipeSpawnRequest, RecipeSpawnResponse,
+    HookListResponse, HookRule, HookTestResponse, HookUpdateRequest,
 };
+
 use asylum_types::config::{AutonomyConfig, HarnessConfig, LoonConfig};
 use asylum_types::node::NodeRecord;
 
@@ -605,9 +606,18 @@ impl CapabilityService {
 
         self.store
             .record_event(node_id, NodeEventKind::HarnessEvent, payload.clone())?;
-        self.post_hook_event(kind, Some(node_id), payload);
+        self.post_hook_event(kind, Some(node_id), payload.clone());
+
+        // Decision producer: an awaiting-input signal (permission_prompt,
+        // elicitation*, agent_needs_input) is the explicit ask-the-human moment,
+        // so materialise a pending decision the operator/supervisor can resolve.
+        // Deduped to at most one pending decision per node.
+        if kind == "node.awaiting_input" {
+            self.produce_decision_from_awaiting_input(node_id, &payload);
+        }
 
         // Liveness update, guarded so we don't spam LivenessChanged events for a
+
         // no-op transition (e.g. repeated tool_call while already Running).
         if let Some(target) = mapped.liveness {
             if node.liveness != target {
@@ -624,7 +634,57 @@ impl CapabilityService {
         })
     }
 
+    /// Materialise (or refresh) the single pending decision for a node that has
+    /// signalled it is awaiting human input. Question text comes verbatim from the
+    /// harness `message`; when absent it falls back to a generic prompt. A fresh
+    /// awaiting-input while a decision is already pending updates that decision's
+    /// text rather than stacking a second one.
+    fn produce_decision_from_awaiting_input(&self, node_id: Uuid, payload: &JsonValue) {
+        let text = payload
+            .get("message")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| "Node is awaiting human input".to_string());
+        match self.store.pending_decision_for_node(node_id) {
+            Ok(Some(existing)) => {
+                // Reuse: refresh the question, no duplicate notification.
+                if let Err(e) = self.store.update_decision_text(&existing.0, &text) {
+                    tracing::warn!(error = %e, node_id = %node_id, "failed to refresh pending decision text");
+                }
+            }
+            Ok(None) => match self.store.insert_decision(Some(node_id), &text) {
+                Ok(record) => {
+                    let decision = map_decision(record);
+                    let _ = self.store.insert_notification(
+                        Some(node_id),
+                        "decision",
+                        "Decision requested",
+                        &decision.text,
+                    );
+                    let _ = self.store.record_event(
+                        node_id,
+                        NodeEventKind::HumanInputRequested,
+                        json!({
+                            "decision": decision.id,
+                            "text": decision.text,
+                            "source": "harness_event",
+                        }),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, node_id = %node_id, "failed to create pending decision from awaiting_input");
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, node_id = %node_id, "failed to look up pending decision for node");
+            }
+        }
+    }
+
     /// Persist a statusline telemetry datapoint and fire `node.ctx_pressure`
+
     /// when `used_percentage` crosses a configured threshold for the first time
     /// in this session. Returns the mapped event kind if a threshold fired.
     fn ingest_statusline(
@@ -880,44 +940,74 @@ impl CapabilityService {
                 }
                 Ok(format!("channel:{}", channel.id))
             }
+            "send_input" => {
+                let node_id = resolve_action_node_id(action, payload)?;
+                let text = action
+                    .template
+                    .clone()
+                    .or_else(|| {
+                        action
+                            .args
+                            .get("text")
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_string)
+                    })
+                    .ok_or_else(|| {
+                        anyhow!("send_input action requires a 'text' arg or template")
+                    })?;
+                let rendered = render_template(&text, payload);
+                self.send_input(node_id, SendInputRequest { text: rendered })
+                    .await?;
+                Ok(format!("send_input:{node_id}"))
+            }
             "spawn" => {
-                if !recipe_spawn_is_enabled() {
-                    return Err(anyhow!(
-                        "hook action kind 'spawn' is unavailable while recipe spawn is disabled"
-                    ));
-                }
-                let target = action.target.clone();
-                let recipe_id = target
-                    .strip_prefix("recipe:")
-                    .ok_or_else(|| anyhow!("spawn target must be 'recipe:<id>'"))?;
+                // Honest inline spawn: the action carries a full node spec and
+                // launches a real node. No recipe indirection.
                 let harness = action
                     .args
                     .get("harness")
                     .and_then(JsonValue::as_str)
-                    .unwrap_or("claude_code");
+                    .ok_or_else(|| anyhow!("spawn action requires a 'harness' arg"))?;
                 let substrate = action
                     .args
                     .get("substrate")
                     .and_then(JsonValue::as_str)
-                    .unwrap_or("local");
-                let request = RecipeSpawnRequest {
+                    .ok_or_else(|| anyhow!("spawn action requires a 'substrate' arg"))?;
+                let role_hint = action
+                    .args
+                    .get("role")
+                    .and_then(JsonValue::as_str)
+                    .or_else(|| action.args.get("role_hint").and_then(JsonValue::as_str))
+                    .unwrap_or("worker");
+                let workspace = action
+                    .args
+                    .get("workspace")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_string);
+                let prompt = action
+                    .args
+                    .get("prompt")
+                    .and_then(JsonValue::as_str)
+                    .map(|p| render_template(p, payload));
+                let description = action
+                    .args
+                    .get("description")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_string);
+                let request = CreateNodeRequest {
                     harness: harness.to_string(),
                     substrate: substrate.to_string(),
-                    workspace: action
-                        .args
-                        .get("workspace")
-                        .and_then(JsonValue::as_str)
-                        .map(str::to_string),
-                    description: None,
-                    role_hint: None,
+                    role_hint: role_hint.to_string(),
+                    workspace,
+                    description,
+                    created_by: payload_node_id(payload).map(|id| id.to_string()),
+                    prompt,
+                    launch_args: Vec::new(),
                 };
-                let response = self.spawn_recipe(recipe_id, request).await?;
-                Ok(format!(
-                    "spawn:{}:{}",
-                    recipe_id,
-                    response.node_ids.join(",")
-                ))
+                let response = self.create_node(request).await?;
+                Ok(format!("spawn:{}", response.node_id))
             }
+
             "tool" => {
                 let outcome = self.dispatch_tool(&action.target, payload).await?;
                 Ok(format!("tool:{}:{}", action.target, outcome))
@@ -1085,16 +1175,22 @@ fn launch_prompt_for_runtime(
     node_id: Uuid,
     request: &CreateNodeRequest,
 ) -> String {
-    let context = adapter.launch_context(node_id, request);
-    match request
+    let mut prompt = adapter.launch_context(node_id, request);
+    if let Some(desc) = request
         .description
         .as_deref()
         .filter(|value| !value.is_empty())
     {
-        Some(desc) => format!("{}\n\nUser launch packet:\n{}", context.trim_end(), desc),
-        None => context,
+        prompt = format!("{}\n\nUser launch packet:\n{}", prompt.trim_end(), desc);
     }
+    // The optional initial prompt is the node's first task: a supervisor's
+    // opening instruction to the worker, delivered as the submitted message.
+    if let Some(task) = request.prompt.as_deref().filter(|value| !value.is_empty()) {
+        prompt = format!("{}\n\nYour task:\n{}", prompt.trim_end(), task);
+    }
+    prompt
 }
+
 
 impl CapabilityService {
     pub async fn capabilities(&self) -> CapabilityListResponse {
@@ -1427,14 +1523,8 @@ impl CapabilityService {
                 true,
             ),
             descriptor(
-                CapabilityName::RecipeList,
-                "/api/recipes",
-                "GET",
-                "List configured launch recipes (currently none in shipped runtime)",
-                true,
-            ),
-            descriptor(
                 CapabilityName::NodeFork,
+
                 "/api/nodes/{id}/fork",
                 "POST",
                 "Fork a node",
@@ -2236,9 +2326,11 @@ impl CapabilityService {
                         workspace,
                         description: None,
                         created_by: None,
+                        prompt: None,
                         launch_args: Vec::new(),
                     })
                     .await
+
                 {
                     Ok(response) => Ok((
                         None,
@@ -2283,9 +2375,11 @@ impl CapabilityService {
                         decision_id,
                         DecisionResolveRequest {
                             status: "approved".to_string(),
+                            answer: None,
                         },
                     )
                     .await?;
+
                 Ok((
                     None,
                     json!({
@@ -2301,9 +2395,11 @@ impl CapabilityService {
                         decision_id,
                         DecisionResolveRequest {
                             status: "denied".to_string(),
+                            answer: None,
                         },
                     )
                     .await?;
+
                 Ok((
                     None,
                     json!({
@@ -2395,7 +2491,8 @@ impl CapabilityService {
             ("interrupt", node.capabilities.interrupt),
             ("stop", node.capabilities.stop),
         ];
-        let markdown = recipes::launch_packet_markdown(
+        let markdown = launch_packet::launch_packet_markdown(
+
             &node.id.to_string(),
             &self.config.base_url,
             &node.role_hint,
@@ -2517,8 +2614,20 @@ impl CapabilityService {
             .node_id
             .as_deref()
             .and_then(|raw| Uuid::parse_str(raw).ok());
+        // Close the loop: inject the resolution back into the node's PTY via the
+        // send_input path (types AND submits). A free-text answer is delivered
+        // verbatim; a bare approve/deny maps to a simple affirmative/negative.
+        let feedback = decision_feedback_text(&after.status, request.answer.as_deref());
         if let Some(node_id) = node_id {
             if let Ok(Some(node)) = self.store.get_node(node_id) {
+                if is_active_liveness(&node.liveness) {
+                    if let Err(e) = self
+                        .send_input(node_id, SendInputRequest { text: feedback })
+                        .await
+                    {
+                        tracing::warn!(error = %e, node_id = %node_id, "failed to inject decision feedback into node");
+                    }
+                }
                 if matches!(node.liveness, NodeLiveness::WaitingForInput) {
                     self.store
                         .set_node_liveness(node_id, NodeLiveness::Running)?;
@@ -2543,6 +2652,7 @@ impl CapabilityService {
         }
         Ok(after)
     }
+
 
     pub async fn notify_send(
         &self,
@@ -2758,15 +2868,32 @@ impl CapabilityService {
 
         if remote_command_result.is_none() {
             if let Some(node_id) = node_id {
-                self.send_input(
-                    node_id,
-                    SendInputRequest {
-                        text: request.body.clone(),
-                    },
-                )
-                .await?;
+                // A reply correlated to a node with a pending decision resolves
+                // that decision (free-text answer). resolve_decision then injects
+                // the answer into the PTY, so the inbound reply flows through the
+                // same feedback path rather than bypassing it. With no pending
+                // decision, the reply is a plain input delivery.
+                if let Ok(Some(pending)) = self.store.pending_decision_for_node(node_id) {
+                    self.resolve_decision(
+                        &pending.0,
+                        DecisionResolveRequest {
+                            status: "approved".to_string(),
+                            answer: Some(request.body.clone()),
+                        },
+                    )
+                    .await?;
+                } else {
+                    self.send_input(
+                        node_id,
+                        SendInputRequest {
+                            text: request.body.clone(),
+                        },
+                    )
+                    .await?;
+                }
             }
         }
+
 
         self.record_channel_inbound(
             id,
@@ -2948,21 +3075,6 @@ impl CapabilityService {
         })
     }
 
-    pub async fn list_recipes(&self) -> RecipeListResponse {
-        RecipeListResponse {
-            recipes: Vec::new(),
-        }
-    }
-
-    pub async fn spawn_recipe(
-        &self,
-        recipe_id: &str,
-        _request: RecipeSpawnRequest,
-    ) -> Result<RecipeSpawnResponse> {
-        Err(anyhow!(
-            "recipe-based spawning is disabled until user/config-backed recipes are implemented ({recipe_id})"
-        ))
-    }
 
     pub async fn spawn_peer(
         &self,
@@ -3010,11 +3122,13 @@ impl CapabilityService {
                 workspace,
                 description,
                 created_by: Some(source_id.to_string()),
+                prompt: request.prompt,
                 launch_args: Vec::new(),
             })
             .await?;
         let new_id = Uuid::parse_str(&response.node_id)?;
         let relationship = self.store.create_relationship(
+
             source_id,
             new_id,
             relationship_kind,
@@ -3048,11 +3162,13 @@ impl CapabilityService {
                 workspace,
                 description: Some(description),
                 created_by: None,
+                prompt: None,
                 launch_args: Vec::new(),
             })
             .await?;
         let new_id = Uuid::parse_str(&response.node_id)?;
         self.store.create_relationship(
+
             source_id,
             new_id,
             RelationshipKind::SpawnedFor,
@@ -3202,18 +3318,72 @@ fn looks_like_remote_command(raw: &str) -> bool {
     )
 }
 
-fn recipe_spawn_is_enabled() -> bool {
-    false
-}
-
+/// Validate hook action shapes at create/update time. Kinds are matched by the
+/// executor; here we fail fast on structurally-incomplete honest actions so a
+/// rule cannot be stored that could never execute.
 fn validate_hook_actions(actions: &[HookAction]) -> Result<()> {
-    if !recipe_spawn_is_enabled() && actions.iter().any(|action| action.kind.as_str() == "spawn") {
-        return Err(anyhow!(
-            "hook action kind 'spawn' is unavailable while recipe spawn is disabled"
-        ));
+    for action in actions {
+        match action.kind.as_str() {
+            "spawn" => {
+                if action
+                    .args
+                    .get("harness")
+                    .and_then(JsonValue::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .is_none()
+                {
+                    return Err(anyhow!("spawn action requires a 'harness' arg"));
+                }
+                if action
+                    .args
+                    .get("substrate")
+                    .and_then(JsonValue::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .is_none()
+                {
+                    return Err(anyhow!("spawn action requires a 'substrate' arg"));
+                }
+            }
+            "send_input" => {
+                let has_text = action.template.as_deref().is_some_and(|t| !t.is_empty())
+                    || action
+                        .args
+                        .get("text")
+                        .and_then(JsonValue::as_str)
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .is_some();
+                if !has_text {
+                    return Err(anyhow!(
+                        "send_input action requires a 'text' arg or template"
+                    ));
+                }
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
+
+/// Resolve the node a node-targeted hook action addresses: an explicit UUID in
+/// `action.target`, or the event's own node when the target is empty or names
+/// the event (`event`/`node`/`event.node`).
+fn resolve_action_node_id(action: &HookAction, payload: &JsonValue) -> Result<Uuid> {
+    let target = action.target.trim();
+    if target.is_empty()
+        || target.eq_ignore_ascii_case("event")
+        || target.eq_ignore_ascii_case("node")
+        || target.eq_ignore_ascii_case("event.node")
+    {
+        return node_id_from_payload(payload);
+    }
+    Uuid::parse_str(target).map_err(|_| {
+        anyhow!("send_input target must be a node UUID or 'event' for the event's node")
+    })
+}
+
 
 fn remote_command_requires_node(kind: &RemoteCommandKind) -> bool {
     matches!(
@@ -3247,9 +3417,23 @@ fn decision_id_from_remote_args(args: &std::collections::HashMap<String, String>
         .ok_or_else(|| anyhow!("decision required"))
 }
 
+/// The text injected into a node's PTY when a decision resolves. A free-text
+/// answer wins verbatim; otherwise a bare approve/deny maps to a simple
+/// affirmative/negative. No cleverness — the harness interprets it.
+fn decision_feedback_text(status: &str, answer: Option<&str>) -> String {
+    if let Some(answer) = answer.map(str::trim).filter(|a| !a.is_empty()) {
+        return answer.to_string();
+    }
+    match status {
+        "approved" => "yes".to_string(),
+        _ => "no".to_string(),
+    }
+}
+
 fn map_decision(
     (id, node_id, text, status, created_at, decided_at): crate::storage::DecisionStorageRecord,
 ) -> DecisionRecord {
+
     DecisionRecord {
         id,
         node_id,
@@ -3372,7 +3556,9 @@ mod tests {
             workspace: Some("/tmp".to_string()),
             description: None,
             created_by: None,
+            prompt: None,
             launch_args: Vec::new(),
+
         };
         let prompt = launch_prompt_for_runtime(adapter.as_ref(), node_id, &request);
         assert!(prompt.contains(&format!("You are node {} with role 'worker'.", node_id)));
@@ -3389,7 +3575,9 @@ mod tests {
             workspace: None,
             description: Some(description.to_string()),
             created_by: None,
+            prompt: None,
             launch_args: Vec::new(),
+
         }
     }
 
@@ -3404,7 +3592,9 @@ mod tests {
             workspace: Some(workspace.to_string()),
             description: Some(description.to_string()),
             created_by: None,
+            prompt: None,
             launch_args: Vec::new(),
+
         }
     }
 
@@ -3416,7 +3606,9 @@ mod tests {
             workspace: None,
             description: Some(description.to_string()),
             created_by: None,
+            prompt: None,
             launch_args: Vec::new(),
+
         }
     }
 
@@ -3428,7 +3620,9 @@ mod tests {
             workspace: Some(workspace.to_string()),
             description: Some(description.to_string()),
             created_by: None,
+            prompt: None,
             launch_args: Vec::new(),
+
         }
     }
 
@@ -3518,7 +3712,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capabilities_hide_recipe_spawn_descriptor() -> Result<(), Box<dyn std::error::Error>> {
+    async fn capabilities_expose_no_recipe_surface() -> Result<(), Box<dyn std::error::Error>> {
         let workdir = tempfile::tempdir()?;
         let path = workdir.path().join("asylum.sqlite3").display().to_string();
         let store = Store::open(path)?;
@@ -3529,11 +3723,12 @@ mod tests {
             !capabilities
                 .capabilities
                 .iter()
-                .any(|capability| capability.name == CapabilityName::RecipeSpawn),
-            "recipe spawn capability descriptor should be hidden while disabled"
+                .any(|capability| capability.path == "/api/recipes"),
+            "the recipe surface is removed and must not appear in capability descriptors"
         );
         Ok(())
     }
+
 
     #[tokio::test]
     async fn create_channel_rejects_unsupported_kinds() -> Result<(), Box<dyn std::error::Error>> {
@@ -4269,9 +4464,11 @@ mod tests {
                 &decision.id,
                 DecisionResolveRequest {
                     status: "approved".to_string(),
+                    answer: None,
                 },
             )
             .await?;
+
 
         assert_eq!(decision.status, "approved");
         let updated_node = store.get_node(node.id)?.expect("node should still exist");
@@ -4952,32 +5149,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hook_actions_reject_spawn_while_disabled() -> Result<(), Box<dyn std::error::Error>> {
+    async fn hook_actions_validate_spawn_shape() -> Result<(), Box<dyn std::error::Error>> {
         let workdir = tempfile::tempdir()?;
         let path = workdir.path().join("asylum.sqlite3").display().to_string();
         let store = Store::open(path)?;
         let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
 
+        // A spawn action missing harness/substrate is structurally incomplete and
+        // must be rejected at create time — spawn itself is a valid, honest kind.
         let create_error = service
             .create_hook(HookCreateRequest {
-                name: "spawn-disabled".to_string(),
+                name: "spawn-incomplete".to_string(),
                 enabled: true,
                 event: "node.ctx_pressure".to_string(),
                 filter: "any".to_string(),
                 actions: vec![HookAction {
                     kind: "spawn".to_string(),
-                    target: "recipe:quickstart".to_string(),
+                    target: String::new(),
                     template: None,
                     args: serde_json::json!({}),
                 }],
                 future: false,
             })
             .await
-            .expect_err("hook creation should reject spawn actions");
+            .expect_err("hook creation should reject an incomplete spawn action");
         assert!(create_error
             .to_string()
-            .contains("hook action kind 'spawn'"));
+            .contains("spawn action requires a 'harness' arg"));
 
+        // Same rejection on update.
         let hook = service
             .create_hook(HookCreateRequest {
                 name: "update-target".to_string(),
@@ -4998,20 +5198,43 @@ mod tests {
                     filter: None,
                     actions: Some(vec![HookAction {
                         kind: "spawn".to_string(),
-                        target: "recipe:quickstart".to_string(),
+                        target: String::new(),
                         template: None,
-                        args: serde_json::json!({}),
+                        args: serde_json::json!({"harness": "claude_code"}),
                     }]),
                     future: Some(false),
                 },
             )
             .await
-            .expect_err("spawn actions should remain rejected on update");
+            .expect_err("incomplete spawn actions should be rejected on update");
         assert!(update_error
             .to_string()
-            .contains("hook action kind 'spawn'"));
+            .contains("spawn action requires a 'substrate' arg"));
+
+        // A complete spawn spec is accepted.
+        service
+            .create_hook(HookCreateRequest {
+                name: "spawn-complete".to_string(),
+                enabled: true,
+                event: "node.ctx_pressure".to_string(),
+                filter: "any".to_string(),
+                actions: vec![HookAction {
+                    kind: "spawn".to_string(),
+                    target: String::new(),
+                    template: None,
+                    args: serde_json::json!({
+                        "harness": "codex",
+                        "substrate": "local",
+                        "role": "worker",
+                    }),
+                }],
+                future: false,
+            })
+            .await
+            .expect("a well-formed spawn action should be accepted");
         Ok(())
     }
+
 
     #[tokio::test]
     async fn routed_channel_inbound_fails_before_recording_when_node_delivery_fails(
@@ -5514,46 +5737,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn recipes_are_disabled_and_not_preseeded() -> Result<(), Box<dyn std::error::Error>> {
-        let workdir = tempfile::tempdir()?;
-        let path = workdir.path().join("asylum.sqlite3").display().to_string();
-        let store = Store::open(path)?;
-        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
-
-        let response = service.list_recipes().await;
-        assert!(response.recipes.is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn spawn_recipe_returns_error_until_configured() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let workdir = tempfile::tempdir()?;
-        let path = workdir.path().join("asylum.sqlite3").display().to_string();
-        let store = Store::open(path)?;
-        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
-
-        let error = service
-            .spawn_recipe(
-                "start-command-center",
-                RecipeSpawnRequest {
-                    harness: "codex".to_string(),
-                    substrate: "local".to_string(),
-                    workspace: None,
-                    description: None,
-                    role_hint: Some("command-center".to_string()),
-                },
-            )
-            .await
-            .expect_err("spawning recipes should be disabled");
-        assert!(error
-            .to_string()
-            .contains("recipe-based spawning is disabled"));
-        Ok(())
-    }
-
     // ---- W1: harness-event ingestion ----------------------------------------
+
 
     fn open_test_store() -> (tempfile::TempDir, Store) {
         let workdir = tempfile::tempdir().expect("tempdir");
@@ -5937,4 +6122,296 @@ mod tests {
         assert!(saw_errored, "expected node.errored on nonzero exit");
         Ok(())
     }
+
+    // ---- W4: actions + decision producer/feedback ---------------------------
+
+    #[test]
+    fn launch_prompt_includes_initial_prompt_as_task() {
+        let registry = crate::harness::HarnessRegistry::default();
+        let adapter = registry
+            .get(&HarnessKind::Codex)
+            .expect("default codex adapter exists");
+        let node_id = Uuid::new_v4();
+        let request = CreateNodeRequest {
+            harness: "codex".to_string(),
+            substrate: "local".to_string(),
+            role_hint: "worker".to_string(),
+            workspace: Some("/tmp".to_string()),
+            description: None,
+            created_by: None,
+            prompt: Some("Fix the failing migration test".to_string()),
+            launch_args: Vec::new(),
+        };
+        let prompt = launch_prompt_for_runtime(adapter.as_ref(), node_id, &request);
+        assert!(prompt.contains("You are node"));
+        assert!(prompt.contains("Your task:\nFix the failing migration test"));
+    }
+
+    #[test]
+    fn decision_feedback_text_maps_status_and_answer() {
+        assert_eq!(decision_feedback_text("approved", None), "yes");
+        assert_eq!(decision_feedback_text("denied", None), "no");
+        // A free-text answer overrides the status-derived yes/no, verbatim.
+        assert_eq!(
+            decision_feedback_text("approved", Some("use option B")),
+            "use option B"
+        );
+        // Blank answers fall back to the status mapping.
+        assert_eq!(decision_feedback_text("denied", Some("   ")), "no");
+    }
+
+    #[tokio::test]
+    async fn awaiting_input_produces_single_pending_decision_deduped(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_workdir, store) = open_test_store();
+        let node = insert_active_node(&store, HarnessKind::ClaudeCode);
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        // First permission prompt materialises a pending decision.
+        service
+            .post_harness_event(
+                node.id,
+                HarnessEventRequest {
+                    source: "claude_hook".to_string(),
+                    payload: json!({
+                        "hook_event_name": "Notification",
+                        "type": "permission_prompt",
+                        "message": "Allow Bash?",
+                        "session_id": "sess-1"
+                    }),
+                },
+            )
+            .await?;
+
+        // A second awaiting-input (agent_needs_input) must NOT stack a new
+        // decision; it reuses/updates the single pending one.
+        service
+            .post_harness_event(
+                node.id,
+                HarnessEventRequest {
+                    source: "claude_hook".to_string(),
+                    payload: json!({
+                        "hook_event_name": "Notification",
+                        "type": "agent_needs_input",
+                        "message": "Which branch should I target?",
+                        "session_id": "sess-1"
+                    }),
+                },
+            )
+            .await?;
+
+        let decisions = service.list_decisions().await?;
+        let pending: Vec<_> = decisions
+            .decisions
+            .iter()
+            .filter(|d| d.node_id.as_deref() == Some(node.id.to_string().as_str()))
+            .filter(|d| d.status == "pending")
+            .collect();
+        assert_eq!(
+            pending.len(),
+            1,
+            "at most one pending decision per node; got {pending:?}"
+        );
+        assert_eq!(
+            pending[0].text, "Which branch should I target?",
+            "the reused decision carries the latest question text"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spawn_hook_action_creates_real_node() -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let _home = EnvVarGuard::set_var("HOME", &home);
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let script_path = workdir.path().join("fake-codex.sh");
+        write_executable_script(&script_path, "#!/bin/sh\nexit 0\n")?;
+
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let hook = service
+            .create_hook(HookCreateRequest {
+                name: "spawn-on-pressure".to_string(),
+                enabled: true,
+                event: "node.ctx_pressure".to_string(),
+                filter: "any".to_string(),
+                actions: vec![HookAction {
+                    kind: "spawn".to_string(),
+                    target: String::new(),
+                    template: None,
+                    args: json!({
+                        "harness": "codex",
+                        "substrate": "local",
+                        "role": "helper",
+                        "workspace": workspace.display().to_string(),
+                        "prompt": "start the audit",
+                    }),
+                }],
+                future: false,
+            })
+            .await?;
+
+        let firing = service.hook_test(&hook.id).await?;
+        assert!(firing.firing.ok, "spawn action should execute: {firing:?}");
+
+        let nodes = store.list_nodes()?;
+        let spawned = nodes
+            .iter()
+            .find(|n| n.role_hint == "helper")
+            .expect("spawn action created a real node");
+        assert_eq!(spawned.harness, HarnessKind::Codex);
+        assert_eq!(spawned.substrate, SubstrateKind::Local);
+        let _ = service.stop_node(spawned.id).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_input_hook_action_delivers_text_to_node_stdin(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let _home = EnvVarGuard::set_var("HOME", &home);
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let sink_path = workdir.path().join("stdin.txt");
+        let script_path = workdir.path().join("fake-stdin.sh");
+        // A harness that stays alive and appends every stdin line to a file — the
+        // process stdin is the substrate's input sink.
+        let script = format!(
+            "#!/bin/sh\nprintf 'READY\\r\\n'\nwhile IFS= read -r line; do printf '%s\\n' \"$line\" >> '{}'; done\n",
+            sink_path.display()
+        );
+        write_executable_script(&script_path, &script)?;
+
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let response = service
+            .create_node(local_create_request_with_workspace(
+                "",
+                &workspace.display().to_string(),
+            ))
+            .await?;
+        let node_id = Uuid::parse_str(&response.node_id)?;
+
+        let hook = service
+            .create_hook(HookCreateRequest {
+                name: "poke-on-idle".to_string(),
+                enabled: true,
+                event: "node.idle".to_string(),
+                filter: "any".to_string(),
+                actions: vec![HookAction {
+                    kind: "send_input".to_string(),
+                    target: String::new(),
+                    template: Some("SEND-INPUT-TOKEN-42".to_string()),
+                    args: JsonValue::Null,
+                }],
+                future: false,
+            })
+            .await?;
+        // hook_test targets the running node as the event's node.
+        let firing = service.hook_test(&hook.id).await?;
+        assert!(firing.firing.ok, "send_input action should execute: {firing:?}");
+
+        let mut delivered = false;
+        for _ in 0..250 {
+            if std::fs::read_to_string(&sink_path)
+                .unwrap_or_default()
+                .contains("SEND-INPUT-TOKEN-42")
+            {
+                delivered = true;
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        let _ = service.stop_node(node_id).await;
+        assert!(
+            delivered,
+            "send_input action text did not reach node stdin; sink: {:?}",
+            std::fs::read_to_string(&sink_path).unwrap_or_default()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_decision_injects_feedback_into_node_stdin(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let _home = EnvVarGuard::set_var("HOME", &home);
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let sink_path = workdir.path().join("stdin.txt");
+        let script_path = workdir.path().join("fake-stdin.sh");
+        let script = format!(
+            "#!/bin/sh\nprintf 'READY\\r\\n'\nwhile IFS= read -r line; do printf '%s\\n' \"$line\" >> '{}'; done\n",
+            sink_path.display()
+        );
+        write_executable_script(&script_path, &script)?;
+
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let response = service
+            .create_node(local_create_request_with_workspace(
+                "",
+                &workspace.display().to_string(),
+            ))
+            .await?;
+        let node_id = Uuid::parse_str(&response.node_id)?;
+
+        let decision = service
+            .create_decision(DecisionCreateRequest {
+                node_id: Some(node_id.to_string()),
+                text: "Which option?".to_string(),
+            })
+            .await?;
+        service
+            .resolve_decision(
+                &decision.id,
+                DecisionResolveRequest {
+                    status: "approved".to_string(),
+                    answer: Some("RESOLVE-ANSWER-TOKEN-7".to_string()),
+                },
+            )
+            .await?;
+
+        let mut delivered = false;
+        for _ in 0..250 {
+            if std::fs::read_to_string(&sink_path)
+                .unwrap_or_default()
+                .contains("RESOLVE-ANSWER-TOKEN-7")
+            {
+                delivered = true;
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        let _ = service.stop_node(node_id).await;
+        assert!(
+            delivered,
+            "resolve_decision feedback did not reach node stdin; sink: {:?}",
+            std::fs::read_to_string(&sink_path).unwrap_or_default()
+        );
+        Ok(())
+    }
 }
+

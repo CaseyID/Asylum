@@ -220,20 +220,8 @@ export interface HookEventCatalogEntry {
   label: string;
 }
 
-// ─── recipes ───────────────────────────────────────────────────────
-
-export interface RecipeDescriptor {
-  id: string;
-  title: string;
-  prompt_template: string;
-  kind: string;
-}
-
-export interface RecipeListResponse {
-  recipes: RecipeDescriptor[];
-}
-
 // ─── decisions ────────────────────────────────────────────────────
+
 
 export interface DecisionRecord {
   id: string;

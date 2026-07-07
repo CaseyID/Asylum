@@ -296,8 +296,8 @@ pub fn build_router_for_transport(state: Arc<AppState>, require_auth: bool) -> R
         .route("/api/hooks/firings", get(api_hook_firings))
         .route("/api/hooks/events", get(api_hook_events))
         .route("/api/hooks/{id}/test", post(api_hook_test))
-        .route("/api/recipes", get(api_recipes_list))
         .route("/api/nodes/{id}/fork", post(api_node_fork));
+
     let protected = if require_auth {
         protected.layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1404,13 +1404,8 @@ pub async fn api_hook_test(
     Ok(Json(response))
 }
 
-pub async fn api_recipes_list(
-    Extension(state): Extension<Arc<AppState>>,
-) -> Json<asylum_types::api::RecipeListResponse> {
-    Json(state.service.list_recipes().await)
-}
-
 pub async fn api_node_fork(
+
     Extension(state): Extension<Arc<AppState>>,
     Path(id): Path<String>,
     Json(request): Json<ForkNodeRequest>,

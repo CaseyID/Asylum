@@ -29,7 +29,11 @@ impl RuntimePaths {
     /// `ASYLUM_SOCKET_PATH` should use `from_env` or
     /// `from_values_with_socket_override` and pass the value in directly, so
     /// tests can inject overrides instead of mutating process-global env.
+    /// Test-only helper: the shipped runtime always goes through
+    /// `from_values_with_socket_override` (via `from_env`).
+    #[cfg(test)]
     pub fn from_values(
+
         asylum_home: Option<PathBuf>,
         config_override: Option<PathBuf>,
         database_override: Option<PathBuf>,

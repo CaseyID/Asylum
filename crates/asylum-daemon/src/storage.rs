@@ -832,11 +832,52 @@ impl Store {
         Ok(affected > 0)
     }
 
+    /// The single pending decision for a node, if any. Used to dedup the
+    /// awaiting-input decision producer so at most one pending decision exists
+    /// per node at a time.
+    pub fn pending_decision_for_node(&self, node_id: Uuid) -> Result<Option<DecisionStorageRecord>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "
+            SELECT id,node_id,text,status,created_at,decided_at
+            FROM decisions
+            WHERE node_id = ?1 AND status = 'pending'
+            ORDER BY created_at DESC
+            LIMIT 1
+            ",
+            params![node_id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .context("pending decision for node")
+    }
+
+    /// Refresh the question text of an existing (pending) decision. Used when a
+    /// fresh awaiting-input arrives while a decision is already pending.
+    pub fn update_decision_text(&self, id: &str, text: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        let affected = conn.execute(
+            "UPDATE decisions SET text = ?1 WHERE id = ?2 AND status = 'pending'",
+            params![text, id],
+        )?;
+        Ok(affected > 0)
+    }
+
     pub fn insert_decision(
         &self,
         node_id: Option<Uuid>,
         text: &str,
     ) -> Result<DecisionStorageRecord> {
+
         let id = Uuid::new_v4().to_string();
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let node_id = node_id.map(|id| id.to_string());

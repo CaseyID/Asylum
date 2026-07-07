@@ -64,9 +64,8 @@ pub enum CapabilityName {
     HookFirings,
     HookEvents,
     HookTest,
-    RecipeList,
-    RecipeSpawn,
     NodeFork,
+
     NodeSpawnPeer,
 }
 

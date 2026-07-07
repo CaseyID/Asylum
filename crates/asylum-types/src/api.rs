@@ -25,9 +25,15 @@ pub struct CreateNodeRequest {
     pub workspace: Option<String>,
     pub description: Option<String>,
     pub created_by: Option<String>,
+    /// Optional first instruction delivered to the node as a submitted message
+    /// once its harness is ready (rides W0's launch-prompt path). Lets a
+    /// supervisor hand a worker its opening task at spawn time.
+    #[serde(default)]
+    pub prompt: Option<String>,
     #[serde(default)]
     pub launch_args: Vec<String>,
 }
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeCreateResponse {
@@ -46,11 +52,16 @@ pub struct SpawnPeerRequest {
     pub workspace: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    /// Optional first instruction for the spawned peer, delivered as its opening
+    /// submitted message (routes into CreateNodeRequest.prompt).
+    #[serde(default)]
+    pub prompt: Option<String>,
     #[serde(default)]
     pub relationship_kind: Option<String>,
     #[serde(default)]
     pub relationship_label: Option<String>,
 }
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpawnPeerResponse {
@@ -332,7 +343,12 @@ pub struct DecisionCreateRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DecisionResolveRequest {
     pub status: String,
+    /// Optional free-text answer injected verbatim into the node's PTY. When
+    /// present it overrides the status-derived affirmative/negative feedback.
+    #[serde(default)]
+    pub answer: Option<String>,
 }
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChannelDescriptor {
@@ -529,37 +545,8 @@ pub struct HookTestResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RecipeDescriptor {
-    pub id: String,
-    pub title: String,
-    pub prompt_template: String,
-    pub kind: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RecipeListResponse {
-    pub recipes: Vec<RecipeDescriptor>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RecipeSpawnRequest {
-    pub harness: String,
-    pub substrate: String,
-    #[serde(default)]
-    pub workspace: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub role_hint: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RecipeSpawnResponse {
-    pub node_ids: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ForkNodeRequest {
+
     #[serde(default)]
     pub role_hint: Option<String>,
     #[serde(default)]

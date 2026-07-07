@@ -100,7 +100,8 @@ pub async fn run_stdio_server(client: Arc<AsylumClient>) -> Result<()> {
 }
 
 fn tool_definitions() -> Vec<ToolSpec> {
-    let mut tools = vec![
+    let tools = vec![
+
         // — node lifecycle —
         ToolSpec {
             name: "node.create",
@@ -114,9 +115,11 @@ fn tool_definitions() -> Vec<ToolSpec> {
                     "workspace": {"type":"string"},
                     "description": {"type":"string"},
                     "created_by": {"type":"string"},
+                    "prompt": {"type":"string","description":"Optional first instruction delivered to the node as a submitted message once its harness is ready"},
                 },
                 "required":["harness","substrate"]
             }),
+
         },
         ToolSpec {
             name: "node.list",
@@ -206,10 +209,12 @@ fn tool_definitions() -> Vec<ToolSpec> {
                     "role_hint":{"type":"string"},
                     "workspace":{"type":"string"},
                     "description":{"type":"string"},
+                    "prompt":{"type":"string","description":"Optional first instruction for the spawned peer, delivered as its opening submitted message once its harness is ready"},
                     "relationship_kind":{"type":"string","description":"spawned_for or supervises; defaults to spawned_for"},
                     "relationship_label":{"type":"string"},
                 }
             }),
+
         },
         ToolSpec {
             name: "node.attach_url",
@@ -437,12 +442,8 @@ fn tool_definitions() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
-            name: "recipe.list",
-            description: "List configured launch recipes",
-            input_schema: json!({"type":"object","properties":{}}),
-        },
-        ToolSpec {
             name: "remote_command.send",
+
             description: "Execute a remote command against the daemon",
             input_schema: json!({
                 "type":"object",
@@ -464,9 +465,13 @@ fn tool_definitions() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "decision.list",
-            description: "List operator decisions",
-            input_schema: json!({"type":"object","properties":{}}),
+            description: "List operator decisions; pass pending=true to return only unresolved ones",
+            input_schema: json!({
+                "type":"object",
+                "properties":{"pending":{"type":"boolean","description":"When true, return only pending (unresolved) decisions"}}
+            }),
         },
+
         ToolSpec {
             name: "decision.inspect",
             description: "Inspect one operator decision",
@@ -478,15 +483,17 @@ fn tool_definitions() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "decision.resolve",
-            description: "Resolve an operator decision",
+            description: "Resolve an operator decision; the resolution is injected into the node's input (answer verbatim, else yes/no from status)",
             input_schema: json!({
                 "type":"object",
                 "properties":{
                     "decision_id":{"type":"string"},
                     "status":{"type":"string","enum":["approved","denied"]},
+                    "answer":{"type":"string","description":"Optional free-text answer delivered to the node verbatim, overriding the status-derived yes/no"},
                 },
                 "required":["decision_id","status"]
             }),
+
         },
         // — system —
         ToolSpec {
@@ -506,26 +513,9 @@ fn tool_definitions() -> Vec<ToolSpec> {
         // Skipped (out of scope for v1 MCP): token management (security-sensitive),
         // substrate/harness descriptors (static metadata), artifact refs.
     ];
-    if recipe_spawn_is_enabled() {
-        tools.push(ToolSpec {
-            name: "recipe.spawn",
-            description: "Spawn nodes from a configured recipe",
-            input_schema: json!({
-                "type":"object",
-                "properties":{
-                    "recipe_id":{"type":"string"},
-                    "harness":{"type":"string"},
-                    "substrate":{"type":"string"},
-                    "workspace":{"type":"string"},
-                    "description":{"type":"string"},
-                    "role_hint":{"type":"string"},
-                },
-                "required":["recipe_id","harness","substrate"]
-            }),
-        });
-    }
     tools
 }
+
 
 /// M7: Returns None for JSON-RPC notifications (id is absent); caller must not send a response.
 async fn handle_request(client: &AsylumClient, request: RpcRequest) -> Option<RpcResponse> {
@@ -721,9 +711,11 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
                 role_hint: Option<String>,
                 workspace: Option<String>,
                 description: Option<String>,
+                prompt: Option<String>,
                 relationship_kind: Option<String>,
                 relationship_label: Option<String>,
             }
+
             let args: SpawnPeerArgs = match serde_json::from_value(params.arguments) {
                 Ok(args) => args,
                 Err(err) => {
@@ -751,9 +743,11 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
                 role_hint: args.role_hint,
                 workspace: args.workspace,
                 description: args.description,
+                prompt: args.prompt,
                 relationship_kind: args.relationship_kind,
                 relationship_label: args.relationship_label,
             };
+
             match client.spawn_peer(source_node, request).await {
                 Ok(response) => content_result(json!({
                     "node_id": response.node_id,
@@ -1095,42 +1089,8 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
                 Err(err) => rpc_error(-32000, &format!("context.launch_packet failed: {err}")),
             }
         }
-        "recipe.list" => match client.list_recipes().await {
-            Ok(response) => content_result(json!({ "recipes": response.recipes })),
-            Err(err) => rpc_error(-32000, &format!("recipe.list failed: {err}")),
-        },
-        "recipe.spawn" => {
-            if !recipe_spawn_is_enabled() {
-                return rpc_error(-32601, "recipe.spawn is not supported");
-            }
-            #[derive(Deserialize)]
-            struct SpawnArgs {
-                recipe_id: String,
-                harness: String,
-                substrate: String,
-                workspace: Option<String>,
-                description: Option<String>,
-                role_hint: Option<String>,
-            }
-            let args: SpawnArgs = match serde_json::from_value(params.arguments) {
-                Ok(args) => args,
-                Err(err) => {
-                    return rpc_error(-32602, &format!("recipe.spawn: invalid args: {err}"));
-                }
-            };
-            let request = asylum_types::api::RecipeSpawnRequest {
-                harness: args.harness,
-                substrate: args.substrate,
-                workspace: args.workspace,
-                description: args.description,
-                role_hint: args.role_hint,
-            };
-            match client.spawn_recipe(&args.recipe_id, request).await {
-                Ok(response) => content_result(json!({ "node_ids": response.node_ids })),
-                Err(err) => rpc_error(-32000, &format!("recipe.spawn failed: {err}")),
-            }
-        }
         "remote_command.send" => {
+
             #[derive(Deserialize)]
             struct RemoteCommandArgs {
                 command: String,
@@ -1175,10 +1135,25 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
                 Err(err) => rpc_error(-32000, &format!("decision.create failed: {err}")),
             }
         }
-        "decision.list" => match client.list_decisions().await {
-            Ok(response) => content_result(json!({ "decisions": response.decisions })),
-            Err(err) => rpc_error(-32000, &format!("decision.list failed: {err}")),
-        },
+        "decision.list" => {
+            let pending_only = params
+                .arguments
+                .get("pending")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            match client.list_decisions().await {
+                Ok(response) => {
+                    let decisions: Vec<_> = response
+                        .decisions
+                        .into_iter()
+                        .filter(|d| !pending_only || d.status == "pending")
+                        .collect();
+                    content_result(json!({ "decisions": decisions }))
+                }
+                Err(err) => rpc_error(-32000, &format!("decision.list failed: {err}")),
+            }
+        }
+
         "decision.inspect" => {
             let decision_id = extract_arg_string(&params.arguments, "decision_id")
                 .or_else(|| extract_arg_string(&params.arguments, "id"))
@@ -1196,6 +1171,8 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
             struct DecisionResolveArgs {
                 decision_id: String,
                 status: String,
+                #[serde(default)]
+                answer: Option<String>,
             }
             let args: DecisionResolveArgs = match serde_json::from_value(params.arguments) {
                 Ok(args) => args,
@@ -1205,7 +1182,9 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
             };
             let request = asylum_types::api::DecisionResolveRequest {
                 status: args.status,
+                answer: args.answer,
             };
+
             match client.resolve_decision(&args.decision_id, request).await {
                 Ok(decision) => content_result(json!({ "decision": decision })),
                 Err(err) => rpc_error(-32000, &format!("decision.resolve failed: {err}")),
@@ -1228,6 +1207,7 @@ async fn handle_node_create(client: &AsylumClient, arguments: Value) -> RpcRespo
         workspace: Option<String>,
         description: Option<String>,
         created_by: Option<String>,
+        prompt: Option<String>,
     }
     let args: CreateArgs = match serde_json::from_value(arguments) {
         Ok(args) => args,
@@ -1242,8 +1222,10 @@ async fn handle_node_create(client: &AsylumClient, arguments: Value) -> RpcRespo
         workspace: args.workspace,
         description: args.description,
         created_by: args.created_by,
+        prompt: args.prompt,
         launch_args: Vec::new(),
     };
+
     match client.create_node(request).await {
         Ok(response) => content_result(json!({ "node_id": response.node_id })),
         Err(err) => rpc_error(-32000, &format!("node.create failed: {err}")),
@@ -1311,11 +1293,8 @@ fn rpc_error(code: i32, message: &str) -> RpcResponse {
     }
 }
 
-fn recipe_spawn_is_enabled() -> bool {
-    false
-}
-
 #[cfg(test)]
+
 mod tests {
     use super::*;
 
@@ -1346,43 +1325,51 @@ mod tests {
         assert!(names.contains(&"workspace.recent"));
         assert!(names.contains(&"context.system_map"));
         assert!(names.contains(&"context.launch_packet"));
-        assert!(names.contains(&"recipe.list"));
+        assert!(!names.contains(&"recipe.list"));
         assert!(!names.contains(&"recipe.spawn"));
         assert!(names.contains(&"remote_command.send"));
+
         assert!(names.contains(&"decision.create"));
         assert!(names.contains(&"decision.list"));
         assert!(names.contains(&"decision.inspect"));
         assert!(names.contains(&"decision.resolve"));
     }
 
-    #[tokio::test]
-    async fn recipe_spawn_tool_call_fails_when_disabled() {
-        use std::sync::Arc;
-        let client = Arc::new(AsylumClient::new(
-            "http://127.0.0.1:1",
-            Option::<String>::None,
-        ));
-        let response = handle_tools_call(
-            &client,
-            Some(json!({
-                "name": "recipe.spawn",
-                "arguments": {
-                    "recipe_id": "start-command-center",
-                    "harness": "codex",
-                    "substrate": "local",
-                },
-            })),
-        )
-        .await;
-
-        assert!(response.error.is_some());
-        let error = response.error.unwrap();
-        assert_eq!(error.code, -32601);
-        assert!(error.message.contains("not supported"));
+    #[test]
+    fn node_create_and_spawn_peer_expose_prompt_param() {
+        let tools = tool_definitions();
+        let find = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} tool exists"))
+                .input_schema
+                .clone()
+        };
+        assert!(
+            find("node.create")["properties"]
+                .get("prompt")
+                .is_some(),
+            "node.create schema must document the prompt param"
+        );
+        assert!(
+            find("node.spawn_peer")["properties"]
+                .get("prompt")
+                .is_some(),
+            "node.spawn_peer schema must document the prompt param"
+        );
+        assert!(
+            find("decision.resolve")["properties"]
+                .get("answer")
+                .is_some(),
+            "decision.resolve schema must document the free-text answer param"
+        );
     }
+
 
     #[test]
     fn parse_node_id_works() {
+
         let parsed = parse_node_id(&json!({"node_id": "00000000-0000-0000-0000-000000000001"}));
         assert!(parsed.is_ok());
     }
