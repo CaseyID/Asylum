@@ -63,7 +63,7 @@ Gate: the north-star scenario, witnessed end-to-end.
 
 ## Open questions for Casey
 
-- Codex host auth likely invalidated (2026-07-07): running codex inside a Loon guest with a copied ~/.codex/auth.json refreshed the ChatGPT OAuth token, and the host copy now fails with "refresh token was already used". Needs an interactive `codex login` from Casey when convenient. Claude auth unaffected. Until then, live codex checks are auth-blocked (mechanisms verified via hooks/unit tests instead). Consider not copying codex auth into guests, or re-copying it back out after guest use, in Phase D hardening.
+- Codex host auth likely invalidated (2026-07-07): running codex inside a Loon guest with a copied ~/.codex/auth.json refreshed the ChatGPT OAuth token, and the host copy now fails with "refresh token was already used". Needs an interactive `codex login` from Casey when convenient. DECISION (Casey, 2026-07-07): deprioritized — do not spend further mission time on codex live verification; the mechanism is unit-tested and partially live-proven (notify bridge, quiescence idle, submit path). Claude-first everywhere including the acceptance scenario; re-run the one-node codex check after re-auth, post-mission. Claude auth unaffected. Until then, live codex checks are auth-blocked (mechanisms verified via hooks/unit tests instead). Consider not copying codex auth into guests, or re-copying it back out after guest use, in Phase D hardening.
 
 Resolved: passwordless sudo configured 2026-07-06 via /etc/sudoers.d/99-casey-nopasswd (remove with `sudo rm /etc/sudoers.d/99-casey-nopasswd` when the mission is over).
 
