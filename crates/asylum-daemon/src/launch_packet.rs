@@ -31,11 +31,11 @@ Do not poll `node.inspect` / `node.events` in a loop -- register hooks once;
 they fire on real events, and every extra tool call costs a harness turn.
 
 - `hook.create(name, event, filter?, actions[], enabled?)`. `event` must be one
-  of the 13 events that can actually fire: `graph.spawn`,
+  of the 14 events that can actually fire: `graph.spawn`,
   `node.session_started`, `node.turn_complete`, `node.awaiting_input`,
   `node.idle`, `node.ctx_pressure`, `node.tool_call`, `node.session_end`,
-  `node.exited`, `node.errored`, `channel.inbound`, `schedule.5m`,
-  `schedule.30m`. `node.idle` is a real native signal for local Claude workers
+  `node.exited`, `node.errored`, `node.resumed`, `channel.inbound`,
+  `schedule.5m`, `schedule.30m`. `node.idle` is a real native signal for local Claude workers
   (Notification hook); for Codex it is a daemon quiescence timer (~120s of no
   output), so treat Codex idle timing as approximate.
 - `filter` is a small expression over the event payload: `key==value`,
@@ -222,11 +222,22 @@ mod tests {
             "node.session_end",
             "node.exited",
             "node.errored",
+            "node.resumed",
             "channel.inbound",
             "schedule.5m",
             "schedule.30m",
         ] {
             assert!(markdown.contains(event), "missing event reference: {event}");
+        }
+
+        // n1 drift guard: the manual must name EVERY catalog event, so a newly
+        // added hookable event cannot be silently under-advertised again.
+        for entry in crate::hooks::event_catalog() {
+            assert!(
+                markdown.contains(&entry.id),
+                "manual omits catalog event: {}",
+                entry.id
+            );
         }
         for action_kind in ["send_input", "spawn", "channel", "pause_node", "archive"] {
             assert!(

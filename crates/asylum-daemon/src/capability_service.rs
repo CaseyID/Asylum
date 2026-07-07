@@ -62,7 +62,10 @@ use asylum_types::api::{
 use asylum_types::config::{AutonomyConfig, HarnessConfig, LoonConfig};
 use asylum_types::node::NodeRecord;
 
-const CHANNEL_REPLY_TOKEN_LENGTH: usize = 5;
+// m5: 32 hex chars = the full UUIDv4 (~122 bits of entropy), not the old 5
+// chars (~20 bits) that were brute-forceable within the 30-min TTL. Stays
+// ascii-alphanumeric so the inbound reply-marker parser is unaffected.
+const CHANNEL_REPLY_TOKEN_LENGTH: usize = 32;
 const CHANNEL_REPLY_CORRELATION_TTL_SECONDS: i64 = 60 * 30;
 // Awaiting-input / permission-prompt decisions surface under the single
 // `node.awaiting_input` catalog event (permission_requested was merged in).
@@ -142,6 +145,90 @@ fn is_active_liveness(liveness: &NodeLiveness) -> bool {
         liveness,
         NodeLiveness::Starting | NodeLiveness::Running | NodeLiveness::WaitingForInput
     )
+}
+
+/// The DB name of the per-node Loon guest token (M3). Encodes the node id so
+/// every teardown/exit/reconcile path can revoke exactly that credential.
+fn loon_node_token_name(node_id: Uuid) -> String {
+    format!("loon-node-{node_id}")
+}
+
+/// Extract the node id from a `/api/nodes/{id}/...` path, if present (M3 scope
+/// enforcement). Returns the raw `{id}` segment (validated as a UUID) or None.
+fn node_id_from_path(path: &str) -> Option<String> {
+    let mut segments = path.split('/').filter(|s| !s.is_empty());
+    // Expect .../nodes/{id}
+    while let Some(seg) = segments.next() {
+        if seg == "nodes" {
+            let candidate = segments.next()?;
+            return Uuid::parse_str(candidate).ok().map(|_| candidate.to_string());
+        }
+    }
+    None
+}
+
+/// The live states a process-termination event is allowed to transition FROM.
+/// Used as the compare-and-set guard in the exit sink so a terminal state set by
+/// an operator stop/archive is never clobbered by a later exit signal.
+const EXIT_SINK_ACTIVE_STATES: [NodeLiveness; 3] = [
+    NodeLiveness::Running,
+    NodeLiveness::Starting,
+    NodeLiveness::WaitingForInput,
+];
+
+/// Apply a process-exit outcome to a node's liveness honestly (C1/M2). The
+/// mapping never fabricates a clean exit:
+/// - authoritative clean exit (code 0)  -> Stopped + node.exited
+/// - authoritative abnormal exit         -> Failed  + node.errored (abnormal_exit)
+/// - lost exit stream (loon SSE dropped) -> Failed  + node.errored (stream_lost)
+///
+/// The transition is a compare-and-set from the live states, so it no-ops when a
+/// terminal state already won the race. The hook event fires only on a real
+/// transition, so a duplicate/late signal cannot double-announce an exit.
+fn apply_exit_outcome(
+    store: &Store,
+    engine: &HookEngine,
+    node_id: Uuid,
+    outcome: ExitOutcome,
+) {
+    let (target, event, reason) = if outcome.stream_lost {
+        (NodeLiveness::Failed, "node.errored", "stream_lost")
+    } else if outcome.success {
+        (NodeLiveness::Stopped, "node.exited", "exited")
+    } else {
+        (NodeLiveness::Failed, "node.errored", "abnormal_exit")
+    };
+    // M3: an authoritative exit means the loon exit_task is tearing the VM down
+    // (or a local process is gone) -- revoke the per-node guest token so a leaked
+    // credential cannot outlive the node. On stream_lost the VM is deliberately
+    // kept, so the token is kept too. No-op for local nodes (no such token).
+    if !outcome.stream_lost {
+        let _ = store.revoke_tokens_by_name(&loon_node_token_name(node_id));
+    }
+    match store.transition_node_liveness(
+        node_id,
+        target,
+        &EXIT_SINK_ACTIVE_STATES,
+        Some(reason),
+        json!({ "exit_code": outcome.code }),
+    ) {
+        Ok(true) => {
+            engine.post(HookEvent {
+                event: event.to_string(),
+                node_id: Some(node_id),
+                payload: json!({
+                    "node": {"id": node_id.to_string()},
+                    "reason": reason,
+                    "exit_code": outcome.code,
+                }),
+            });
+        }
+        // Already terminal (operator stop/archive won): leave the truth alone.
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, node_id = %node_id, "exit sink liveness CAS failed");
+        }
+    }
 }
 
 /// The result of mapping a raw harness payload to Asylum's event model. All
@@ -348,41 +435,11 @@ impl CapabilityService {
                 let engine = exit_engine.clone();
                 tokio::runtime::Handle::current().spawn(async move {
                     // The exit sink is the sole owner of process-termination truth.
-                    // Only act when the process died while the daemon still
-                    // considered it live; user stop/archive already set a terminal
-                    // liveness and posted node.exited, so those are left untouched.
-                    if let Ok(Some(node)) = store.get_node(node_id) {
-                        if matches!(
-                            node.liveness,
-                            NodeLiveness::Running
-                                | NodeLiveness::Starting
-                                | NodeLiveness::WaitingForInput
-                        ) {
-                            if outcome.success {
-                                let _ = store.set_node_liveness(node_id, NodeLiveness::Stopped);
-                                engine.post(HookEvent {
-                                    event: "node.exited".to_string(),
-                                    node_id: Some(node_id),
-                                    payload: json!({
-                                        "node": {"id": node_id.to_string()},
-                                        "reason": "exited",
-                                        "exit_code": outcome.code,
-                                    }),
-                                });
-                            } else {
-                                let _ = store.set_node_liveness(node_id, NodeLiveness::Failed);
-                                engine.post(HookEvent {
-                                    event: "node.errored".to_string(),
-                                    node_id: Some(node_id),
-                                    payload: json!({
-                                        "node": {"id": node_id.to_string()},
-                                        "reason": "abnormal_exit",
-                                        "exit_code": outcome.code,
-                                    }),
-                                });
-                            }
-                        }
-                    }
+                    // The transition is a compare-and-set FROM the live states, so
+                    // a user stop/archive (already terminal) wins the race and this
+                    // becomes a no-op; only a process that died while still live is
+                    // transitioned + announced.
+                    apply_exit_outcome(&store, &engine, node_id, outcome);
                 });
             },
         );
@@ -447,38 +504,11 @@ impl CapabilityService {
                     let store = loon_exit_store.clone();
                     let engine = loon_exit_engine.clone();
                     tokio::runtime::Handle::current().spawn(async move {
-                        if let Ok(Some(node)) = store.get_node(node_id) {
-                            if matches!(
-                                node.liveness,
-                                NodeLiveness::Running
-                                    | NodeLiveness::Starting
-                                    | NodeLiveness::WaitingForInput
-                            ) {
-                                if outcome.success {
-                                    let _ = store.set_node_liveness(node_id, NodeLiveness::Stopped);
-                                    engine.post(HookEvent {
-                                        event: "node.exited".to_string(),
-                                        node_id: Some(node_id),
-                                        payload: json!({
-                                            "node": {"id": node_id.to_string()},
-                                            "reason": "exited",
-                                            "exit_code": outcome.code,
-                                        }),
-                                    });
-                                } else {
-                                    let _ = store.set_node_liveness(node_id, NodeLiveness::Failed);
-                                    engine.post(HookEvent {
-                                        event: "node.errored".to_string(),
-                                        node_id: Some(node_id),
-                                        payload: json!({
-                                            "node": {"id": node_id.to_string()},
-                                            "reason": "abnormal_exit",
-                                            "exit_code": outcome.code,
-                                        }),
-                                    });
-                                }
-                            }
-                        }
+                        // Same CAS exit truth as local. C1: a lost SSE exit stream
+                        // arrives here as outcome.stream_lost -> node.errored with
+                        // reason "stream_lost" (never a clean-exit lie); the VM is
+                        // deliberately kept (teardown is skipped in exit_task).
+                        apply_exit_outcome(&store, &engine, node_id, outcome);
                     });
                 },
             )))
@@ -717,14 +747,30 @@ impl CapabilityService {
             self.produce_decision_from_awaiting_input(node_id, &payload);
         }
 
-        // Liveness update, guarded so we don't spam LivenessChanged events for a
-
-        // no-op transition (e.g. repeated tool_call while already Running).
+        // Liveness update as a compare-and-set (M2): only transition FROM an
+        // active state, so a concurrent terminal write from the exit sink wins
+        // and a stale-snapshot harness event can never resurrect a dead node.
+        // The CAS also no-ops a same-state transition (no LivenessChanged spam).
         if let Some(target) = mapped.liveness {
-            if node.liveness != target {
-                if let Err(e) = self.store.set_node_liveness(node_id, target) {
-                    tracing::warn!(error = %e, node_id = %node_id, "failed to update liveness from harness event");
-                }
+            // m1: node.idle must not downgrade WaitingForInput -> Running. An idle
+            // signal while a decision is pending would otherwise show a healthy
+            // Running node that is actually blocked. Restrict idle to Starting/
+            // Running sources; all other events may also transition from
+            // WaitingForInput (e.g. turn_complete legitimately clears it).
+            let allowed_from: &[NodeLiveness] = if kind == "node.idle" {
+                &[NodeLiveness::Starting, NodeLiveness::Running]
+            } else {
+                &[
+                    NodeLiveness::Starting,
+                    NodeLiveness::Running,
+                    NodeLiveness::WaitingForInput,
+                ]
+            };
+            if let Err(e) =
+                self.store
+                    .transition_node_liveness(node_id, target, allowed_from, None, json!({}))
+            {
+                tracing::warn!(error = %e, node_id = %node_id, "failed to update liveness from harness event");
             }
         }
 
@@ -748,38 +794,44 @@ impl CapabilityService {
             .filter(|m| !m.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| "Node is awaiting human input".to_string());
-        match self.store.pending_decision_for_node(node_id) {
-            Ok(Some(existing)) => {
-                // Reuse: refresh the question, no duplicate notification.
-                if let Err(e) = self.store.update_decision_text(&existing.0, &text) {
-                    tracing::warn!(error = %e, node_id = %node_id, "failed to refresh pending decision text");
-                }
-            }
-            Ok(None) => match self.store.insert_decision(Some(node_id), &text) {
-                Ok(record) => {
-                    let decision = map_decision(record);
-                    let _ = self.store.insert_notification(
-                        Some(node_id),
-                        "decision",
-                        "Decision requested",
-                        &decision.text,
-                    );
-                    let _ = self.store.record_event(
-                        node_id,
-                        NodeEventKind::HumanInputRequested,
-                        json!({
-                            "decision": decision.id,
-                            "text": decision.text,
-                            "source": "harness_event",
-                        }),
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, node_id = %node_id, "failed to create pending decision from awaiting_input");
-                }
-            },
+        // M2 guard: never materialise a decision on a node that has since gone
+        // terminal (a permission_prompt racing an exit). Re-read liveness right
+        // before the write; the exit sink CAS + this check make a decision on a
+        // dead node vanishingly unlikely (a residual sub-millisecond TOCTOU
+        // window remains, but no clean-exit lie is produced).
+        match self.store.get_node(node_id) {
+            Ok(Some(node)) if is_active_liveness(&node.liveness) => {}
+            Ok(_) => return,
             Err(e) => {
-                tracing::warn!(error = %e, node_id = %node_id, "failed to look up pending decision for node");
+                tracing::warn!(error = %e, node_id = %node_id, "failed to re-read node before decision");
+                return;
+            }
+        }
+        // Atomic create-or-refresh (M6): the partial unique index guarantees at
+        // most one pending decision per node even under concurrent posts.
+        match self.store.upsert_pending_node_decision(node_id, &text) {
+            Ok((record, true)) => {
+                let decision = map_decision(record);
+                let _ = self.store.insert_notification(
+                    Some(node_id),
+                    "decision",
+                    "Decision requested",
+                    &decision.text,
+                );
+                let _ = self.store.record_event(
+                    node_id,
+                    NodeEventKind::HumanInputRequested,
+                    json!({
+                        "decision": decision.id,
+                        "text": decision.text,
+                        "source": "harness_event",
+                    }),
+                );
+            }
+            // Refreshed an existing pending decision: no duplicate notification.
+            Ok((_, false)) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, node_id = %node_id, "failed to create/refresh pending decision from awaiting_input");
             }
         }
     }
@@ -814,25 +866,32 @@ impl CapabilityService {
         self.store
             .record_event(node_id, NodeEventKind::HarnessEvent, telemetry_body)?;
 
-        let prior = self.store.harness_event_bodies(node_id).unwrap_or_default();
+        // M7: dedup ctx_pressure threshold crossings from the node row instead of
+        // loading and JSON-parsing EVERY prior harness-event body per statusline
+        // post (which grew O(n) per post, O(n^2) per session). The row tracks the
+        // session the state belongs to and the highest threshold already fired in
+        // it; thresholds fire once, monotonically, and reset on a session change.
+        let (stored_session, stored_max) = self
+            .store
+            .ctx_pressure_state(node_id)
+            .unwrap_or((None, None));
+        let session_matches = stored_session.as_deref() == session_id;
+        let already_fired_max = if session_matches {
+            stored_max.unwrap_or(f64::NEG_INFINITY)
+        } else {
+            // New session: the prior session's fired-state does not apply.
+            f64::NEG_INFINITY
+        };
+
         let mut thresholds = self.config.autonomy.ctx_pressure_thresholds.clone();
         thresholds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut fired: Option<String> = None;
+        let mut new_max = already_fired_max;
         for threshold in thresholds {
-            if used < threshold {
-                continue;
-            }
-            let already_fired = prior.iter().any(|body| {
-                body.get("event").and_then(|v| v.as_str()) == Some("node.ctx_pressure")
-                    && body
-                        .get("threshold")
-                        .and_then(|v| v.as_f64())
-                        .map(|t| (t - threshold).abs() < f64::EPSILON)
-                        .unwrap_or(false)
-                    && body.get("session_id").and_then(|v| v.as_str()) == session_id
-            });
-            if already_fired {
+            // Fire only thresholds we have reached AND not already fired this
+            // session (strictly above the prior fired maximum).
+            if used < threshold || threshold <= already_fired_max {
                 continue;
             }
             let body = json!({
@@ -847,6 +906,17 @@ impl CapabilityService {
                 .record_event(node_id, NodeEventKind::HarnessEvent, body.clone())?;
             self.post_hook_event("node.ctx_pressure", Some(node_id), body);
             fired = Some("node.ctx_pressure".to_string());
+            if threshold > new_max {
+                new_max = threshold;
+            }
+        }
+        // Persist the advanced fired-state (and the current session) whenever we
+        // fired something or moved to a new session, so the next post dedups
+        // against a bounded row read.
+        if new_max > already_fired_max || !session_matches {
+            let persisted_max = if new_max.is_finite() { new_max } else { 0.0 };
+            self.store
+                .set_ctx_pressure_state(node_id, session_id, persisted_max)?;
         }
         Ok(fired)
     }
@@ -2026,7 +2096,13 @@ impl CapabilityService {
                     }
                 }
                 if let Err(launch_err) = self.local_substrate.launch(context).await {
-                    let _ = self.store.set_node_liveness(node.id, NodeLiveness::Failed);
+                    let _ = self.store.transition_node_liveness(
+                        node.id,
+                        NodeLiveness::Failed,
+                        &[NodeLiveness::Starting],
+                        Some("launch_failed"),
+                        json!({}),
+                    );
                     let _ = self.store.record_event(
                         node.id,
                         NodeEventKind::HarnessFailure,
@@ -2034,8 +2110,15 @@ impl CapabilityService {
                     );
                     return Err(launch_err);
                 }
-                self.store
-                    .set_node_liveness(node.id, NodeLiveness::Running)?;
+                // M1: CAS Starting -> Running so a child that died during launch
+                // (exit sink already terminal) is not overwritten back to Running.
+                self.store.transition_node_liveness(
+                    node.id,
+                    NodeLiveness::Running,
+                    &[NodeLiveness::Starting],
+                    None,
+                    json!({}),
+                )?;
             }
             SubstrateKind::Loon => {
                 let loon = self
@@ -2052,11 +2135,23 @@ impl CapabilityService {
                     Ok(external_id) => {
                         self.store
                             .set_node_external_id(node.id, Some(external_id))?;
-                        self.store
-                            .set_node_liveness(node.id, NodeLiveness::Running)?;
+                        // M1: CAS Starting -> Running (see local path).
+                        self.store.transition_node_liveness(
+                            node.id,
+                            NodeLiveness::Running,
+                            &[NodeLiveness::Starting],
+                            None,
+                            json!({}),
+                        )?;
                     }
                     Err(launch_err) => {
-                        let _ = self.store.set_node_liveness(node.id, NodeLiveness::Failed);
+                        let _ = self.store.transition_node_liveness(
+                            node.id,
+                            NodeLiveness::Failed,
+                            &[NodeLiveness::Starting],
+                            Some("launch_failed"),
+                            json!({}),
+                        );
                         let _ = self.store.record_event(
                             node.id,
                             NodeEventKind::HarnessFailure,
@@ -2169,6 +2264,8 @@ impl CapabilityService {
                 // Adopt-and-resume-in-guest is future work (needs exec-id
                 // persistence across restarts).
                 let _ = loon.force_teardown(&external_id).await;
+                // M3: token dies with the reclaimed VM.
+                let _ = self.store.revoke_tokens_by_name(&loon_node_token_name(node.id));
                 self.mark_reconciled(
                     node,
                     "reconciled_loon_vm_orphaned_torn_down",
@@ -2179,6 +2276,7 @@ impl CapabilityService {
             Ok(false) => {
                 // VM already gone; prune any tombstone and mark honestly.
                 let _ = loon.force_teardown(&external_id).await;
+                let _ = self.store.revoke_tokens_by_name(&loon_node_token_name(node.id));
                 self.mark_reconciled(node, "reconciled_loon_vm_gone", false, Some(&external_id));
             }
             Err(e) => {
@@ -2304,6 +2402,24 @@ impl CapabilityService {
                     return Err(anyhow!("pre_trust_workspace failed: {e}"));
                 }
 
+                // M1: move to Starting BEFORE launch so the exit sink (which only
+                // acts on live states) can own the terminal decision if the
+                // resumed child dies in the launch window. Without this the node
+                // sat at a terminal Stopped, the exit sink no-oped, and the
+                // post-launch Running write below resurrected an eternal-Running
+                // lie that only a daemon restart could clear.
+                let _ = self.store.transition_node_liveness(
+                    node.id,
+                    NodeLiveness::Starting,
+                    &[
+                        NodeLiveness::Stopped,
+                        NodeLiveness::Exited,
+                        NodeLiveness::Failed,
+                    ],
+                    Some("resuming"),
+                    json!({ "harness_session_id": session_id }),
+                );
+
                 let context = SubstrateContext {
                     node_id: node.id,
                     harness: harness.clone(),
@@ -2318,7 +2434,15 @@ impl CapabilityService {
                     launch_prompt: None,
                 };
                 if let Err(launch_err) = self.local_substrate.launch(context).await {
-                    let _ = self.store.set_node_liveness(node.id, NodeLiveness::Failed);
+                    // CAS from Starting so a concurrent exit-sink terminal write is
+                    // not clobbered.
+                    let _ = self.store.transition_node_liveness(
+                        node.id,
+                        NodeLiveness::Failed,
+                        &[NodeLiveness::Starting],
+                        Some("resume_launch_failed"),
+                        json!({}),
+                    );
                     let _ = self.store.record_event(
                         node.id,
                         NodeEventKind::HarnessFailure,
@@ -2326,10 +2450,15 @@ impl CapabilityService {
                     );
                     return Err(anyhow!("resume launch failed: {launch_err}"));
                 }
-                self.store.set_node_liveness_with_reason(
+                // M1: CAS Starting -> Running. If the resumed child already died in
+                // the launch window, the exit sink moved it terminal and this
+                // no-ops -- the node stays honestly Failed/Stopped instead of a
+                // resurrected Running.
+                self.store.transition_node_liveness(
                     node.id,
                     NodeLiveness::Running,
-                    "resumed",
+                    &[NodeLiveness::Starting],
+                    Some("resumed"),
                     json!({ "harness_session_id": session_id }),
                 )?;
                 self.post_hook_event(
@@ -2554,6 +2683,8 @@ impl CapabilityService {
         }
         self.store
             .set_node_liveness(node_id, NodeLiveness::Stopped)?;
+        // M3: kill the per-node guest token now that the node is stopped.
+        let _ = self.store.revoke_tokens_by_name(&loon_node_token_name(node_id));
         self.post_hook_event(
             "node.exited",
             Some(node_id),
@@ -2576,6 +2707,8 @@ impl CapabilityService {
         }
         self.store
             .set_node_liveness(node_id, NodeLiveness::Archived)?;
+        // M3: kill the per-node guest token now that the node is archived.
+        let _ = self.store.revoke_tokens_by_name(&loon_node_token_name(node_id));
         self.post_hook_event(
             "node.exited",
             Some(node_id),
@@ -3087,9 +3220,12 @@ impl CapabilityService {
         id: &str,
         request: DecisionResolveRequest,
     ) -> Result<DecisionRecord> {
+        // m6: "answered" is the honest status for a free-text reply whose content
+        // is neither a structured approve nor deny (a phone reply body is opaque
+        // free text; hardcoding "approved" recorded a human denial as an approval).
         let status = match request.status.as_str() {
-            "approved" | "denied" => request.status,
-            _ => return Err(anyhow!("decision status must be approved or denied")),
+            "approved" | "denied" | "answered" => request.status,
+            _ => return Err(anyhow!("decision status must be approved, denied, or answered")),
         };
         let before = self.get_decision(id).await?;
         if !self.store.resolve_decision(id, &status)? {
@@ -3231,6 +3367,53 @@ impl CapabilityService {
         }
     }
 
+    /// M3 narrow scope enforcement for per-node Loon guest tokens.
+    ///
+    /// A guest token is named `loon-node-{node_id}` and is shipped INTO the VM as
+    /// `ASYLUM_TOKEN`. Anything inside VM A (the harness, a prompt-injected agent,
+    /// anything reading its env) must not be able to drive/stop/archive node B.
+    /// Given the raw bearer value and the request path, this returns false when a
+    /// loon-node token targets:
+    ///   - a `/api/nodes/{other}/...` route for a different node id, or
+    ///   - the `/api/tokens...` fleet-credential-management surface.
+    /// Owner tokens (static config token or any non-`loon-node-` DB token) and
+    /// `AuthMode::Disabled` are unrestricted.
+    ///
+    /// ENFORCED: cross-node access via a node id in the URL PATH, and token
+    /// management. NOT enforced (documented, see docs security note): node ids
+    /// carried in the request BODY or query string, and non-node-scoped
+    /// endpoints (e.g. `POST /api/nodes` create, `/api/graph`, `/api/decisions`),
+    /// which a guest legitimately uses to spawn/observe peers.
+    pub fn scoped_token_authorizes_path(&self, token_value: &str, path: &str) -> bool {
+        if matches!(self.auth_mode, AuthMode::Disabled) {
+            return true;
+        }
+        // Identify a per-node guest token by its DB name; owner/config tokens are
+        // unrestricted.
+        let hash = crate::auth::hash_token(token_value);
+        let bound_node = match self.store.find_token_by_hash(&hash) {
+            Ok(Some((_, name, _, _))) => name
+                .strip_prefix("loon-node-")
+                .map(|id| id.to_string()),
+            // Not a DB token (static config owner token) or lookup miss: not a
+            // scoped guest token, so no path restriction.
+            _ => None,
+        };
+        let Some(bound_node) = bound_node else {
+            return true;
+        };
+        // A guest token may not touch the token-management surface at all.
+        if path == "/api/tokens" || path.starts_with("/api/tokens/") {
+            return false;
+        }
+        // If the path carries a node id (/api/nodes/{id}/...), it must be its own.
+        if let Some(target) = node_id_from_path(path) {
+            return target == bound_node;
+        }
+        // Non-node-scoped path: allowed (see NOT-enforced note above).
+        true
+    }
+
     pub fn attach_issuer_clone(&self) -> Arc<AttachTokenIssuer> {
         self.attach_issuer.clone()
     }
@@ -3360,10 +3543,13 @@ impl CapabilityService {
                 // same feedback path rather than bypassing it. With no pending
                 // decision, the reply is a plain input delivery.
                 if let Ok(Some(pending)) = self.store.pending_decision_for_node(node_id) {
+                    // m6: record the reply honestly. The free-text body is opaque
+                    // (Asylum does not parse it into yes/no -- dumb plumbing), so
+                    // the decision resolves as "answered", not "approved".
                     self.resolve_decision(
                         &pending.0,
                         DecisionResolveRequest {
-                            status: "approved".to_string(),
+                            status: "answered".to_string(),
                             answer: Some(request.body.clone()),
                         },
                     )

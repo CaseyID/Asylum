@@ -42,7 +42,18 @@ const LAUNCH_SUBMIT_NUDGES: [Duration; 2] = [Duration::from_secs(5), Duration::f
 /// keystroke submits. codex additionally suppresses Enter-as-submit for 120ms
 /// after a paste burst ends, so the gap before the CR must exceed that window
 /// (live-verified: 50ms left the prompt sitting in codex's composer).
-async fn submit_over_writer(writer: &Arc<Mutex<Box<dyn Write + Send>>>, text: &str) -> Result<()> {
+async fn submit_over_writer(
+    submit_lock: &Arc<Mutex<()>>,
+    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    text: &str,
+) -> Result<()> {
+    // M5: hold a per-node submit lock across the ENTIRE body -> gap -> CR
+    // sequence. The writer mutex alone is insufficient: it is released during
+    // SUBMIT_GAP, so two concurrent submits would interleave as
+    // body_a, body_b, CR, CR -- both bodies land in the composer and the first
+    // CR submits the concatenation. Serializing the whole sequence makes each
+    // submit atomic relative to every other submit on the same node.
+    let _submit = submit_lock.lock().await;
     {
         let mut w = writer.lock().await;
         w.write_all(text.as_bytes())?;
@@ -62,6 +73,7 @@ async fn submit_over_writer(writer: &Arc<Mutex<Box<dyn Write + Send>>>, text: &s
 /// window (initial render finished). No output content is inspected — this is
 /// timing only, keeping Asylum as dumb plumbing.
 async fn await_ready_and_deliver(
+    submit_lock: Arc<Mutex<()>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     mut rx: broadcast::Receiver<String>,
     prompt: String,
@@ -86,7 +98,7 @@ async fn await_ready_and_deliver(
             _ => break,
         }
     }
-    match submit_over_writer(&writer, &prompt).await {
+    match submit_over_writer(&submit_lock, &writer, &prompt).await {
         Ok(()) => tracing::debug!(node_id = %node_id, "delivered launch prompt"),
         Err(e) => {
             tracing::warn!(node_id = %node_id, error = %e, "launch prompt delivery failed")
@@ -103,6 +115,7 @@ async fn await_ready_and_deliver(
     }
     for delay in LAUNCH_SUBMIT_NUDGES {
         tokio::time::sleep(delay).await;
+        let _submit = submit_lock.lock().await;
         let mut w = writer.lock().await;
         if w.write_all(b"\r").and_then(|_| w.flush()).is_err() {
             break;
@@ -120,6 +133,9 @@ struct LocalRuntime {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     output_tx: broadcast::Sender<String>,
     killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
+    /// M5: per-node lock held across a whole submit sequence so concurrent
+    /// send_input calls cannot interleave their body/CR writes.
+    submit_lock: Arc<Mutex<()>>,
 }
 
 /// How a local harness process ended, reported to the exit sink so the
@@ -129,6 +145,12 @@ struct LocalRuntime {
 pub struct ExitOutcome {
     pub success: bool,
     pub code: Option<u32>,
+    /// True when the exit signal was LOST (e.g. a loon SSE exec-stream errored or
+    /// closed without an exit_code frame) rather than an authoritative exec exit.
+    /// The exit sink maps this to node.errored/"stream_lost" (never a clean-exit
+    /// lie), and the loon exit path must NOT tear the VM down on it (C1). Always
+    /// false for the local substrate, whose child.wait() is authoritative.
+    pub stream_lost: bool,
 }
 
 #[derive(Clone)]
@@ -213,6 +235,7 @@ impl LocalSubstrate {
         let exit_sink = self.exit_sink.clone();
         let runtimes_for_exit = self.runtimes.clone();
         let writer_arc: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(writer));
+        let submit_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         let (output_tx, _) = broadcast::channel(1024);
         let output_tx_for_reader = output_tx.clone();
 
@@ -222,7 +245,14 @@ impl LocalSubstrate {
         // message once the TUI is ready (bug fix: a positional prompt argv is
         // never auto-submitted by interactive harnesses).
         let launch_delivery = ctx.launch_prompt.clone().filter(|p| !p.is_empty()).map(
-            |prompt| (prompt, output_tx.subscribe(), writer_arc.clone()),
+            |prompt| {
+                (
+                    prompt,
+                    output_tx.subscribe(),
+                    writer_arc.clone(),
+                    submit_lock.clone(),
+                )
+            },
         );
 
         // Insert into runtimes before spawning the reader task so that any
@@ -233,15 +263,17 @@ impl LocalSubstrate {
                 writer: writer_arc,
                 output_tx,
                 killer: Arc::new(Mutex::new(killer)),
+                submit_lock,
             },
         );
 
-        if let Some((prompt, rx, writer)) = launch_delivery {
+        if let Some((prompt, rx, writer, submit_lock)) = launch_delivery {
             // Submit nudges only for harnesses that swallow the submitting CR
             // during startup (codex). Claude submits reliably on delivery and
             // may already be mid-dialog when a nudge would land.
             let submit_nudges = matches!(ctx.harness, HarnessKind::Codex);
             tokio::spawn(await_ready_and_deliver(
+                submit_lock,
                 writer,
                 rx,
                 prompt,
@@ -291,10 +323,12 @@ impl LocalSubstrate {
                 Ok(status) => ExitOutcome {
                     success: status.success(),
                     code: Some(status.exit_code()),
+                    stream_lost: false,
                 },
                 Err(_) => ExitOutcome {
                     success: false,
                     code: None,
+                    stream_lost: false,
                 },
             };
             // Harness exited (either on its own or via stop()); drop the runtime
@@ -316,8 +350,8 @@ impl LocalSubstrate {
     /// decision feedback uses to drive a worker, so a single call must both enter
     /// the text AND submit it.
     pub async fn send_input(&self, node_id: Uuid, text: &str) -> Result<()> {
-        let writer = self.writer_for(node_id).await?;
-        submit_over_writer(&writer, text).await
+        let (writer, submit_lock) = self.writer_and_submit_lock_for(node_id).await?;
+        submit_over_writer(&submit_lock, &writer, text).await
     }
 
     /// Write bytes to the node's PTY verbatim, with NO appended submit key. This
@@ -341,6 +375,19 @@ impl LocalSubstrate {
             .get(&node_id)
             .ok_or_else(|| anyhow!("node not running"))?;
         Ok(runtime.writer.clone())
+    }
+
+    /// Clone both the shared writer and the per-node submit lock (M5), releasing
+    /// the runtimes map lock before the caller runs the submit sequence.
+    async fn writer_and_submit_lock_for(
+        &self,
+        node_id: Uuid,
+    ) -> Result<(Arc<Mutex<Box<dyn Write + Send>>>, Arc<Mutex<()>>)> {
+        let runtimes = self.runtimes.read().await;
+        let runtime = runtimes
+            .get(&node_id)
+            .ok_or_else(|| anyhow!("node not running"))?;
+        Ok((runtime.writer.clone(), runtime.submit_lock.clone()))
     }
 
     pub async fn attach(&self, node_id: Uuid) -> Result<broadcast::Receiver<String>> {
@@ -422,7 +469,8 @@ mod tests {
         let writes = recorder.writes.clone();
         let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(recorder)));
 
-        submit_over_writer(&writer, "Reply with exactly: SEND-OK")
+        let submit_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        submit_over_writer(&submit_lock, &writer, "Reply with exactly: SEND-OK")
             .await
             .expect("submit sequence should succeed");
 
@@ -447,13 +495,49 @@ mod tests {
         let writes = recorder.writes.clone();
         let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(recorder)));
 
-        submit_over_writer(&writer, "hello").await.unwrap();
+        let submit_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        submit_over_writer(&submit_lock, &writer, "hello").await.unwrap();
 
         let recorded = writes.lock().unwrap();
         assert!(
             !recorded[0].contains(&b'\r'),
             "body write must not contain a carriage return"
         );
+    }
+
+    /// M5: two concurrent submits sharing one node's writer + submit lock must
+    /// NOT interleave. Without the per-node submit lock the writes would come out
+    /// as body_a, body_b, CR, CR (both bodies concatenated, one stray Enter);
+    /// with it each submit's [body, CR] pair stays contiguous.
+    #[tokio::test]
+    async fn concurrent_submits_do_not_interleave_body_and_cr() {
+        let recorder = RecordingWriter::default();
+        let writes = recorder.writes.clone();
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(recorder)));
+        let submit_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+
+        let (w1, l1) = (writer.clone(), submit_lock.clone());
+        let (w2, l2) = (writer.clone(), submit_lock.clone());
+        let a = tokio::spawn(async move { submit_over_writer(&l1, &w1, "AAAA").await });
+        let b = tokio::spawn(async move { submit_over_writer(&l2, &w2, "BBBB").await });
+        a.await.unwrap().unwrap();
+        b.await.unwrap().unwrap();
+
+        let recorded = writes.lock().unwrap();
+        assert_eq!(recorded.len(), 4, "expected body,CR,body,CR; got {recorded:?}");
+        // Each submit must be a contiguous [body, CR] pair; neither ordering is
+        // interleaved. Whichever ran first, its body is immediately followed by
+        // its own CR.
+        assert_eq!(recorded[1], b"\r", "first submit's CR must follow its body");
+        assert_eq!(recorded[3], b"\r", "second submit's CR must follow its body");
+        assert!(
+            recorded[0] != b"\r" && recorded[2] != b"\r",
+            "bodies must occupy the non-CR slots: {recorded:?}"
+        );
+        // And the two bodies are the two distinct messages, never merged.
+        let mut bodies = vec![recorded[0].clone(), recorded[2].clone()];
+        bodies.sort();
+        assert_eq!(bodies, vec![b"AAAA".to_vec(), b"BBBB".to_vec()]);
     }
 
     /// End-to-end launch delivery through a real PTY. A harness that prints a

@@ -101,10 +101,14 @@ pub fn resolve_target(
 }
 
 fn resolve_target_from_env(default_socket_path: PathBuf) -> ClientTarget {
+    fn non_empty(var: &str) -> Option<String> {
+        env::var(var).ok().filter(|value| !value.is_empty())
+    }
     resolve_target(
-        env::var("ASYLUM_SOCKET_PATH").ok(),
-        env::var("ASYLUM_BASE_URL").ok(),
-        env::var("ASYLUM_TOKEN").ok(),
+        // n3: an empty value is "unset", not a valid empty socket path.
+        non_empty("ASYLUM_SOCKET_PATH"),
+        non_empty("ASYLUM_BASE_URL"),
+        non_empty("ASYLUM_TOKEN"),
         default_socket_path,
     )
 }
@@ -226,13 +230,16 @@ pub async fn run_claude_statusline(paths: &RuntimePaths) {
 
     let line = render_statusline(&payload);
 
+    // n2: print the visible status bar first. The line is independent of the POST
+    // result, and dispatch is bounded by REQUEST_TIMEOUT (2s); printing after it
+    // would stall Claude's status bar up to 2s per render on a slow daemon.
+    println!("{line}");
+
     let node_id_env = env::var("ASYLUM_NODE_ID").ok();
     let target = resolve_target_from_env(paths.socket_path());
     if let Err(err) = dispatch(node_id_env, target, Source::ClaudeStatusline, payload).await {
         eprintln!("asylum harness-event claude-statusline: {err}");
     }
-
-    println!("{line}");
 }
 
 /// `asylum harness-event codex-notify <payload>`: Codex appends the notify

@@ -97,10 +97,6 @@ pub struct LoonConfig {
     #[serde(default = "default_loon_endpoint")]
     pub endpoint: String,
     #[serde(default)]
-    pub api_key_file: Option<PathBuf>,
-    #[serde(default)]
-    pub cert_fingerprint_file: Option<PathBuf>,
-    #[serde(default)]
     pub cli_path: Option<PathBuf>,
     #[serde(default)]
     pub enabled: bool,
@@ -166,8 +162,6 @@ impl Default for LoonConfig {
     fn default() -> Self {
         Self {
             endpoint: "http://127.0.0.1:7777".to_string(),
-            api_key_file: None,
-            cert_fingerprint_file: None,
             cli_path: None,
             enabled: false,
             config_path: None,
