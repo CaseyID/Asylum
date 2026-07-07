@@ -46,7 +46,11 @@ use crate::launch_packet;
 
 use crate::remote_commands::{parse_remote_command, ParsedRemoteCommand, RemoteCommandKind};
 use crate::storage::Store;
-use crate::substrate::loon::{capability_flags_from_health, LoonHealth, LoonSubstrate};
+use crate::substrate::loon::{
+    capability_flags_from_health, LoonHealth, LoonLaunchSpec, LoonRuntimeConfig, LoonSubstrate,
+    GUEST_ASYLUM_BINARY,
+};
+use crate::harness::DaemonResolution;
 use crate::substrate::{ExitOutcome, LocalSubstrate, SubstrateContext};
 use asylum_types::api::{
     ChannelCreateRequest, ChannelDescriptor, ChannelInboundRequest, ChannelListResponse,
@@ -375,12 +379,100 @@ impl CapabilityService {
             },
         );
         let loon_substrate = if config.loon.enabled {
+            // Guest-facing daemon URL: guests reach the host over the per-VM
+            // gateway, stably named host.loon.internal. Default to that name on
+            // the daemon's bind port unless an explicit guest_base_url is set.
+            let guest_base_url = config
+                .loon
+                .guest_base_url
+                .clone()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| {
+                    let port = config
+                        .bind_addr
+                        .rsplit(':')
+                        .next()
+                        .unwrap_or("7717");
+                    format!("http://host.loon.internal:{port}")
+                });
+            let loon_cfg = LoonRuntimeConfig {
+                cli_path: config.loon.cli_path.clone(),
+                config_path: config.loon.config_path.clone(),
+                profile: config.loon.profile.clone(),
+                endpoint_override: {
+                    let ep = config.loon.endpoint.trim();
+                    if ep.is_empty() || ep == "http://127.0.0.1:7777" {
+                        None
+                    } else {
+                        Some(ep.to_string())
+                    }
+                },
+                image: config.loon.image.clone(),
+                workspace_dir: config.loon.workspace_dir.clone(),
+                vm_memory_mib: config.loon.vm_memory_mib,
+                vm_cpus: config.loon.vm_cpus,
+                guest_asylum_binary: config.loon.guest_asylum_binary.clone(),
+                guest_base_url,
+            };
+            // Loon nodes route PTY output, decisions, and exit truth through the
+            // SAME sinks as local nodes, so observe/idle/exit behave identically.
+            let loon_sink_store = store.clone();
+            let loon_decision = LocalDecisionIngestion {
+                store: store.clone(),
+                hook_engine: hook_engine.clone(),
+            };
+            let loon_exit_store = store.clone();
+            let loon_exit_engine = hook_engine.clone();
             Some(Arc::new(LoonSubstrate::new(
-                &config.loon.endpoint,
-                config.loon.cli_path.clone(),
-                config.loon.api_key_file.clone(),
-                config.loon.cert_fingerprint_file.clone(),
-                true,
+                loon_cfg,
+                move |node_id, chunk| {
+                    if let Err(e) = loon_sink_store.append_transcript_chunk(node_id, chunk) {
+                        tracing::warn!(error = %e, "failed to persist loon transcript chunk");
+                    }
+                },
+                move |node_id, request| {
+                    if let Err(e) = loon_decision.ingest_request(node_id, request) {
+                        tracing::warn!(error = %e, node_id = %node_id, "failed to ingest loon decision request");
+                    }
+                },
+                move |node_id, outcome: ExitOutcome| {
+                    let store = loon_exit_store.clone();
+                    let engine = loon_exit_engine.clone();
+                    tokio::runtime::Handle::current().spawn(async move {
+                        if let Ok(Some(node)) = store.get_node(node_id) {
+                            if matches!(
+                                node.liveness,
+                                NodeLiveness::Running
+                                    | NodeLiveness::Starting
+                                    | NodeLiveness::WaitingForInput
+                            ) {
+                                if outcome.success {
+                                    let _ = store.set_node_liveness(node_id, NodeLiveness::Stopped);
+                                    engine.post(HookEvent {
+                                        event: "node.exited".to_string(),
+                                        node_id: Some(node_id),
+                                        payload: json!({
+                                            "node": {"id": node_id.to_string()},
+                                            "reason": "exited",
+                                            "exit_code": outcome.code,
+                                        }),
+                                    });
+                                } else {
+                                    let _ = store.set_node_liveness(node_id, NodeLiveness::Failed);
+                                    engine.post(HookEvent {
+                                        event: "node.errored".to_string(),
+                                        node_id: Some(node_id),
+                                        payload: json!({
+                                            "node": {"id": node_id.to_string()},
+                                            "reason": "abnormal_exit",
+                                            "exit_code": outcome.code,
+                                        }),
+                                    });
+                                }
+                            }
+                        }
+                    });
+                },
             )))
         } else {
             None
@@ -767,9 +859,9 @@ impl CapabilityService {
         };
         let now = OffsetDateTime::now_utc().unix_timestamp();
         for node in running {
-            if node.substrate != SubstrateKind::Local {
-                continue;
-            }
+            // Both Local and Loon nodes stream PTY output through the transcript
+            // sink, so the output-quiescence timer applies to either. Harnesses
+            // with a native idle signal (claude) are still skipped below.
             let native_idle = self
                 .harnesses
                 .get(&node.harness)
@@ -1827,35 +1919,55 @@ impl CapabilityService {
 
         let launch_prompt = launch_prompt_for_runtime(adapter.as_ref(), node.id, &request);
         let mut launch_args = adapter.launch_args().to_vec();
-        if matches!(substrate, SubstrateKind::Local) {
-            // Pre-assign the harness session id where the harness supports it (claude
-            // `--session-id`). Recorded on the node row now so it is the Phase C resume
-            // key even before the first SessionStart post confirms it. Codex returns
-            // None (its thread-id is discovered from the first notify post, W1).
-            let pre_session_id = adapter.preassign_session_id();
-            if let Some(session_id) = pre_session_id {
-                if let Err(e) = self
-                    .store
-                    .set_node_harness_session_id(node.id, Some(&session_id.to_string()))
-                {
-                    tracing::warn!(error = %e, node_id = %node.id, "failed to record pre-assigned harness session id");
-                }
+        // Pre-assign the harness session id where the harness supports it (claude
+        // `--session-id`). Recorded on the node row now so it is the Phase C resume
+        // key even before the first SessionStart post confirms it. Codex returns
+        // None (its thread-id is discovered from the first notify post, W1).
+        let pre_session_id = adapter.preassign_session_id();
+        if let Some(session_id) = pre_session_id {
+            if let Err(e) = self
+                .store
+                .set_node_harness_session_id(node.id, Some(&session_id.to_string()))
+            {
+                tracing::warn!(error = %e, node_id = %node.id, "failed to record pre-assigned harness session id");
             }
-            let asylum_binary = current_asylum_binary();
-            launch_args.extend(adapter.asylum_control_args(
-                &asylum_binary,
-                self.config.socket_path.as_deref(),
-                node.id,
-                pre_session_id,
-            ));
         }
+        // Build the MCP + hook injection and per-node env per substrate. Local
+        // resolves the daemon over the unauthenticated unix socket; Loon crosses
+        // the VM boundary and resolves over HTTP with a minted per-node token
+        // against the in-guest asylum binary path.
+        let env = match substrate {
+            SubstrateKind::Local => {
+                let asylum_binary = current_asylum_binary();
+                launch_args.extend(adapter.asylum_control_args(
+                    &asylum_binary,
+                    &DaemonResolution::Socket(self.config.socket_path.as_deref()),
+                    node.id,
+                    pre_session_id,
+                ));
+                self.local_launch_env(&node, &harness, &substrate, &capabilities)?
+            }
+            SubstrateKind::Loon => {
+                let token = self.mint_loon_node_token(node.id)?;
+                let guest_base_url = self.loon_guest_base_url();
+                launch_args.extend(adapter.asylum_control_args(
+                    GUEST_ASYLUM_BINARY,
+                    &DaemonResolution::Http {
+                        base_url: &guest_base_url,
+                        token: &token,
+                    },
+                    node.id,
+                    pre_session_id,
+                ));
+                self.loon_launch_env(&node, &harness, &capabilities, &guest_base_url, &token)?
+            }
+        };
         launch_args.extend(request.launch_args.clone());
         // The launch prompt is intentionally NOT appended as a positional argv.
         // Interactive harnesses (claude, codex) pre-fill a positional prompt into
         // the input box but never submit it, so the node sits idle. It is instead
         // delivered over the PTY as a submitted message once the TUI is ready
-        // (Local: SubstrateContext::launch_prompt) or as `--prompt` (Loon).
-        let env = self.local_launch_env(&node, &harness, &substrate, &capabilities)?;
+        // (both Local and Loon use SubstrateContext::launch_prompt).
         let context = SubstrateContext {
             node_id: node.id,
             harness: harness.clone(),
@@ -1904,13 +2016,13 @@ impl CapabilityService {
                     .loon_substrate
                     .as_ref()
                     .ok_or_else(|| anyhow!("unsupported substrate"))?;
-                let payload = crate::substrate::loon::LoonContext {
-                    node_id: node.id,
-                    harness: harness.clone(),
-                    command: adapter.command().to_string(),
-                    prompt: launch_prompt,
-                };
-                match loon.launch_node(&payload).await {
+                // The full harness argv/env/workspace/launch-prompt survive into
+                // the guest launch (no lossy shim) via the SubstrateContext.
+                let spec = LoonLaunchSpec::from_context(
+                    context,
+                    format!("asylum-{}", node.id),
+                );
+                match loon.launch_node(spec).await {
                     Ok(external_id) => {
                         self.store
                             .set_node_external_id(node.id, Some(external_id))?;
@@ -1981,6 +2093,79 @@ impl CapabilityService {
         }
         if let Some(socket_path) = &self.config.socket_path {
             env.push(("ASYLUM_SOCKET_PATH".to_string(), socket_path.clone()));
+        }
+        Ok(env)
+    }
+
+    /// Guest-facing Asylum daemon URL for Loon nodes: explicit config wins, else
+    /// derive host.loon.internal on the daemon bind port (guests reach the host
+    /// over the per-VM gateway, stably named host.loon.internal).
+    fn loon_guest_base_url(&self) -> String {
+        if let Some(url) = self
+            .config
+            .loon
+            .guest_base_url
+            .as_ref()
+            .filter(|v| !v.is_empty())
+        {
+            return url.clone();
+        }
+        let port = self.config.bind_addr.rsplit(':').next().unwrap_or("7717");
+        format!("http://host.loon.internal:{port}")
+    }
+
+    /// Mint a per-node bearer token for the in-guest MCP server + harness-event
+    /// bridge (the unix socket does not cross the VM boundary). Tokens are
+    /// all-or-nothing today (scope is inert); the scope string is descriptive.
+    fn mint_loon_node_token(&self, node_id: Uuid) -> Result<String> {
+        let name = format!("loon-node-{node_id}");
+        // Node lifetime can be long; give the token a generous 30-day TTL.
+        let issued = issue_owner_token(&name, &["loon-node".to_string()], Some(30 * 24 * 3600))?;
+        self.store.insert_token(
+            issued.token_id,
+            &name,
+            &issued.stored_hash,
+            &serde_json::to_string(&issued.scope)?,
+            issued.expires_at_epoch_secs,
+        )?;
+        Ok(issued.raw_token)
+    }
+
+    /// Environment for a Loon guest harness process: mirrors `local_launch_env`
+    /// but resolves the daemon over HTTP (guest base URL + per-node token) rather
+    /// than the unix socket, and never sets ASYLUM_SOCKET_PATH.
+    fn loon_launch_env(
+        &self,
+        node: &NodeRecord,
+        harness: &HarnessKind,
+        capabilities: &CapabilitySnapshot,
+        guest_base_url: &str,
+        token: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let mut env = vec![
+            ("ASYLUM_NODE_ID".to_string(), node.id.to_string()),
+            ("ASYLUM_NODE_ROLE".to_string(), node.role_hint.clone()),
+            ("ASYLUM_HARNESS".to_string(), harness.to_string()),
+            ("ASYLUM_SUBSTRATE".to_string(), SubstrateKind::Loon.to_string()),
+            ("ASYLUM_BASE_URL".to_string(), guest_base_url.to_string()),
+            ("ASYLUM_TOKEN".to_string(), token.to_string()),
+            ("ASYLUM_CONTROL_TRANSPORT".to_string(), "http".to_string()),
+            (
+                "ASYLUM_DECISION_PROTOCOL".to_string(),
+                ASYLUM_DECISION_PROTOCOL.to_string(),
+            ),
+            (
+                "ASYLUM_CAPABILITIES_JSON".to_string(),
+                serde_json::to_string(capabilities)?,
+            ),
+            (
+                "ASYLUM_GRAPH_SUMMARY".to_string(),
+                self.graph_summary()
+                    .unwrap_or_else(|_| "graph unavailable".to_string()),
+            ),
+        ];
+        if let Some(workspace) = &node.workspace {
+            env.push(("ASYLUM_WORKSPACE".to_string(), workspace.clone()));
         }
         Ok(env)
     }
@@ -3151,6 +3336,15 @@ impl CapabilityService {
             .store
             .get_node(source_id)?
             .ok_or_else(|| anyhow!("source node not found"))?;
+        if source.substrate == SubstrateKind::Loon {
+            // A Local fork shares the source's real workspace files. A Loon
+            // "fork" would boot a fresh VM whose same-named in-guest workspace
+            // is empty -- silently NOT a fork. Reject rather than degrade.
+            return Err(anyhow!(
+                "fork is unsupported for loon nodes: guest workspaces are not shared \
+                 across VMs; create a new node and provision its workspace explicitly"
+            ));
+        }
         let role_hint = request.role_hint.unwrap_or(source.role_hint.clone());
         let workspace = request.workspace.or(source.workspace.clone());
         let description = request.description.unwrap_or(source.description.clone());
@@ -3612,19 +3806,6 @@ mod tests {
         }
     }
 
-    fn loon_create_request_with_workspace(description: &str, workspace: &str) -> CreateNodeRequest {
-        CreateNodeRequest {
-            harness: "codex".to_string(),
-            substrate: "loon".to_string(),
-            role_hint: "worker".to_string(),
-            workspace: Some(workspace.to_string()),
-            description: Some(description.to_string()),
-            created_by: None,
-            prompt: None,
-            launch_args: Vec::new(),
-
-        }
-    }
 
     fn open_store_with_schema_broken(path: &str, table: &str) -> Result<(), rusqlite::Error> {
         let connection = Connection::open(path)?;
@@ -4049,23 +4230,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_substrate_descriptors_hides_unknown_loon_metrics(
+    async fn loon_descriptor_is_unhealthy_when_host_unreachable(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let workdir = tempfile::tempdir()?;
         let path = workdir.path().join("asylum.sqlite3").display().to_string();
         let store = Store::open(path)?;
         let mut config = test_app_config();
         config.loon.enabled = true;
-        let script_path = workdir.path().join("fake-loon-cli.sh");
-        config.loon.cli_path = Some(script_path.clone());
-        write_executable_script(&script_path, "#!/bin/sh\nexit 0\n")?;
+        // Point at a non-existent loon client config so the substrate is degraded
+        // (unreachable) rather than talking to the developer's real loon host.
+        config.loon.config_path = Some(workdir.path().join("no-loon.toml"));
 
         let service = CapabilityService::new(store, AuthMode::Disabled, config);
 
         let health = service.substrate_health().await;
-        assert_eq!(health.status, "limited");
+        assert_eq!(health.status, "unavailable");
         assert!(health.running_instances.is_none());
-        assert!(health.harness_profiles.is_none());
 
         let descriptors = service.list_substrate_descriptors().await?;
         let loon = descriptors
@@ -4074,7 +4254,7 @@ mod tests {
             .find(|s| s.id == "loon")
             .expect("loon descriptor should exist when configured");
         assert!(!loon.healthy);
-        assert_eq!(loon.status, "limited");
+        assert_eq!(loon.status, "unavailable");
         assert_eq!(loon.capacity, 0.0);
         assert_eq!(loon.nodes, 0);
         Ok(())
@@ -4088,16 +4268,16 @@ mod tests {
         let store = Store::open(path.clone())?;
         let mut config = test_app_config();
         config.loon.enabled = true;
-        let script_path = workdir.path().join("fake-loon-cli.sh");
-        write_executable_script(&script_path, "#!/bin/sh\nprintf 'loon version'\nexit 0\n")?;
-        config.loon.cli_path = Some(script_path);
+        // Unreachable loon host -> the create-time support gate rejects before any
+        // node row is inserted.
+        config.loon.config_path = Some(workdir.path().join("no-loon.toml"));
 
         let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
 
         let error = service
             .create_node(loon_create_request("unsupported by capability probe"))
             .await
-            .expect_err("loon create should refuse unsupported substrate profiles");
+            .expect_err("loon create should refuse when the host is unreachable");
         assert!(error.to_string().contains("unsupported_on_substrate"));
 
         let graph = store.graph()?;
@@ -4109,89 +4289,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_loon_spawn_marks_node_failed_and_records_harness_failure(
+    async fn loon_node_launch_env_resolves_over_http_with_token(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // The guest harness resolves the daemon over HTTP (base URL + per-node
+        // token), never the unix socket. Exercises the daemon-side helpers
+        // directly so it stays hermetic (no loon host required).
         let workdir = tempfile::tempdir()?;
         let path = workdir.path().join("asylum.sqlite3").display().to_string();
-        let store = Store::open(path.clone())?;
-        let mut config = test_app_config();
-        config.loon.enabled = true;
-        let script_path = workdir.path().join("fake-loon-cli.sh");
-        write_executable_script(
-            &script_path,
-            "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then\nprintf '{\"status\":\"ok\",\"running_instances\":1,\"harness_profiles\":[\"codex\"]}\n'\nexit 0\nfi\nif [ \"$1\" = \"spawn\" ]; then\nprintf 'spawn failed' >&2\nexit 1\nfi\nexit 0\n",
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        let caps = CapabilitySnapshot {
+            browser_attach: true,
+            native_attach: true,
+            send_input: true,
+            interrupt: true,
+            stop: true,
+            resume: false,
+            structured_events: false,
+            transcript_export: false,
+        };
+        let node = store.insert_node(
+            HarnessKind::ClaudeCode,
+            SubstrateKind::Loon,
+            "worker",
+            Some("/work"),
+            None,
+            None,
+            caps.clone(),
+            None,
         )?;
-        config.loon.cli_path = Some(script_path);
 
-        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+        let token = service.mint_loon_node_token(node.id)?;
+        assert!(token.contains("asylum-owner-"), "unexpected token: {token}");
 
-        let error = service
-            .create_node(loon_create_request("spawn failure regression"))
-            .await
-            .expect_err("spawn failure should return an error and keep an error row");
-        assert!(error.to_string().contains("spawn failed"));
-
-        let graph = store.graph()?;
-        let node = graph
-            .nodes
-            .into_iter()
-            .find(|node| node.description == "spawn failure regression")
-            .expect("failed Loon launch should persist node row");
-        assert_eq!(node.liveness, NodeLiveness::Failed);
-
-        let events = store.list_events(node.id)?;
-        assert!(events.iter().any(|event| {
-            event.kind == NodeEventKind::LivenessChanged
-                && event.body["liveness"] == serde_json::json!("failed")
-        }));
-        assert!(events.iter().any(|event| {
-            event.kind == NodeEventKind::HarnessFailure
-                && event.body["error"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("spawn failed")
-        }));
+        let env = service.loon_launch_env(
+            &node,
+            &HarnessKind::ClaudeCode,
+            &caps,
+            "http://host.loon.internal:7788",
+            &token,
+        )?;
+        let map: std::collections::HashMap<String, String> = env.into_iter().collect();
+        assert_eq!(
+            map.get("ASYLUM_BASE_URL").map(String::as_str),
+            Some("http://host.loon.internal:7788")
+        );
+        assert_eq!(map.get("ASYLUM_TOKEN").map(String::as_str), Some(token.as_str()));
+        assert_eq!(map.get("ASYLUM_CONTROL_TRANSPORT").map(String::as_str), Some("http"));
+        assert_eq!(map.get("ASYLUM_WORKSPACE").map(String::as_str), Some("/work"));
+        assert!(
+            !map.contains_key("ASYLUM_SOCKET_PATH"),
+            "loon guest env must not carry a unix socket path"
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn loon_launch_uses_context_plus_user_prompt_in_commandline(
+    async fn loon_control_args_use_http_resolution_and_guest_binary(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let workdir = tempfile::tempdir()?;
-        let path = workdir.path().join("asylum.sqlite3").display().to_string();
-        let store = Store::open(path.clone())?;
-        let mut config = test_app_config();
-        config.loon.enabled = true;
-        let workspace = workdir.path().join("workspace");
-        std::fs::create_dir_all(&workspace)?;
-        let cli_args_path = workdir.path().join("loon-args.txt");
-        let script_path = workdir.path().join("fake-loon-cli.sh");
-        let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then\nprintf '{{\"status\":\"ok\",\"running_instances\":1,\"harness_profiles\":[\"codex\"]}}\\n'\nexit 0\nfi\nif [ \"$1\" = \"spawn\" ]; then\nprintf '%s\\n' \"$@\" > '{}' \nprintf '00000000-0000-0000-0000-000000000000\\n'\nexit 0\nfi\nexit 0\n",
-            cli_args_path.display()
+        // The MCP injection for a Loon node must reference the in-guest asylum
+        // binary and resolve over HTTP (base URL + token), not the unix socket.
+        use crate::harness::DaemonResolution;
+        let registry = crate::harness::HarnessRegistry::default();
+        let claude = registry.get(&HarnessKind::ClaudeCode).unwrap();
+        let node_id = Uuid::new_v4();
+        let args = claude.asylum_control_args(
+            GUEST_ASYLUM_BINARY,
+            &DaemonResolution::Http {
+                base_url: "http://host.loon.internal:7788",
+                token: "asylum-owner-tok",
+            },
+            node_id,
+            Some(Uuid::new_v4()),
         );
-        write_executable_script(&script_path, &script)?;
-        config.loon.cli_path = Some(script_path);
-
-        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
-        let description = "Build exactly this as your first action";
-        let response = service
-            .create_node(loon_create_request_with_workspace(
-                description,
-                &workspace.display().to_string(),
-            ))
-            .await?;
-        let node_id = Uuid::parse_str(&response.node_id)?;
-
-        wait_for_liveness(&store, node_id, NodeLiveness::Running).await?;
-        let cli_args = std::fs::read_to_string(&cli_args_path)?;
-        assert!(cli_args.contains("spawn"));
-        assert!(cli_args.contains("--prompt"));
-        assert!(cli_args.contains(&format!("You are node {} with role 'worker'.", node_id)));
-        assert!(cli_args.contains(&format!("Workspace: {}", workspace.display())));
-        assert!(cli_args.contains("User launch packet:"));
-        assert!(cli_args.contains(description));
-
+        let cfg_index = args.iter().position(|a| a == "--mcp-config").unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&args[cfg_index + 1])?;
+        assert_eq!(cfg["mcpServers"]["asylum"]["command"], GUEST_ASYLUM_BINARY);
+        assert_eq!(
+            cfg["mcpServers"]["asylum"]["env"]["ASYLUM_BASE_URL"],
+            "http://host.loon.internal:7788"
+        );
+        assert_eq!(
+            cfg["mcpServers"]["asylum"]["env"]["ASYLUM_TOKEN"],
+            "asylum-owner-tok"
+        );
+        assert!(cfg["mcpServers"]["asylum"]["env"]["ASYLUM_SOCKET_PATH"].is_null());
         Ok(())
     }
 

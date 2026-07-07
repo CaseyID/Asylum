@@ -94,11 +94,72 @@ impl Default for HarnessConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoonConfig {
+    #[serde(default = "default_loon_endpoint")]
     pub endpoint: String,
+    #[serde(default)]
     pub api_key_file: Option<PathBuf>,
+    #[serde(default)]
     pub cert_fingerprint_file: Option<PathBuf>,
+    #[serde(default)]
     pub cli_path: Option<PathBuf>,
+    #[serde(default)]
     pub enabled: bool,
+    /// Path to the loon client config.toml (url/key/fingerprint per profile).
+    /// Defaults to \$XDG_CONFIG_HOME/loon/config.toml (or ~/.config/loon/config.toml).
+    #[serde(default)]
+    pub config_path: Option<PathBuf>,
+    /// loon profile name to use from the client config. Defaults to the config's
+    /// default_profile.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Guest OCI-tar image path (local path the loon host can read) used for
+    /// . Defaults to the claude-dev reference image.
+    #[serde(default = "default_loon_image")]
+    pub image: String,
+    /// Base URL the in-guest harness uses to reach the Asylum daemon over HTTP.
+    /// Guests reach the host via the per-VM gateway, stably named
+    /// host.loon.internal. Defaults to http://host.loon.internal:<asylum-port>
+    /// derived from the daemon bind when unset.
+    #[serde(default)]
+    pub guest_base_url: Option<String>,
+    /// In-guest workspace directory created at provision when a node does not
+    /// specify a workspace. Loon workspaces live INSIDE the guest (no host bind
+    /// mounts). Defaults to /work.
+    #[serde(default = "default_loon_workspace")]
+    pub workspace_dir: String,
+    /// microVM memory in MiB for `loon vm create`. claude-code (Node.js) plus the
+    /// in-guest MCP server need well beyond loon's 256 MiB default; too little
+    /// OOMs the guest. Defaults to 2048.
+    #[serde(default = "default_loon_vm_memory_mib")]
+    pub vm_memory_mib: u32,
+    /// microVM vCPU count for `loon vm create`. Defaults to 2.
+    #[serde(default = "default_loon_vm_cpus")]
+    pub vm_cpus: u32,
+    /// Host path to the static musl \`asylum\` binary staged into the guest at
+    /// /usr/local/bin/asylum for the in-guest MCP server + harness-event bridge.
+    /// Required for MCP-in-guest; build via scripts/build-guest-asylum.sh.
+    #[serde(default)]
+    pub guest_asylum_binary: Option<PathBuf>,
+}
+
+fn default_loon_endpoint() -> String {
+    "http://127.0.0.1:7777".to_string()
+}
+
+fn default_loon_image() -> String {
+    "/var/lib/loon/agent-images/claude-dev.oci.tar".to_string()
+}
+
+fn default_loon_workspace() -> String {
+    "/work".to_string()
+}
+
+fn default_loon_vm_memory_mib() -> u32 {
+    2048
+}
+
+fn default_loon_vm_cpus() -> u32 {
+    2
 }
 
 impl Default for LoonConfig {
@@ -109,6 +170,14 @@ impl Default for LoonConfig {
             cert_fingerprint_file: None,
             cli_path: None,
             enabled: false,
+            config_path: None,
+            profile: None,
+            image: default_loon_image(),
+            guest_base_url: None,
+            workspace_dir: default_loon_workspace(),
+            vm_memory_mib: default_loon_vm_memory_mib(),
+            vm_cpus: default_loon_vm_cpus(),
+            guest_asylum_binary: None,
         }
     }
 }

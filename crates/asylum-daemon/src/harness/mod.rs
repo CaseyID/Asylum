@@ -17,6 +17,15 @@ pub enum HarnessError {
     UnknownHarness,
 }
 
+/// How an in-guest / local harness resolves the Asylum daemon for the injected
+/// MCP server and hook bridge. Local nodes use the unauthenticated unix socket;
+/// Loon nodes cross the VM boundary and must resolve over HTTP with a per-node
+/// bearer token.
+pub enum DaemonResolution<'a> {
+    Socket(Option<&'a str>),
+    Http { base_url: &'a str, token: &'a str },
+}
+
 pub trait HarnessAdapter: Send + Sync {
     fn kind(&self) -> HarnessKind;
     fn command(&self) -> &str;
@@ -30,7 +39,7 @@ pub trait HarnessAdapter: Send + Sync {
     fn asylum_control_args(
         &self,
         _asylum_binary: &str,
-        _socket_path: Option<&str>,
+        _resolution: &DaemonResolution,
         _node_id: Uuid,
         _session_id: Option<Uuid>,
     ) -> Vec<String> {
@@ -208,7 +217,7 @@ mod tests {
 
         let args = codex.asylum_control_args(
             "/usr/local/bin/asylum",
-            Some("/tmp/asylum.sock"),
+            &DaemonResolution::Socket(Some("/tmp/asylum.sock")),
             node_id,
             None,
         );
@@ -229,7 +238,7 @@ mod tests {
 
         let args = codex.asylum_control_args(
             "/usr/local/bin/asylum",
-            Some("/tmp/asylum.sock"),
+            &DaemonResolution::Socket(Some("/tmp/asylum.sock")),
             node_id,
             // Codex ignores a pre-assigned session id (no --session-id equivalent).
             Some(Uuid::new_v4()),
@@ -252,6 +261,27 @@ mod tests {
     }
 
     #[test]
+    fn codex_control_args_resolve_over_http_for_loon() {
+        let registry = HarnessRegistry::default();
+        let codex = registry.get(&HarnessKind::Codex).unwrap();
+        let node_id = Uuid::new_v4();
+        let args = codex.asylum_control_args(
+            "/usr/local/bin/asylum",
+            &DaemonResolution::Http {
+                base_url: "http://host.loon.internal:7788",
+                token: "asylum-owner-tok",
+            },
+            node_id,
+            None,
+        );
+        let joined = args.join("\n");
+        assert!(joined.contains("ASYLUM_BASE_URL=\"http://host.loon.internal:7788\""));
+        assert!(joined.contains("ASYLUM_TOKEN=\"asylum-owner-tok\""));
+        assert!(!joined.contains("ASYLUM_SOCKET_PATH"));
+        assert!(joined.contains("mcp_servers.asylum.command=\"/usr/local/bin/asylum\""));
+    }
+
+    #[test]
     fn claude_control_args_register_asylum_mcp_per_launch() -> anyhow::Result<()> {
         let registry = HarnessRegistry::default();
         let claude = registry.get(&HarnessKind::ClaudeCode).unwrap();
@@ -260,7 +290,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let args = claude.asylum_control_args(
             "/opt/asylum/bin/asylum",
-            Some("/tmp/asylum.sock"),
+            &DaemonResolution::Socket(Some("/tmp/asylum.sock")),
             node_id,
             Some(session_id),
         );
@@ -363,7 +393,7 @@ mod tests {
         let mut argv = claude.launch_args().to_vec();
         argv.extend(claude.asylum_control_args(
             "/opt/asylum/bin/asylum",
-            Some("/tmp/asylum.sock"),
+            &DaemonResolution::Socket(Some("/tmp/asylum.sock")),
             node_id,
             Some(Uuid::new_v4()),
         ));

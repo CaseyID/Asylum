@@ -5,6 +5,7 @@ use asylum_types::node::CapabilitySnapshot;
 use asylum_types::node::HarnessKind;
 
 use crate::harness::launch_context::LaunchContext;
+use crate::harness::DaemonResolution;
 
 pub struct CodexHarness {
     command: String,
@@ -68,7 +69,7 @@ impl super::HarnessAdapter for CodexHarness {
     fn asylum_control_args(
         &self,
         asylum_binary: &str,
-        socket_path: Option<&str>,
+        resolution: &DaemonResolution,
         node_id: uuid::Uuid,
         // Codex session ids are not pre-assignable (`codex` has no --session-id);
         // W1 records the thread-id from the first notify post instead.
@@ -78,8 +79,15 @@ impl super::HarnessAdapter for CodexHarness {
             "ASYLUM_NODE_ID={}",
             toml_string(&node_id.to_string())
         )];
-        if let Some(socket_path) = socket_path {
-            env_entries.push(format!("ASYLUM_SOCKET_PATH={}", toml_string(socket_path)));
+        match resolution {
+            DaemonResolution::Socket(Some(socket_path)) => {
+                env_entries.push(format!("ASYLUM_SOCKET_PATH={}", toml_string(socket_path)));
+            }
+            DaemonResolution::Socket(None) => {}
+            DaemonResolution::Http { base_url, token } => {
+                env_entries.push(format!("ASYLUM_BASE_URL={}", toml_string(base_url)));
+                env_entries.push(format!("ASYLUM_TOKEN={}", toml_string(token)));
+            }
         }
 
         vec![
