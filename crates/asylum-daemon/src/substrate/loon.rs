@@ -45,6 +45,14 @@ use crate::decision_ingester::{
 /// processes them as two keystroke events, short enough to stay imperceptible.
 const SUBMIT_GAP: Duration = Duration::from_millis(50);
 
+/// M4: how often the attach WebSocket sends a keepalive Ping. Without periodic
+/// traffic a TCP half-open (silent peer death, NAT idle drop) leaves the socket
+/// looking "open" indefinitely while input is silently accepted and dropped. A
+/// failed Ping send tears the write task down, which drops the input channel so
+/// subsequent send_input/interrupt calls honestly error instead of returning Ok
+/// into a dead socket.
+const ATTACH_WS_PING_INTERVAL: Duration = Duration::from_secs(20);
+
 /// Readiness gating for launch-prompt delivery over the guest PTY (timing only).
 const LAUNCH_FIRST_OUTPUT_TIMEOUT: Duration = Duration::from_secs(45);
 const LAUNCH_QUIET_WINDOW: Duration = Duration::from_millis(700);
@@ -157,6 +165,9 @@ struct LoonRuntime {
     input_tx: mpsc::UnboundedSender<Vec<u8>>,
     output_tx: broadcast::Sender<String>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// M5: per-node lock held across a whole submit (body burst -> gap -> CR) so
+    /// concurrent send_input calls cannot interleave their bytes on the guest PTY.
+    submit_lock: Arc<Mutex<()>>,
 }
 
 /// How a guest harness process ended (mirrors the local `ExitOutcome`).
@@ -618,13 +629,53 @@ impl LoonSubstrate {
             }
         });
 
+        // M4: the write task pumps guest input AND sends keepalive Pings so a
+        // half-open attach socket is actively detected. On a send/ping failure it
+        // reports a lost stream (never a clean exit) via the exit sink -- which
+        // marks the node errored but KEEPS the VM (C1) -- and returns, dropping
+        // the input channel so later send_input calls error honestly.
+        let write_exit_sink = self.exit_sink.clone();
         let write_task = tokio::spawn(async move {
-            while let Some(bytes) = input_rx.recv().await {
-                if ws_write.send(Message::Binary(bytes.into())).await.is_err() {
-                    break;
+            let mut ping = tokio::time::interval(ATTACH_WS_PING_INTERVAL);
+            ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // First tick fires immediately; skip it so we do not ping before the
+            // socket has settled.
+            ping.tick().await;
+            let socket_died = loop {
+                tokio::select! {
+                    maybe_bytes = input_rx.recv() => {
+                        match maybe_bytes {
+                            Some(bytes) => {
+                                if ws_write.send(Message::Binary(bytes.into())).await.is_err() {
+                                    break true;
+                                }
+                            }
+                            // All senders dropped (runtime torn down): graceful.
+                            None => break false,
+                        }
+                    }
+                    _ = ping.tick() => {
+                        if ws_write.send(Message::Ping(Vec::new().into())).await.is_err() {
+                            break true;
+                        }
+                    }
                 }
-            }
+            };
             let _ = ws_write.close().await;
+            if socket_died {
+                tracing::warn!(
+                    node_id = %node_id,
+                    "loon attach ws send/ping failed (half-open); marking node errored, keeping VM"
+                );
+                write_exit_sink(
+                    node_id,
+                    super::ExitOutcome {
+                        success: false,
+                        code: None,
+                        stream_lost: true,
+                    },
+                );
+            }
         });
 
         // --- SSE exec-stream: authoritative exit signal ---
@@ -636,13 +687,31 @@ impl LoonSubstrate {
         let sse_key = key.clone();
         let teardown = self.clone();
         let exit_task = tokio::spawn(async move {
-            let outcome = watch_exit(&http, &sse_url, &sse_key).await;
-            // The guest harness ended: drop the runtime, report exit truth, and
-            // tear the VM down so a dead node never leaks a microVM.
-            runtimes.write().await.remove(&vm_id_owned);
-            exit_sink(node_id, outcome);
-            let _ = teardown.teardown_vm(&vm_id_owned).await;
+            let watch = watch_exit(&http, &sse_url, &sse_key).await;
             let _ = exec_id_owned;
+            match watch {
+                // Authoritative exec exit: the guest harness really ended. Drop the
+                // runtime, report exit truth, and tear the VM down so a dead node
+                // never leaks a microVM.
+                ExitWatch::Exited(_) => {
+                    runtimes.write().await.remove(&vm_id_owned);
+                    exit_sink(node_id, exit_watch_to_outcome(watch));
+                    let _ = teardown.teardown_vm(&vm_id_owned).await;
+                }
+                // C1: the exit SIGNAL was lost (transient SSE error / close without
+                // an exit_code) -- we do NOT know the guest died. A network blip
+                // must not destroy a healthy VM and its workspace. Mark the node
+                // errored/unknown (stream_lost), KEEP the VM and the runtime, and
+                // log; reconciliation or an operator can reclaim it deliberately.
+                ExitWatch::StreamLost => {
+                    tracing::warn!(
+                        node_id = %node_id,
+                        vm_id = %vm_id_owned,
+                        "loon exit stream lost (no exit_code); marking node errored, keeping VM"
+                    );
+                    exit_sink(node_id, exit_watch_to_outcome(watch));
+                }
+            }
         });
 
         let runtime = LoonRuntime {
@@ -652,6 +721,7 @@ impl LoonSubstrate {
             input_tx: input_tx.clone(),
             output_tx: output_tx.clone(),
             tasks: Arc::new(Mutex::new(vec![read_task, write_task, exit_task])),
+            submit_lock: Arc::new(Mutex::new(())),
         };
         self.runtimes
             .write()
@@ -672,7 +742,11 @@ impl LoonSubstrate {
     // ---- input / control --------------------------------------------------
 
     pub async fn send_input(&self, external_id: &str, text: &str) -> Result<()> {
-        let tx = self.input_for(external_id).await?;
+        let (tx, submit_lock) = self.input_and_submit_lock_for(external_id).await?;
+        // M5: serialize the whole body -> gap -> CR sequence per node. The input
+        // channel is FIFO, but the gap between the body and the CR lets a second
+        // concurrent submit slip its body/CR in between without this lock.
+        let _submit = submit_lock.lock().await;
         // W0 submit contract: body burst, gap, then a lone CR as a distinct write.
         tx.send(text.as_bytes().to_vec())
             .map_err(|_| anyhow!("node not running"))?;
@@ -793,18 +867,36 @@ impl LoonSubstrate {
         Ok(runtime.input_tx.clone())
     }
 
+    /// Clone both the input channel and the per-node submit lock (M5).
+    async fn input_and_submit_lock_for(
+        &self,
+        external_id: &str,
+    ) -> Result<(mpsc::UnboundedSender<Vec<u8>>, Arc<Mutex<()>>)> {
+        let runtimes = self.runtimes.read().await;
+        let runtime = runtimes
+            .get(external_id)
+            .ok_or_else(|| anyhow!("node not running"))?;
+        Ok((runtime.input_tx.clone(), runtime.submit_lock.clone()))
+    }
+
     // ---- loon HTTP helpers ------------------------------------------------
 
     async fn exec_signal(&self, vm_id: &str, exec_id: &str, signal: &str) -> Result<()> {
         let base = self.api_base()?.to_string();
         let key = self.api_key()?.to_string();
         let http = self.http()?;
-        http.post(format!("{base}/instances/{vm_id}/exec/{exec_id}/signal"))
+        let resp = http
+            .post(format!("{base}/instances/{vm_id}/exec/{exec_id}/signal"))
             .bearer_auth(&key)
             .json(&json!({ "signal": signal }))
             .send()
             .await
             .context("send exec signal")?;
+        // m9: a 4xx/5xx used to be swallowed as success, hiding a real API
+        // failure of the graceful-shutdown SIGTERM.
+        if !resp.status().is_success() {
+            return Err(anyhow!("loon exec signal returned {}", resp.status()));
+        }
         Ok(())
     }
 
@@ -812,12 +904,16 @@ impl LoonSubstrate {
         let base = self.api_base()?.to_string();
         let key = self.api_key()?.to_string();
         let http = self.http()?;
-        http.post(format!("{base}/instances/{vm_id}/exec/{exec_id}/resize"))
+        let resp = http
+            .post(format!("{base}/instances/{vm_id}/exec/{exec_id}/resize"))
             .bearer_auth(&key)
             .json(&json!({ "cols": cols, "rows": rows }))
             .send()
             .await
             .context("resize exec pty")?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("loon exec resize returned {}", resp.status()));
+        }
         Ok(())
     }
 
@@ -924,24 +1020,35 @@ impl LoonSubstrate {
     }
 }
 
-/// Hold the SSE exec-stream open and map its `exit` event to an `ExitOutcome`.
-/// For a PTY exec this stream carries only the exit notification.
-async fn watch_exit(http: &Client, url: &str, key: &str) -> super::ExitOutcome {
+/// Outcome of watching the SSE exec-stream for a guest exit. Only a parsed
+/// `exit_code` frame is authoritative; anything else (connect failure, mid-stream
+/// error, or close without an exit_code) is a LOST stream, not a clean exit.
+enum ExitWatch {
+    /// Authoritative: the exec reported this exit code.
+    Exited(u32),
+    /// The exit signal was lost -- we do not know how (or whether) the guest
+    /// ended. Never reported as success; the caller keeps the VM (C1).
+    StreamLost,
+}
+
+/// Hold the SSE exec-stream open and classify how it ended. For a PTY exec this
+/// stream carries only the exit notification. Honest mapping (C1): only a parsed
+/// `exit_code` frame is an authoritative exit; a connect failure, a mid-stream
+/// byte error, or a close before any exit_code is a lost stream, NOT a clean end.
+async fn watch_exit(http: &Client, url: &str, key: &str) -> ExitWatch {
     let resp = match http.get(url).bearer_auth(key).send().await {
         Ok(r) if r.status().is_success() => r,
-        _ => {
-            return super::ExitOutcome {
-                success: false,
-                code: None,
-            }
-        }
+        // Could not even establish the exit stream: unknown, not a clean exit.
+        _ => return ExitWatch::StreamLost,
     };
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
     while let Some(chunk) = stream.next().await {
         let bytes = match chunk {
             Ok(b) => b,
-            Err(_) => break,
+            // Mid-stream transport error: the exit signal is lost. Do NOT invent
+            // a clean exit and do NOT let the caller tear the VM down.
+            Err(_) => return ExitWatch::StreamLost,
         };
         buf.push_str(&String::from_utf8_lossy(&bytes));
         // Parse complete SSE data lines looking for an exit_code.
@@ -951,19 +1058,32 @@ async fn watch_exit(http: &Client, url: &str, key: &str) -> super::ExitOutcome {
             if let Some(data) = line.strip_prefix("data:") {
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(data.trim()) {
                     if let Some(code) = value.get("exit_code").and_then(|v| v.as_i64()) {
-                        return super::ExitOutcome {
-                            success: code == 0,
-                            code: Some(code as u32),
-                        };
+                        return ExitWatch::Exited(code as u32);
                     }
                 }
             }
         }
     }
-    // Stream ended without a parseable exit code: treat as a clean end.
-    super::ExitOutcome {
-        success: true,
-        code: None,
+    // Stream ended without a parseable exit code: the signal is lost, not a
+    // clean end. This is the exact path that used to report success: true.
+    ExitWatch::StreamLost
+}
+
+/// Map an `ExitWatch` into the substrate-wide `ExitOutcome`. A lost stream is
+/// surfaced with `stream_lost: true` so the exit sink records node.errored
+/// (never a clean-exit lie) and the caller keeps the VM.
+fn exit_watch_to_outcome(watch: ExitWatch) -> super::ExitOutcome {
+    match watch {
+        ExitWatch::Exited(code) => super::ExitOutcome {
+            success: code == 0,
+            code: Some(code),
+            stream_lost: false,
+        },
+        ExitWatch::StreamLost => super::ExitOutcome {
+            success: false,
+            code: None,
+            stream_lost: true,
+        },
     }
 }
 
@@ -1218,7 +1338,13 @@ fn shell_single_quote(s: &str) -> String {
 }
 
 fn toml_key(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    format!("\"{escaped}\"")
 }
 
 
@@ -1231,6 +1357,37 @@ mod tests {
         assert_eq!(decode_hex("00ff10"), Some(vec![0x00, 0xff, 0x10]));
         assert_eq!(decode_hex("aa:bb"), Some(vec![0xaa, 0xbb]));
         assert_eq!(decode_hex("abc"), None);
+    }
+
+    // C1: the exit-watch -> ExitOutcome mapping must be honest. Only a parsed
+    // exit_code is authoritative; a lost stream is NEVER reported as a clean exit
+    // and carries stream_lost so the caller keeps the VM.
+    #[test]
+    fn exit_watch_maps_honestly() {
+        let clean = exit_watch_to_outcome(ExitWatch::Exited(0));
+        assert!(clean.success && !clean.stream_lost && clean.code == Some(0));
+
+        let abnormal = exit_watch_to_outcome(ExitWatch::Exited(137));
+        assert!(!abnormal.success && !abnormal.stream_lost && abnormal.code == Some(137));
+
+        let lost = exit_watch_to_outcome(ExitWatch::StreamLost);
+        assert!(
+            !lost.success,
+            "a lost exit stream must never be reported as success (the C1 bug)"
+        );
+        assert!(
+            lost.stream_lost,
+            "a lost stream must be flagged so the caller keeps the VM"
+        );
+        assert!(lost.code.is_none());
+    }
+
+    #[test]
+    fn toml_key_escapes_control_chars() {
+        // n4: an embedded newline must be escaped so it cannot break out of the
+        // quoted TOML value.
+        assert_eq!(toml_key("a\nb"), "\"a\\nb\"");
+        assert_eq!(toml_key("a\"b"), "\"a\\\"b\"");
     }
 
     #[test]

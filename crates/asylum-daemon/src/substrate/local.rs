@@ -35,6 +35,16 @@ const LAUNCH_READY_MAX: Duration = Duration::from_secs(10);
 /// composer does nothing in both claude and codex.
 const LAUNCH_SUBMIT_NUDGES: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(10)];
 
+/// Addendum B: on stop, claude nodes are asked to quit cleanly (the `/exit`
+/// slash command) so the harness flushes its session transcript before we fall
+/// back to killing the process. Bounded so a wedged harness still gets torn
+/// down promptly.
+const GRACEFUL_QUIT_WAIT: Duration = Duration::from_secs(5);
+const GRACEFUL_QUIT_POLL: Duration = Duration::from_millis(100);
+/// claude 2.1.202 clean-quit slash command (verified via docs: `/quit` aliases
+/// `/exit`). Delivered as a submitted message (body + CR) like any TUI input.
+const CLAUDE_QUIT_COMMAND: &str = "/exit";
+
 /// Deliver `text` to a writer as a SUBMITTED message: write the body, pause, then
 /// write a lone carriage return as a DISTINCT write. Claude's TUI uses auto-paste
 /// / bracketed-paste detection, so a CR bundled into the same write as the body
@@ -42,7 +52,18 @@ const LAUNCH_SUBMIT_NUDGES: [Duration; 2] = [Duration::from_secs(5), Duration::f
 /// keystroke submits. codex additionally suppresses Enter-as-submit for 120ms
 /// after a paste burst ends, so the gap before the CR must exceed that window
 /// (live-verified: 50ms left the prompt sitting in codex's composer).
-async fn submit_over_writer(writer: &Arc<Mutex<Box<dyn Write + Send>>>, text: &str) -> Result<()> {
+async fn submit_over_writer(
+    submit_lock: &Arc<Mutex<()>>,
+    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    text: &str,
+) -> Result<()> {
+    // M5: hold a per-node submit lock across the ENTIRE body -> gap -> CR
+    // sequence. The writer mutex alone is insufficient: it is released during
+    // SUBMIT_GAP, so two concurrent submits would interleave as
+    // body_a, body_b, CR, CR -- both bodies land in the composer and the first
+    // CR submits the concatenation. Serializing the whole sequence makes each
+    // submit atomic relative to every other submit on the same node.
+    let _submit = submit_lock.lock().await;
     {
         let mut w = writer.lock().await;
         w.write_all(text.as_bytes())?;
@@ -62,6 +83,7 @@ async fn submit_over_writer(writer: &Arc<Mutex<Box<dyn Write + Send>>>, text: &s
 /// window (initial render finished). No output content is inspected — this is
 /// timing only, keeping Asylum as dumb plumbing.
 async fn await_ready_and_deliver(
+    submit_lock: Arc<Mutex<()>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     mut rx: broadcast::Receiver<String>,
     prompt: String,
@@ -86,7 +108,7 @@ async fn await_ready_and_deliver(
             _ => break,
         }
     }
-    match submit_over_writer(&writer, &prompt).await {
+    match submit_over_writer(&submit_lock, &writer, &prompt).await {
         Ok(()) => tracing::debug!(node_id = %node_id, "delivered launch prompt"),
         Err(e) => {
             tracing::warn!(node_id = %node_id, error = %e, "launch prompt delivery failed")
@@ -103,6 +125,7 @@ async fn await_ready_and_deliver(
     }
     for delay in LAUNCH_SUBMIT_NUDGES {
         tokio::time::sleep(delay).await;
+        let _submit = submit_lock.lock().await;
         let mut w = writer.lock().await;
         if w.write_all(b"\r").and_then(|_| w.flush()).is_err() {
             break;
@@ -120,6 +143,12 @@ struct LocalRuntime {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     output_tx: broadcast::Sender<String>,
     killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
+    /// M5: per-node lock held across a whole submit sequence so concurrent
+    /// send_input calls cannot interleave their body/CR writes.
+    submit_lock: Arc<Mutex<()>>,
+    /// Addendum B: the harness kind, so stop() can send the harness's clean-quit
+    /// command (claude `/exit`) before falling back to SIGKILL.
+    harness: HarnessKind,
 }
 
 /// How a local harness process ended, reported to the exit sink so the
@@ -129,6 +158,12 @@ struct LocalRuntime {
 pub struct ExitOutcome {
     pub success: bool,
     pub code: Option<u32>,
+    /// True when the exit signal was LOST (e.g. a loon SSE exec-stream errored or
+    /// closed without an exit_code frame) rather than an authoritative exec exit.
+    /// The exit sink maps this to node.errored/"stream_lost" (never a clean-exit
+    /// lie), and the loon exit path must NOT tear the VM down on it (C1). Always
+    /// false for the local substrate, whose child.wait() is authoritative.
+    pub stream_lost: bool,
 }
 
 #[derive(Clone)]
@@ -213,6 +248,7 @@ impl LocalSubstrate {
         let exit_sink = self.exit_sink.clone();
         let runtimes_for_exit = self.runtimes.clone();
         let writer_arc: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(writer));
+        let submit_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         let (output_tx, _) = broadcast::channel(1024);
         let output_tx_for_reader = output_tx.clone();
 
@@ -222,7 +258,14 @@ impl LocalSubstrate {
         // message once the TUI is ready (bug fix: a positional prompt argv is
         // never auto-submitted by interactive harnesses).
         let launch_delivery = ctx.launch_prompt.clone().filter(|p| !p.is_empty()).map(
-            |prompt| (prompt, output_tx.subscribe(), writer_arc.clone()),
+            |prompt| {
+                (
+                    prompt,
+                    output_tx.subscribe(),
+                    writer_arc.clone(),
+                    submit_lock.clone(),
+                )
+            },
         );
 
         // Insert into runtimes before spawning the reader task so that any
@@ -233,15 +276,18 @@ impl LocalSubstrate {
                 writer: writer_arc,
                 output_tx,
                 killer: Arc::new(Mutex::new(killer)),
+                submit_lock,
+                harness: ctx.harness.clone(),
             },
         );
 
-        if let Some((prompt, rx, writer)) = launch_delivery {
+        if let Some((prompt, rx, writer, submit_lock)) = launch_delivery {
             // Submit nudges only for harnesses that swallow the submitting CR
             // during startup (codex). Claude submits reliably on delivery and
             // may already be mid-dialog when a nudge would land.
             let submit_nudges = matches!(ctx.harness, HarnessKind::Codex);
             tokio::spawn(await_ready_and_deliver(
+                submit_lock,
                 writer,
                 rx,
                 prompt,
@@ -291,10 +337,12 @@ impl LocalSubstrate {
                 Ok(status) => ExitOutcome {
                     success: status.success(),
                     code: Some(status.exit_code()),
+                    stream_lost: false,
                 },
                 Err(_) => ExitOutcome {
                     success: false,
                     code: None,
+                    stream_lost: false,
                 },
             };
             // Harness exited (either on its own or via stop()); drop the runtime
@@ -316,8 +364,8 @@ impl LocalSubstrate {
     /// decision feedback uses to drive a worker, so a single call must both enter
     /// the text AND submit it.
     pub async fn send_input(&self, node_id: Uuid, text: &str) -> Result<()> {
-        let writer = self.writer_for(node_id).await?;
-        submit_over_writer(&writer, text).await
+        let (writer, submit_lock) = self.writer_and_submit_lock_for(node_id).await?;
+        submit_over_writer(&submit_lock, &writer, text).await
     }
 
     /// Write bytes to the node's PTY verbatim, with NO appended submit key. This
@@ -343,6 +391,19 @@ impl LocalSubstrate {
         Ok(runtime.writer.clone())
     }
 
+    /// Clone both the shared writer and the per-node submit lock (M5), releasing
+    /// the runtimes map lock before the caller runs the submit sequence.
+    async fn writer_and_submit_lock_for(
+        &self,
+        node_id: Uuid,
+    ) -> Result<(Arc<Mutex<Box<dyn Write + Send>>>, Arc<Mutex<()>>)> {
+        let runtimes = self.runtimes.read().await;
+        let runtime = runtimes
+            .get(&node_id)
+            .ok_or_else(|| anyhow!("node not running"))?;
+        Ok((runtime.writer.clone(), runtime.submit_lock.clone()))
+    }
+
     pub async fn attach(&self, node_id: Uuid) -> Result<broadcast::Receiver<String>> {
         let runtimes = self.runtimes.read().await;
         let runtime = runtimes
@@ -363,6 +424,37 @@ impl LocalSubstrate {
     }
 
     pub async fn stop(&self, node_id: Uuid) -> Result<()> {
+        // Clone the runtime handles WITHOUT removing the entry yet: the graceful
+        // path needs the process to exit on its own so the reader task records the
+        // real (clean) exit outcome and removes the runtime itself.
+        let runtime = { self.runtimes.read().await.get(&node_id).cloned() };
+        let Some(runtime) = runtime else {
+            return Ok(());
+        };
+
+        // Addendum B: claude flushes its session transcript on a clean quit, so
+        // ask it to `/exit` first and give the process a bounded window to leave
+        // before we resort to SIGKILL (which would drop the transcript tail).
+        // Codex has no cheap in-band clean-quit that reliably terminates the
+        // process from a single PTY write (its `/quit` needs a confirm and a
+        // stray CR can select a dialog default), so codex stays on the direct
+        // kill path below -- documented here rather than guessed at.
+        if matches!(runtime.harness, HarnessKind::ClaudeCode) {
+            let _ = submit_over_writer(&runtime.submit_lock, &runtime.writer, CLAUDE_QUIT_COMMAND)
+                .await;
+            let deadline = tokio::time::Instant::now() + GRACEFUL_QUIT_WAIT;
+            while tokio::time::Instant::now() < deadline {
+                // The reader task removes the runtime from the map when the child
+                // exits; a miss means the clean quit worked and no kill is needed.
+                if !self.runtimes.read().await.contains_key(&node_id) {
+                    return Ok(());
+                }
+                tokio::time::sleep(GRACEFUL_QUIT_POLL).await;
+            }
+        }
+
+        // Fallback (non-claude, or claude that did not quit in time): remove the
+        // runtime and SIGKILL the child.
         let runtime = {
             let mut runtimes = self.runtimes.write().await;
             runtimes.remove(&node_id)
@@ -422,7 +514,8 @@ mod tests {
         let writes = recorder.writes.clone();
         let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(recorder)));
 
-        submit_over_writer(&writer, "Reply with exactly: SEND-OK")
+        let submit_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        submit_over_writer(&submit_lock, &writer, "Reply with exactly: SEND-OK")
             .await
             .expect("submit sequence should succeed");
 
@@ -447,13 +540,49 @@ mod tests {
         let writes = recorder.writes.clone();
         let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(recorder)));
 
-        submit_over_writer(&writer, "hello").await.unwrap();
+        let submit_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        submit_over_writer(&submit_lock, &writer, "hello").await.unwrap();
 
         let recorded = writes.lock().unwrap();
         assert!(
             !recorded[0].contains(&b'\r'),
             "body write must not contain a carriage return"
         );
+    }
+
+    /// M5: two concurrent submits sharing one node's writer + submit lock must
+    /// NOT interleave. Without the per-node submit lock the writes would come out
+    /// as body_a, body_b, CR, CR (both bodies concatenated, one stray Enter);
+    /// with it each submit's [body, CR] pair stays contiguous.
+    #[tokio::test]
+    async fn concurrent_submits_do_not_interleave_body_and_cr() {
+        let recorder = RecordingWriter::default();
+        let writes = recorder.writes.clone();
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(recorder)));
+        let submit_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+
+        let (w1, l1) = (writer.clone(), submit_lock.clone());
+        let (w2, l2) = (writer.clone(), submit_lock.clone());
+        let a = tokio::spawn(async move { submit_over_writer(&l1, &w1, "AAAA").await });
+        let b = tokio::spawn(async move { submit_over_writer(&l2, &w2, "BBBB").await });
+        a.await.unwrap().unwrap();
+        b.await.unwrap().unwrap();
+
+        let recorded = writes.lock().unwrap();
+        assert_eq!(recorded.len(), 4, "expected body,CR,body,CR; got {recorded:?}");
+        // Each submit must be a contiguous [body, CR] pair; neither ordering is
+        // interleaved. Whichever ran first, its body is immediately followed by
+        // its own CR.
+        assert_eq!(recorded[1], b"\r", "first submit's CR must follow its body");
+        assert_eq!(recorded[3], b"\r", "second submit's CR must follow its body");
+        assert!(
+            recorded[0] != b"\r" && recorded[2] != b"\r",
+            "bodies must occupy the non-CR slots: {recorded:?}"
+        );
+        // And the two bodies are the two distinct messages, never merged.
+        let mut bodies = vec![recorded[0].clone(), recorded[2].clone()];
+        bodies.sort();
+        assert_eq!(bodies, vec![b"AAAA".to_vec(), b"BBBB".to_vec()]);
     }
 
     /// End-to-end launch delivery through a real PTY. A harness that prints a
@@ -496,6 +625,58 @@ mod tests {
             delivered,
             "launch prompt was not delivered/submitted over the PTY; captured: {:?}",
             collected.lock().unwrap()
+        );
+    }
+
+    /// Addendum B: stopping a claude node writes the clean-quit command over the
+    /// PTY and lets the process exit on its own (flushing its transcript) before
+    /// the SIGKILL fallback. The stand-in process reads one line and exits 0 iff
+    /// it received `/exit`; had stop() gone straight to SIGKILL, the process
+    /// would have been killed mid-read and the outcome would not be a clean
+    /// self-exit (code 0).
+    #[tokio::test]
+    async fn claude_stop_sends_exit_command_and_lets_process_quit_cleanly() {
+        let outcome: Arc<StdMutex<Option<ExitOutcome>>> = Arc::new(StdMutex::new(None));
+        let outcome_sink = outcome.clone();
+        let substrate = LocalSubstrate::new_with_sinks(
+            |_id, _text| {},
+            |_id, _req| {},
+            move |_id, o| {
+                *outcome_sink.lock().unwrap() = Some(o);
+            },
+        );
+
+        let node_id = Uuid::new_v4();
+        let ctx = crate::substrate::SubstrateContext {
+            node_id,
+            harness: HarnessKind::ClaudeCode,
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "IFS= read -r line; case \"$line\" in */exit*) exit 0;; *) exit 3;; esac"
+                    .to_string(),
+            ],
+            workspace: None,
+            env: Vec::new(),
+            launch_prompt: None,
+        };
+        substrate.launch(ctx).await.expect("launch should succeed");
+        // Let the shell reach its read() before we stop it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        substrate.stop(node_id).await.expect("stop should succeed");
+
+        let mut got = None;
+        for _ in 0..100 {
+            if let Some(o) = *outcome.lock().unwrap() {
+                got = Some(o);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let got = got.expect("exit outcome should have been recorded");
+        assert!(
+            got.success && got.code == Some(0),
+            "claude stop should quit the process cleanly via /exit (expected success exit 0), got {got:?}"
         );
     }
 }

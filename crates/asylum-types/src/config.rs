@@ -97,10 +97,6 @@ pub struct LoonConfig {
     #[serde(default = "default_loon_endpoint")]
     pub endpoint: String,
     #[serde(default)]
-    pub api_key_file: Option<PathBuf>,
-    #[serde(default)]
-    pub cert_fingerprint_file: Option<PathBuf>,
-    #[serde(default)]
     pub cli_path: Option<PathBuf>,
     #[serde(default)]
     pub enabled: bool,
@@ -166,8 +162,6 @@ impl Default for LoonConfig {
     fn default() -> Self {
         Self {
             endpoint: "http://127.0.0.1:7777".to_string(),
-            api_key_file: None,
-            cert_fingerprint_file: None,
             cli_path: None,
             enabled: false,
             config_path: None,
@@ -182,6 +176,14 @@ impl Default for LoonConfig {
     }
 }
 
+/// ntfy channel config. SECURITY (M8): the topic is a control channel, not just
+/// an alert feed. A correlated reply on this topic auto-resolves a pending
+/// decision and injects the reply text into the node's harness. The correlation
+/// token in the push body is anti-collision only (32 hex chars), NOT a secret --
+/// it travels in cleartext. Anyone who can PUBLISH to the topic can drive input
+/// into your workers, so topic write-access equals fleet control. Use a private,
+/// unguessable `topic` and, where the server supports it, a publish ACL via
+/// `token`. See README "ntfy Notifications".
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NtfyConfig {
     pub server: Option<String>,

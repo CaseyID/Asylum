@@ -1123,6 +1123,14 @@ async fn attach_output_for(
 
 /// Route raw attach input (no appended submit key) to the node's owning
 /// substrate PTY.
+///
+/// Addendum C: this raw interactive-attach path intentionally records NO
+/// `InputSent` event. Unlike `CapabilityService::send_input` (the programmatic
+/// one-message-per-call API, which does record `InputSent`), this path carries a
+/// live operator terminal's per-keystroke byte stream. Emitting an event per
+/// keystroke would spam the event log with no useful granularity, so the raw
+/// attach stream is deliberately left off the event ledger; the attach session
+/// itself is the audit unit.
 async fn route_attach_input(
     service: &crate::capability_service::CapabilityService,
     node: &asylum_types::node::NodeRecord,
@@ -1757,29 +1765,41 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    let has_bearer = request
+    let path = request.uri().path().to_string();
+
+    // Bearer header: validate, then M3 scope-check (a per-node guest token may
+    // only act on its own node's path).
+    let header_value = request
         .headers()
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| state.service.validate_owner_token(Some(value)));
-
-    if has_bearer {
-        return next.run(request).await;
+        .map(|v| v.to_string());
+    if let Some(value) = header_value {
+        if state.service.validate_owner_token(Some(&value)) {
+            let raw = value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+                .unwrap_or(&value);
+            if state.service.scoped_token_authorizes_path(raw, &path) {
+                return next.run(request).await;
+            }
+            return forbidden_cross_node();
+        }
     }
 
     // Browser WebSocket clients cannot set custom headers; accept a ?token= query param.
-    let has_query_token = request
-        .uri()
-        .query()
-        .and_then(|query| {
-            url::form_urlencoded::parse(query.as_bytes())
-                .find(|(key, _)| key == "token")
-                .map(|(_, value)| value.into_owned())
-        })
-        .is_some_and(|token| state.service.validate_owner_token_value(&token));
-
-    if has_query_token {
-        return next.run(request).await;
+    let query_token = request.uri().query().and_then(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .find(|(key, _)| key == "token")
+            .map(|(_, value)| value.into_owned())
+    });
+    if let Some(token) = query_token {
+        if state.service.validate_owner_token_value(&token) {
+            if state.service.scoped_token_authorizes_path(&token, &path) {
+                return next.run(request).await;
+            }
+            return forbidden_cross_node();
+        }
     }
 
     (
@@ -1787,6 +1807,19 @@ pub async fn auth_middleware(
         Json(ErrorPayload {
             code: "unauthorized".to_string(),
             message: "missing or invalid token".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+/// M3: a valid per-node guest token tried to act outside its own node (or on the
+/// token-management surface). Authenticated but not authorized.
+fn forbidden_cross_node() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorPayload {
+            code: "forbidden".to_string(),
+            message: "token is scoped to its own node and may not act on this resource".to_string(),
         }),
     )
         .into_response()

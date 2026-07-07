@@ -67,6 +67,8 @@ export ASYLUM_NTFY_TOKEN="your-access-token"  # if your server requires auth
 
 When configured, the daemon subscribes to the topic at startup. Inbound ntfy messages appear as toasts in Cockpit and trigger `channel.inbound` hooks. Nodes can send outbound notifications via `asylum notify send`.
 
+**Security — the ntfy topic is a control channel, not just alerts.** An escalation sent to your topic carries a short correlation token in the message body; a reply quoting that token *resolves the pending decision and injects the reply text straight into the node's harness*. The correlation token is not a secret (it is transmitted in cleartext in the push, and is a 32-hex-character value only to avoid collisions), so anyone who can **publish** to the topic can read the escalation, extract the token, and drive input into your workers — ntfy topic write-access is effectively fleet control. Use a **private, unguessable topic name** and, on any server that supports it, an ACL that restricts publish access (`ASYLUM_NTFY_TOKEN`). Never use a short or shared topic. If you cannot restrict publish access, treat inbound replies as untrusted and do not rely on ntfy for decision resolution.
+
 ### Known Limits
 
 - Asylum is single-user in v0.1.x. Owner tokens protect HTTP access, but token scopes are advisory labels, not per-route authorization.
