@@ -70,6 +70,35 @@ impl super::HarnessAdapter for CodexHarness {
         context.instruction_prompt()
     }
 
+    fn supports_model(&self) -> bool {
+        true
+    }
+
+    fn supports_effort(&self) -> bool {
+        true
+    }
+
+    fn profile_args(
+        &self,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<Vec<String>, super::UnsupportedProfileOption> {
+        // codex 0.144.1: dotted TOML config overrides `-c model=<value>` and
+        // `-c model_reasoning_effort=<value>`. Values pass through verbatim --
+        // codex parses each as TOML with a raw-string fallback, so a bare model
+        // name works; Asylum keeps no catalog and validates nothing.
+        let mut args = Vec::new();
+        if let Some(model) = model {
+            args.push("-c".to_string());
+            args.push(format!("model={model}"));
+        }
+        if let Some(effort) = effort {
+            args.push("-c".to_string());
+            args.push(format!("model_reasoning_effort={effort}"));
+        }
+        Ok(args)
+    }
+
     fn asylum_control_args(
         &self,
         asylum_binary: &str,

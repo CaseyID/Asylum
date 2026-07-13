@@ -17,6 +17,29 @@ pub enum HarnessError {
     UnknownHarness,
 }
 
+/// An explicit launch-profile option (`model`/`effort`) the requested harness
+/// cannot express. Returned by `HarnessAdapter::profile_args` so create/spawn
+/// surface an honest error to the client (CAP-012 shape) instead of silently
+/// dropping the option. Asylum validates nothing about the *value* -- the harness
+/// is authoritative -- this only reports that the harness has no flag for it.
+#[derive(Debug)]
+pub struct UnsupportedProfileOption {
+    pub harness: HarnessKind,
+    pub option: &'static str,
+}
+
+impl std::fmt::Display for UnsupportedProfileOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "harness {} does not support the launch-profile option '{}'",
+            self.harness, self.option
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedProfileOption {}
+
 /// How an in-guest / local harness resolves the Asylum daemon for the injected
 /// MCP server and hook bridge. Local nodes use the unauthenticated unix socket;
 /// Loon nodes cross the VM boundary and must resolve over HTTP with a per-node
@@ -81,6 +104,45 @@ pub trait HarnessAdapter: Send + Sync {
     /// output-quiescence timer for `node.idle` (codex).
     fn native_idle_signal(&self) -> bool {
         false
+    }
+
+    /// Whether this harness accepts a per-launch model override. Descriptors read
+    /// this to advertise the control honestly rather than hardcoding a list.
+    fn supports_model(&self) -> bool {
+        false
+    }
+
+    /// Whether this harness accepts a per-launch reasoning-effort override.
+    fn supports_effort(&self) -> bool {
+        false
+    }
+
+    /// Translate a launch profile (model / reasoning effort) into the harness's
+    /// per-launch argv, appended after `launch_args()` and the control injection
+    /// but before the caller's trailing `request.launch_args`. Values pass through
+    /// VERBATIM -- Asylum keeps no model/effort catalog and validates nothing; the
+    /// harness is authoritative. An option the adapter cannot express returns an
+    /// `UnsupportedProfileOption` error that propagates out of create/spawn as a
+    /// clear client error -- an option is never silently dropped. The default
+    /// implementation supports neither option.
+    fn profile_args(
+        &self,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<Vec<String>, UnsupportedProfileOption> {
+        if model.is_some() {
+            return Err(UnsupportedProfileOption {
+                harness: self.kind(),
+                option: "model",
+            });
+        }
+        if effort.is_some() {
+            return Err(UnsupportedProfileOption {
+                harness: self.kind(),
+                option: "effort",
+            });
+        }
+        Ok(Vec::new())
     }
 }
 
@@ -456,6 +518,134 @@ mod tests {
         assert!(argv.iter().any(|a| a == "--mcp-config"));
         assert!(argv.iter().any(|a| a == "--strict-mcp-config"));
         assert!(argv.iter().any(|a| a == "--settings"));
+    }
+
+    #[test]
+    fn claude_profile_args_emit_model_and_effort_flags_verbatim() {
+        let registry = HarnessRegistry::default();
+        let claude = registry.get(&HarnessKind::ClaudeCode).unwrap();
+
+        assert!(claude.supports_model());
+        assert!(claude.supports_effort());
+
+        // Both options: `--model <v>` then `--effort <v>`, values verbatim.
+        let args = claude.profile_args(Some("opus"), Some("high")).unwrap();
+        assert_eq!(args, vec!["--model", "opus", "--effort", "high"]);
+
+        // Only model.
+        let args = claude.profile_args(Some("sonnet-4.5"), None).unwrap();
+        assert_eq!(args, vec!["--model", "sonnet-4.5"]);
+
+        // Only effort.
+        let args = claude.profile_args(None, Some("max")).unwrap();
+        assert_eq!(args, vec!["--effort", "max"]);
+
+        // Neither: empty argv, no error.
+        assert!(claude.profile_args(None, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn codex_profile_args_emit_dotted_config_overrides_verbatim() {
+        let registry = HarnessRegistry::default();
+        let codex = registry.get(&HarnessKind::Codex).unwrap();
+
+        assert!(codex.supports_model());
+        assert!(codex.supports_effort());
+
+        let args = codex.profile_args(Some("gpt-5-codex"), Some("high")).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                "model=gpt-5-codex",
+                "-c",
+                "model_reasoning_effort=high"
+            ]
+        );
+
+        let args = codex.profile_args(Some("o3"), None).unwrap();
+        assert_eq!(args, vec!["-c", "model=o3"]);
+
+        let args = codex.profile_args(None, Some("low")).unwrap();
+        assert_eq!(args, vec!["-c", "model_reasoning_effort=low"]);
+
+        assert!(codex.profile_args(None, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn claude_profile_args_land_after_control_and_before_user_args() {
+        // Full create_node assembly order with a launch profile:
+        // launch_args() ++ control ++ profile ++ request.launch_args.
+        let registry = HarnessRegistry::default();
+        let claude = registry.get(&HarnessKind::ClaudeCode).unwrap();
+        let node_id = Uuid::new_v4();
+
+        let mut argv = claude.launch_args().to_vec();
+        argv.extend(claude.asylum_control_args(
+            "/opt/asylum/bin/asylum",
+            &DaemonResolution::Socket(Some("/tmp/asylum.sock")),
+            node_id,
+            Some(Uuid::new_v4()),
+        ));
+        argv.extend(claude.profile_args(Some("opus"), Some("high")).unwrap());
+        argv.extend(["--extra".to_string(), "user".to_string()]);
+
+        // Trust-bypass flag stays leading.
+        assert_eq!(argv[0], "--dangerously-skip-permissions");
+        // Control (--settings) precedes the profile flags, which precede the
+        // trailing user args.
+        let settings_pos = argv.iter().position(|a| a == "--settings").unwrap();
+        let model_pos = argv.iter().position(|a| a == "--model").unwrap();
+        let effort_pos = argv.iter().position(|a| a == "--effort").unwrap();
+        let extra_pos = argv.iter().position(|a| a == "--extra").unwrap();
+        assert!(settings_pos < model_pos);
+        assert!(model_pos < effort_pos);
+        assert!(effort_pos < extra_pos);
+        assert_eq!(argv.last().unwrap(), "user");
+    }
+
+    #[test]
+    fn default_adapter_profile_args_reject_unsupported_options_honestly() {
+        // A hypothetical adapter that overrides nothing uses the trait default,
+        // which rejects any requested profile option with an explicit error
+        // rather than silently dropping it (CAP-012 shape).
+        struct BareHarness;
+        impl HarnessAdapter for BareHarness {
+            fn kind(&self) -> HarnessKind {
+                HarnessKind::Codex
+            }
+            fn command(&self) -> &str {
+                "bare"
+            }
+            fn launch_args(&self) -> &[String] {
+                &[]
+            }
+            fn capabilities(&self) -> CapabilitySnapshot {
+                CapabilitySnapshot::default()
+            }
+            fn launch_context(
+                &self,
+                _node_id: Uuid,
+                _request: &asylum_types::api::CreateNodeRequest,
+            ) -> String {
+                String::new()
+            }
+            fn pre_trust_workspace(&self, _workspace: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let bare = BareHarness;
+        assert!(!bare.supports_model());
+        assert!(!bare.supports_effort());
+        assert!(bare.profile_args(None, None).unwrap().is_empty());
+
+        let err = bare.profile_args(Some("opus"), None).unwrap_err();
+        assert_eq!(err.option, "model");
+        assert!(err.to_string().contains("does not support"));
+
+        let err = bare.profile_args(None, Some("high")).unwrap_err();
+        assert_eq!(err.option, "effort");
     }
 
     #[test]

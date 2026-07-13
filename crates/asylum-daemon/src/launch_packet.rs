@@ -11,7 +11,7 @@ names and parameters below are exact -- no other names or params exist.
 
 ### Spawning workers
 
-- `node.spawn_peer(harness, substrate, role_hint?, workspace?, description?, prompt?, relationship_kind?, relationship_label?)`
+- `node.spawn_peer(harness, substrate, role_hint?, workspace?, description?, prompt?, relationship_kind?, relationship_label?, model?, effort?)`
   creates a peer and records a graph edge from you to it (`relationship_kind`
   defaults to `spawned_for`). `harness` is `claude_code` or `codex`; `substrate`
   is `local` or `loon`. `node_id` (source) is optional -- it defaults to you
@@ -21,9 +21,14 @@ names and parameters below are exact -- no other names or params exist.
     opening submitted turn. Set `prompt` -- not just `description` -- when you
     want the worker to act immediately on a concrete task; it saves a
     follow-up `send_input` round trip.
-- `node.create(harness, substrate, role_hint?, workspace?, description?, prompt?, created_by?)`
+  - `model` and `effort` are optional launch-profile overrides passed verbatim
+    to the harness (no Asylum catalog or validation). The peer does NOT inherit
+    your profile; omit them for the harness default. Unsupported options fail
+    with an explicit error.
+- `node.create(harness, substrate, role_hint?, workspace?, description?, prompt?, created_by?, model?, effort?)`
   creates a node without a graph edge back to you. Prefer `node.spawn_peer`
-  when you are the one doing the spawning.
+  when you are the one doing the spawning. `model`/`effort` are the same
+  verbatim launch-profile overrides as on `node.spawn_peer`.
 
 ### Watching workers without streaming their output
 

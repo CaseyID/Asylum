@@ -38,6 +38,15 @@ pub struct CreateNodeRequest {
     /// supervisor hand a worker its opening task at spawn time.
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Optional launch-profile model, passed verbatim to the harness's per-launch
+    /// model flag. Asylum keeps no model catalog and does not validate the value;
+    /// the harness is authoritative. `None` means the harness default.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional launch-profile reasoning effort, passed verbatim to the harness's
+    /// per-launch effort flag. Same dumb-plumbing policy as `model`.
+    #[serde(default)]
+    pub effort: Option<String>,
     #[serde(default)]
     pub launch_args: Vec<String>,
 }
@@ -68,6 +77,15 @@ pub struct SpawnPeerRequest {
     pub relationship_kind: Option<String>,
     #[serde(default)]
     pub relationship_label: Option<String>,
+    /// Launch-profile model for the spawned peer, passed verbatim to the harness.
+    /// A peer does NOT inherit the parent's profile: this is only applied when the
+    /// spawner sets it explicitly (`None` means the harness default).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Launch-profile reasoning effort for the spawned peer, passed verbatim. Same
+    /// no-inheritance policy as `model`.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 
@@ -161,6 +179,14 @@ pub struct HarnessDescriptor {
     pub available: bool,
     pub command: String,
     pub caps: Vec<String>,
+    /// Whether this harness accepts a per-launch model override (launch profile).
+    /// Derived from the adapter, not a hardcoded list, so Cockpit/CLI/MCP offer the
+    /// control only when it is real. Serde default keeps older wire payloads valid.
+    #[serde(default)]
+    pub supports_model: bool,
+    /// Whether this harness accepts a per-launch reasoning-effort override.
+    #[serde(default)]
+    pub supports_effort: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -563,6 +589,15 @@ pub struct ForkNodeRequest {
     pub workspace: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    /// Launch-profile model for the fork. Unlike spawn_peer, a fork reproduces
+    /// the source node's launch profile by default; set this only to override
+    /// the source's model. `None` falls back to the source's recorded model.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Launch-profile reasoning effort for the fork. `None` falls back to the
+    /// source's recorded effort. Same reproduce-the-source policy as `model`.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 impl NodeLiveness {
@@ -587,5 +622,68 @@ impl NodeLiveness {
 
     pub fn in_progress(&self) -> bool {
         !self.is_done_for_now()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_node_request_profile_fields_default_to_none() {
+        // A minimal payload without model/effort decodes to the harness-default
+        // marker (None) for both launch-profile fields.
+        let request: CreateNodeRequest = serde_json::from_value(serde_json::json!({
+            "harness": "codex",
+            "substrate": "local",
+            "role_hint": "worker",
+        }))
+        .unwrap();
+        assert_eq!(request.model, None);
+        assert_eq!(request.effort, None);
+
+        let request: CreateNodeRequest = serde_json::from_value(serde_json::json!({
+            "harness": "claude_code",
+            "substrate": "local",
+            "role_hint": "worker",
+            "model": "opus",
+            "effort": "high",
+        }))
+        .unwrap();
+        assert_eq!(request.model.as_deref(), Some("opus"));
+        assert_eq!(request.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn spawn_peer_request_profile_fields_default_to_none() {
+        // Spawn carries no profile unless set explicitly (no parent inheritance).
+        let request: SpawnPeerRequest =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(request.model, None);
+        assert_eq!(request.effort, None);
+
+        let request: SpawnPeerRequest = serde_json::from_value(serde_json::json!({
+            "model": "sonnet",
+            "effort": "low",
+        }))
+        .unwrap();
+        assert_eq!(request.model.as_deref(), Some("sonnet"));
+        assert_eq!(request.effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn harness_descriptor_support_flags_default_false_for_wire_compat() {
+        // An older daemon payload without the support flags decodes to false.
+        let descriptor: HarnessDescriptor = serde_json::from_value(serde_json::json!({
+            "id": "codex",
+            "name": "Codex",
+            "kind": "cli",
+            "available": true,
+            "command": "codex",
+            "caps": ["launch", "observe"],
+        }))
+        .unwrap();
+        assert!(!descriptor.supports_model);
+        assert!(!descriptor.supports_effort);
     }
 }

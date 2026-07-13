@@ -22,6 +22,16 @@ pub struct NodeRecord {
     /// (claude `session_id`, codex `thread-id`). Resume key for Phase C.
     #[serde(default)]
     pub harness_session_id: Option<String>,
+    /// Launch-profile model the node was actually launched with, recorded at launch
+    /// time and passed through verbatim. `None` is the explicit harness-default
+    /// marker (display layers render it as "harness default"). Survives
+    /// restart/resume so historical nodes report the profile they ran under.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Launch-profile reasoning effort the node was actually launched with. Same
+    /// harness-default marker semantics as `model`.
+    #[serde(default)]
+    pub effort: Option<String>,
     pub capabilities: CapabilitySnapshot,
     #[serde(default)]
     pub tokens_in: u64,
@@ -102,6 +112,8 @@ impl Default for NodeRecord {
             updated_at: OffsetDateTime::UNIX_EPOCH,
             external_id: None,
             harness_session_id: None,
+            model: None,
+            effort: None,
             capabilities: CapabilitySnapshot::default(),
             tokens_in: 0,
             tokens_out: 0,
@@ -221,6 +233,8 @@ mod tests {
             updated_at: OffsetDateTime::UNIX_EPOCH,
             external_id: None,
             harness_session_id: Some("sess-1".to_string()),
+            model: Some("opus".to_string()),
+            effort: Some("high".to_string()),
             capabilities: CapabilitySnapshot {
                 browser_attach: true,
                 native_attach: true,
@@ -247,12 +261,38 @@ mod tests {
         assert_eq!(value["tool_calls"], 5);
         assert_eq!(value["idle_seconds"], 7);
         assert!(value["ctx_pct"].is_number());
+        assert_eq!(value["model"], "opus");
+        assert_eq!(value["effort"], "high");
 
         let round_trip: NodeRecord = serde_json::from_value(value).unwrap();
         assert_eq!(round_trip.tokens_in, 12);
         assert_eq!(round_trip.tokens_out, 34);
         assert_eq!(round_trip.tool_calls, 5);
         assert_eq!(round_trip.idle_seconds, 7);
+        assert_eq!(round_trip.model.as_deref(), Some("opus"));
+        assert_eq!(round_trip.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn node_record_profile_defaults_to_harness_default_marker() {
+        // A payload from before launch profiles existed omits model/effort; both
+        // decode to the None harness-default marker.
+        let legacy = serde_json::json!({
+            "id": Uuid::nil(),
+            "harness": "codex",
+            "substrate": "local",
+            "role_hint": "worker",
+            "liveness": "running",
+            "workspace": null,
+            "description": "",
+            "created_at": "1970-01-01T00:00:00Z",
+            "updated_at": "1970-01-01T00:00:00Z",
+            "external_id": null,
+            "capabilities": {},
+        });
+        let node: NodeRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(node.model, None);
+        assert_eq!(node.effort, None);
     }
 
     // H4 fix: CapabilitySnapshot must tolerate JSON that is missing some or all fields,

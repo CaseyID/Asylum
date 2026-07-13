@@ -1128,6 +1128,14 @@ struct NodeCreateArgs {
     /// First instruction delivered to the node as a submitted message once ready.
     #[arg(long)]
     prompt: Option<String>,
+    /// Launch-profile model, passed verbatim to the harness (no catalog, no
+    /// validation). Omit for the harness default.
+    #[arg(long)]
+    model: Option<String>,
+    /// Launch-profile reasoning effort, passed verbatim to the harness. Omit for
+    /// the harness default.
+    #[arg(long)]
+    effort: Option<String>,
 }
 
 
@@ -1140,6 +1148,14 @@ struct NodeForkArgs {
     workspace: Option<String>,
     #[arg(long)]
     description: Option<String>,
+    /// Launch-profile model override, passed verbatim to the harness. A fork
+    /// reproduces the source's model by default; set this only to override it.
+    #[arg(long)]
+    model: Option<String>,
+    /// Launch-profile reasoning effort override, passed verbatim. Reproduces the
+    /// source's effort by default.
+    #[arg(long)]
+    effort: Option<String>,
 }
 
 #[derive(Args)]
@@ -1162,6 +1178,13 @@ struct NodeSpawnArgs {
     relationship_kind: String,
     #[arg(long)]
     relationship_label: Option<String>,
+    /// Launch-profile model for the spawned peer, passed verbatim to the harness.
+    /// The peer does not inherit the parent's profile; omit for the harness default.
+    #[arg(long)]
+    model: Option<String>,
+    /// Launch-profile reasoning effort for the spawned peer, passed verbatim.
+    #[arg(long)]
+    effort: Option<String>,
 }
 
 
@@ -1173,6 +1196,8 @@ impl NodeForkArgs {
                 role_hint: self.role,
                 workspace: self.workspace,
                 description: self.description,
+                model: self.model,
+                effort: self.effort,
             },
         )
     }
@@ -1191,6 +1216,8 @@ impl NodeSpawnArgs {
                 prompt: self.prompt,
                 relationship_kind: Some(self.relationship_kind),
                 relationship_label: self.relationship_label,
+                model: self.model,
+                effort: self.effort,
             },
 
         )
@@ -1207,6 +1234,8 @@ impl NodeCreateArgs {
             description: self.description,
             created_by: None,
             prompt: self.prompt,
+            model: self.model,
+            effort: self.effort,
             launch_args: Vec::new(),
         }
     }
@@ -2864,12 +2893,55 @@ mod tests {
             workspace: Some(".".to_string()),
             description: None,
             prompt: Some("start on the migration".to_string()),
+            model: None,
+            effort: None,
         };
         let request = args.into_request();
         assert_eq!(request.harness, "codex");
         assert_eq!(request.role_hint, "command-center");
         assert_eq!(request.substrate, "local");
         assert_eq!(request.prompt.as_deref(), Some("start on the migration"));
+        // No launch profile unless requested: both default to the harness-default
+        // marker (None).
+        assert_eq!(request.model, None);
+        assert_eq!(request.effort, None);
+    }
+
+    #[test]
+    fn node_create_args_carry_launch_profile_into_request() {
+        let args = NodeCreateArgs {
+            harness: "claude_code".to_string(),
+            substrate: "local".to_string(),
+            role: "worker".to_string(),
+            workspace: None,
+            description: None,
+            prompt: None,
+            model: Some("opus".to_string()),
+            effort: Some("high".to_string()),
+        };
+        let request = args.into_request();
+        assert_eq!(request.model.as_deref(), Some("opus"));
+        assert_eq!(request.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn node_spawn_args_carry_launch_profile_into_request() {
+        let args = NodeSpawnArgs {
+            source_node_id: Uuid::nil(),
+            harness: None,
+            substrate: None,
+            role: None,
+            workspace: None,
+            description: None,
+            prompt: None,
+            relationship_kind: "spawned_for".to_string(),
+            relationship_label: None,
+            model: Some("sonnet".to_string()),
+            effort: Some("low".to_string()),
+        };
+        let (_id, request) = args.into_request();
+        assert_eq!(request.model.as_deref(), Some("sonnet"));
+        assert_eq!(request.effort.as_deref(), Some("low"));
     }
 
 

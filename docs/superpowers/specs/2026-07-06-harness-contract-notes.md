@@ -37,3 +37,36 @@ Reference for the mission's Phase B/C work (see 2026-07-06-asylum-completion-mis
 4. Awaiting-input/decision producer = Notification `permission_prompt`/`agent_needs_input` (claude) and `approval-requested` (codex).
 5. Session identity: claude = pre-assigned `--session-id` UUID recorded at create time; codex = discovered from rollout/notify and recorded via the bridge.
 6. Resume: claude `--resume <recorded-id>` from the node's workspace dir; codex `codex resume <recorded-id>`.
+
+## 2026-07-13 -- Launch profile flags (verified live)
+
+Verified live on this machine against the installed harness versions. Asylum
+passes every value through VERBATIM -- no model/effort catalogs, no validation.
+The harness is authoritative and rejects a bad value itself.
+
+- claude 2.1.207:
+  - Model: per-launch flag `--model <value>`. Accepts an alias (`sonnet`,
+    `opus`) or a full model name.
+  - Reasoning effort: per-launch flag `--effort <level>`. Accepted values:
+    `low`, `medium`, `high`, `xhigh`, `max`.
+- codex 0.144.1:
+  - Model: dotted TOML config override `-c model=<value>`.
+  - Reasoning effort: dotted TOML config override `-c model_reasoning_effort=<value>`.
+  - Each `-c` value is parsed as TOML with a raw-string fallback, so a bare model
+    name (e.g. `-c model=gpt-5-codex`) is accepted unquoted.
+
+Implementation notes (WS2):
+- Adapter surface: `HarnessAdapter::profile_args(model, effort)` translates the
+  launch profile into the per-launch argv above; `supports_model()` /
+  `supports_effort()` advertise the capability honestly on the harness
+  descriptor. Both bundled adapters support both options; an adapter that cannot
+  express a requested option returns an explicit `UnsupportedProfileOption` error
+  (CAP-012 shape) that propagates out of `create_node`/`spawn_peer` -- never a
+  silent no-op.
+- Argv order in `create_node`: `launch_args()` ++ control injection ++
+  `profile_args` ++ per-request `launch_args` (trailing user args stay last).
+- Persistence: the effective model/effort are recorded on the node row at launch
+  time (NULL = harness default). Resume re-derives and re-applies the recorded
+  profile the same way it reuses stored `launch_args`.
+- Peers do NOT inherit the parent's profile (HARN-006); only an explicitly-set
+  `model`/`effort` on `spawn_peer` is applied.

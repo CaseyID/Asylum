@@ -1264,6 +1264,8 @@ impl CapabilityService {
                     description,
                     created_by: payload_node_id(payload).map(|id| id.to_string()),
                     prompt,
+                    model: None,
+                    effort: None,
                     launch_args: Vec::new(),
                 };
                 let response = self.create_node(request).await?;
@@ -1955,6 +1957,10 @@ impl CapabilityService {
                 available: command_available(adapter.command()),
                 command: adapter.command().to_string(),
                 caps,
+                // Advertise launch-profile support honestly, derived from the
+                // adapter -- so Cockpit/CLI/MCP offer the control only when real.
+                supports_model: adapter.supports_model(),
+                supports_effort: adapter.supports_effort(),
             });
         }
         harnesses.sort_by(|a, b| a.id.cmp(&b.id));
@@ -2063,6 +2069,13 @@ impl CapabilityService {
             .harnesses
             .get(&harness)
             .ok_or_else(|| anyhow!("missing harness adapter"))?;
+        // Translate the launch profile (model/effort) into per-launch argv up
+        // front so an option the harness cannot express fails BEFORE a node row
+        // is created (honest CAP-012 unsupported error, never a silent no-op).
+        // Values pass through verbatim -- Asylum keeps no catalog.
+        let profile_args = adapter
+            .profile_args(request.model.as_deref(), request.effort.as_deref())
+            .map_err(|err| anyhow!("{err}"))?;
         let mut capabilities = adapter.capabilities();
         if matches!(substrate, SubstrateKind::Loon) {
             // Loon guest workspaces (and the in-guest harness session) do not
@@ -2127,6 +2140,20 @@ impl CapabilityService {
             }
         }
 
+        // WS2: record the effective launch profile from what was actually applied
+        // (the request values that produced `profile_args`). None stays the
+        // harness-default marker. Persisted so inspect/Cockpit/CLI/MCP report it
+        // and resume can re-apply it. Best-effort, like launch_args above.
+        if request.model.is_some() || request.effort.is_some() {
+            if let Err(e) = self.store.set_node_launch_profile(
+                node.id,
+                request.model.as_deref(),
+                request.effort.as_deref(),
+            ) {
+                tracing::warn!(error = %e, node_id = %node.id, "failed to persist launch profile");
+            }
+        }
+
         let launch_prompt = launch_prompt_for_runtime(adapter.as_ref(), node.id, &request);
         let mut launch_args = adapter.launch_args().to_vec();
         // Pre-assign the harness session id where the harness supports it (claude
@@ -2172,6 +2199,10 @@ impl CapabilityService {
                 self.loon_launch_env(&node, &harness, &capabilities, &guest_base_url, &token)?
             }
         };
+        // Launch-profile flags land after the adapter's control injection and
+        // before the caller's trailing launch_args, matching the documented argv
+        // order (harness/mod.rs ordering tests).
+        launch_args.extend(profile_args);
         launch_args.extend(request.launch_args.clone());
         // The launch prompt is intentionally NOT appended as a positional argv.
         // Interactive harnesses (claude, codex) pre-fill a positional prompt into
@@ -2534,6 +2565,16 @@ impl CapabilityService {
                 // injection. The resumed argv then matches the created argv except
                 // for the session-id -> resume swap owned by resume_args().
                 let mut args = args;
+                // WS2: re-apply the recorded launch profile before the trailing
+                // launch_args, exactly as create_node ordered them, so the resumed
+                // session runs under the same model/effort it was launched with.
+                // Re-deriving from the stored profile is deterministic; an option
+                // the harness can no longer express surfaces as an honest error.
+                args.extend(
+                    adapter
+                        .profile_args(node.model.as_deref(), node.effort.as_deref())
+                        .map_err(|err| anyhow!("{err}"))?,
+                );
                 args.extend(self.store.get_node_launch_args(node.id).unwrap_or_default());
                 let env =
                     self.local_launch_env(&node, &harness, &node.substrate, &node.capabilities)?;
@@ -3089,6 +3130,8 @@ impl CapabilityService {
                         description: None,
                         created_by: None,
                         prompt: None,
+                        model: None,
+                        effort: None,
                         launch_args: Vec::new(),
                     })
                     .await
@@ -3938,6 +3981,10 @@ impl CapabilityService {
                 description,
                 created_by: Some(source_id.to_string()),
                 prompt: request.prompt,
+                // A spawned peer does NOT inherit the parent's profile: only the
+                // explicitly-set request values carry through (WORK-005 spirit).
+                model: request.model,
+                effort: request.effort,
                 launch_args: Vec::new(),
             })
             .await?;
@@ -3978,6 +4025,11 @@ impl CapabilityService {
         let role_hint = request.role_hint.unwrap_or(source.role_hint.clone());
         let workspace = request.workspace.or(source.workspace.clone());
         let description = request.description.unwrap_or(source.description.clone());
+        // A fork reproduces the source's launch profile by default (matching how
+        // it reproduces role/workspace/description); an explicit request value
+        // overrides it. This differs from spawn_peer, which never inherits.
+        let model = request.model.or(source.model.clone());
+        let effort = request.effort.or(source.effort.clone());
         let response = self
             .create_node(asylum_types::api::CreateNodeRequest {
                 harness: source.harness.to_string(),
@@ -3987,6 +4039,8 @@ impl CapabilityService {
                 description: Some(description),
                 created_by: None,
                 prompt: None,
+                model,
+                effort,
                 launch_args: Vec::new(),
             })
             .await?;
@@ -4381,6 +4435,8 @@ mod tests {
             description: None,
             created_by: None,
             prompt: None,
+            model: None,
+            effort: None,
             launch_args: Vec::new(),
 
         };
@@ -4400,6 +4456,8 @@ mod tests {
             description: Some(description.to_string()),
             created_by: None,
             prompt: None,
+            model: None,
+            effort: None,
             launch_args: Vec::new(),
 
         }
@@ -4417,6 +4475,8 @@ mod tests {
             description: Some(description.to_string()),
             created_by: None,
             prompt: None,
+            model: None,
+            effort: None,
             launch_args: Vec::new(),
 
         }
@@ -4431,6 +4491,8 @@ mod tests {
             description: Some(description.to_string()),
             created_by: None,
             prompt: None,
+            model: None,
+            effort: None,
             launch_args: Vec::new(),
 
         }
@@ -5805,6 +5867,240 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_create_records_and_applies_launch_profile(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _env = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let _home = EnvVarGuard::set_var("HOME", &home);
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let argv_path = workdir.path().join("argv.txt");
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let script_path = workdir.path().join("fake-codex.sh");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{argv}'\nsleep 0.2\n",
+            argv = argv_path.display(),
+        );
+        write_executable_script(&script_path, &script)?;
+
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let request = CreateNodeRequest {
+            harness: "codex".to_string(),
+            substrate: "local".to_string(),
+            role_hint: "worker".to_string(),
+            workspace: Some(workspace.display().to_string()),
+            description: Some("profile node".to_string()),
+            created_by: None,
+            prompt: None,
+            model: Some("gpt-5-codex".to_string()),
+            effort: Some("high".to_string()),
+            launch_args: Vec::new(),
+        };
+        let response = service.create_node(request).await?;
+        let node_id = Uuid::parse_str(&response.node_id)?;
+
+        // HARN-007: the effective profile is recorded on the node row and surfaces
+        // to inspect/list immediately.
+        let node = store.get_node(node_id)?.expect("node exists");
+        assert_eq!(node.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(node.effort.as_deref(), Some("high"));
+
+        for _ in 0..100 {
+            if argv_path.exists() {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        let argv = std::fs::read_to_string(&argv_path)?;
+        let args: Vec<&str> = argv.lines().collect();
+        // Profile flags reach the launched codex argv verbatim as -c overrides,
+        // after the control injection and before any trailing user launch args.
+        let model_pos = args
+            .iter()
+            .position(|a| *a == "model=gpt-5-codex")
+            .expect("model override present in argv");
+        assert_eq!(args[model_pos - 1], "-c");
+        let effort_pos = args
+            .iter()
+            .position(|a| *a == "model_reasoning_effort=high")
+            .expect("effort override present in argv");
+        assert_eq!(args[effort_pos - 1], "-c");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spawn_peer_does_not_inherit_parent_launch_profile(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _env = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let _home = EnvVarGuard::set_var("HOME", &home);
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let script_path = workdir.path().join("fake-codex.sh");
+        // Exit promptly; we only care about the recorded rows, not the argv here.
+        write_executable_script(&script_path, "#!/bin/sh\nsleep 0.1\n")?;
+
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        // Parent launched with an explicit profile.
+        let parent = service
+            .create_node(CreateNodeRequest {
+                harness: "codex".to_string(),
+                substrate: "local".to_string(),
+                role_hint: "supervisor".to_string(),
+                workspace: Some(workspace.display().to_string()),
+                description: Some("parent".to_string()),
+                created_by: None,
+                prompt: None,
+                model: Some("gpt-5-codex".to_string()),
+                effort: Some("high".to_string()),
+                launch_args: Vec::new(),
+            })
+            .await?;
+        let parent_id = Uuid::parse_str(&parent.node_id)?;
+
+        // Spawn WITHOUT a profile: the peer must run at the harness default, not
+        // inherit the parent's profile (HARN-006 / WORK-005 spirit).
+        let default_peer = service
+            .spawn_peer(parent_id, SpawnPeerRequest::default())
+            .await?;
+        assert_eq!(default_peer.node.model, None);
+        assert_eq!(default_peer.node.effort, None);
+
+        // Spawn WITH an explicit profile: it is recorded on the peer.
+        let profiled_peer = service
+            .spawn_peer(
+                parent_id,
+                SpawnPeerRequest {
+                    model: Some("o3".to_string()),
+                    effort: Some("low".to_string()),
+                    ..SpawnPeerRequest::default()
+                },
+            )
+            .await?;
+        assert_eq!(profiled_peer.node.model.as_deref(), Some("o3"));
+        assert_eq!(profiled_peer.node.effort.as_deref(), Some("low"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn harness_descriptors_advertise_profile_support(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workdir = tempfile::tempdir()?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let store = Store::open(path)?;
+        let service = CapabilityService::new(store, AuthMode::Disabled, test_app_config());
+
+        let descriptors = service.list_harness_descriptors().await;
+        // Both bundled adapters support per-launch model and effort; the flags are
+        // derived from the adapter, not hardcoded in the builder.
+        for id in ["codex", "claude_code"] {
+            let descriptor = descriptors
+                .harnesses
+                .iter()
+                .find(|d| d.id == id)
+                .unwrap_or_else(|| panic!("descriptor for {id} exists"));
+            assert!(descriptor.supports_model, "{id} must advertise model support");
+            assert!(
+                descriptor.supports_effort,
+                "{id} must advertise effort support"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_reapplies_recorded_launch_profile(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let argv_path = workdir.path().join("argv.txt");
+        // A fake harness that dumps argv and stays alive so resume reaches Running.
+        let script_path = workdir.path().join("fake-harness.sh");
+        write_executable_script(
+            &script_path,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{argv}'\ntrap '' INT\nwhile true; do sleep 1; done\n",
+                argv = argv_path.display(),
+            ),
+        )?;
+
+        let _home = EnvVarGuard::set_var("HOME", &home);
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        // A stopped codex node recorded with a launch profile.
+        let node = store.insert_node(
+            HarnessKind::Codex,
+            SubstrateKind::Local,
+            "worker",
+            Some(&workspace.display().to_string()),
+            None,
+            None,
+            CapabilitySnapshot::default(),
+            None,
+        )?;
+        let thread_id = Uuid::new_v4().to_string();
+        store.set_node_harness_session_id(node.id, Some(&thread_id))?;
+        store.set_node_launch_profile(node.id, Some("gpt-5-codex"), Some("high"))?;
+        store.set_node_liveness(node.id, NodeLiveness::Stopped)?;
+
+        // Session transcript must exist on disk for resume to proceed.
+        let rollout_dir = home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("07");
+        std::fs::create_dir_all(&rollout_dir)?;
+        std::fs::write(
+            rollout_dir.join(format!("rollout-2026-07-07T00-00-00-{thread_id}.jsonl")),
+            b"{}\n",
+        )?;
+
+        service.resume_node(node.id).await?;
+        wait_for_liveness(&store, node.id, NodeLiveness::Running).await?;
+
+        for _ in 0..100 {
+            if argv_path.exists() {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        let argv = std::fs::read_to_string(&argv_path)?;
+        let args: Vec<&str> = argv.lines().collect();
+        // The resumed argv re-applies the recorded profile verbatim.
+        let model_pos = args
+            .iter()
+            .position(|a| *a == "model=gpt-5-codex")
+            .expect("resumed argv re-applies model override");
+        assert_eq!(args[model_pos - 1], "-c");
+        assert!(args.iter().any(|a| *a == "model_reasoning_effort=high"));
+
+        let _ = service.stop_node(node.id).await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn local_create_uses_resolved_login_shell_command_for_launch(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let _env_lock = env_lock();
@@ -7166,6 +7462,8 @@ mod tests {
             description: None,
             created_by: None,
             prompt: Some("Fix the failing migration test".to_string()),
+            model: None,
+            effort: None,
             launch_args: Vec::new(),
         };
         let prompt = launch_prompt_for_runtime(adapter.as_ref(), node_id, &request);
@@ -7641,6 +7939,75 @@ mod tests {
             err.to_string().contains("not supported for Loon"),
             "unexpected error: {err}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fork_reproduces_source_launch_profile() -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let script_path = workdir.path().join("fake-harness.sh");
+        write_executable_script(
+            &script_path,
+            "#!/bin/sh\ntrap '' INT\nwhile true; do sleep 1; done\n",
+        )?;
+
+        let _home = EnvVarGuard::set_var("HOME", &home);
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let response = service
+            .create_node(local_create_request_with_workspace(
+                "profiled source",
+                &workspace.display().to_string(),
+            ))
+            .await?;
+        let source_id = Uuid::parse_str(&response.node_id)?;
+        // Record a launch profile on the source, as a real launch would.
+        store.set_node_launch_profile(source_id, Some("gpt-5-codex"), Some("high"))?;
+
+        // A fork with no profile override reproduces the source's profile.
+        let forked = service
+            .fork_node(
+                source_id,
+                ForkNodeRequest {
+                    role_hint: None,
+                    workspace: None,
+                    description: None,
+                    model: None,
+                    effort: None,
+                },
+            )
+            .await?;
+        assert_eq!(forked.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(forked.effort.as_deref(), Some("high"));
+
+        // An explicit request value overrides the source's profile.
+        let overridden = service
+            .fork_node(
+                source_id,
+                ForkNodeRequest {
+                    role_hint: None,
+                    workspace: None,
+                    description: None,
+                    model: Some("o3".to_string()),
+                    effort: None,
+                },
+            )
+            .await?;
+        assert_eq!(overridden.model.as_deref(), Some("o3"));
+        assert_eq!(overridden.effort.as_deref(), Some("high"));
+
+        let _ = service.stop_node(source_id).await;
+        let _ = service.stop_node(forked.id).await;
+        let _ = service.stop_node(overridden.id).await;
         Ok(())
     }
 

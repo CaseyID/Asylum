@@ -253,6 +253,12 @@ impl Store {
         // strings) so resume can reuse the exact extra flags the node was
         // created with, instead of silently reverting to the adapter baseline.
         ensure_column(&conn, "nodes", "launch_args", "TEXT")?;
+        // WS2: record the launch-profile model/effort the node was actually
+        // launched with (NULL = harness default). Passed through verbatim; Asylum
+        // keeps no catalog. Survives restart/resume so historical nodes report the
+        // profile they ran under (HARN-007).
+        ensure_column(&conn, "nodes", "model", "TEXT")?;
+        ensure_column(&conn, "nodes", "effort", "TEXT")?;
         // M7: track the ctx_pressure fired-state on the node row so ingest_statusline
         // never has to load-and-scan every prior harness-event body per post.
         ensure_column(&conn, "nodes", "ctx_pressure_session", "TEXT")?;
@@ -264,7 +270,7 @@ impl Store {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "
-            SELECT id,harness,substrate,role_hint,liveness,workspace,description,created_at,updated_at,external_id,capabilities_json,harness_session_id
+            SELECT id,harness,substrate,role_hint,liveness,workspace,description,created_at,updated_at,external_id,capabilities_json,harness_session_id,model,effort
             FROM nodes
             ORDER BY created_at DESC
             ",
@@ -283,7 +289,7 @@ impl Store {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "
-            SELECT id,harness,substrate,role_hint,liveness,workspace,description,created_at,updated_at,external_id,capabilities_json,harness_session_id
+            SELECT id,harness,substrate,role_hint,liveness,workspace,description,created_at,updated_at,external_id,capabilities_json,harness_session_id,model,effort
             FROM nodes
             WHERE liveness = ?1
             ORDER BY created_at DESC
@@ -351,7 +357,7 @@ impl Store {
         let id_string = id.to_string();
         let mut stmt = conn.prepare(
             "
-            SELECT id,harness,substrate,role_hint,liveness,workspace,description,created_at,updated_at,external_id,capabilities_json,harness_session_id
+            SELECT id,harness,substrate,role_hint,liveness,workspace,description,created_at,updated_at,external_id,capabilities_json,harness_session_id,model,effort
             FROM nodes
             WHERE id = ?1
             ",
@@ -600,6 +606,24 @@ impl Store {
         conn.execute(
             "UPDATE nodes SET launch_args = ?1 WHERE id = ?2",
             params![json, id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// WS2: record the launch-profile the node was actually launched with. Each
+    /// value passes through verbatim (`None` = harness default, stored as NULL).
+    /// Called at launch time from what the adapter actually applied, so inspect /
+    /// Cockpit / CLI / MCP report the real profile and resume can re-apply it.
+    pub fn set_node_launch_profile(
+        &self,
+        id: Uuid,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE nodes SET model = ?1, effort = ?2 WHERE id = ?3",
+            params![model, effort, id.to_string()],
         )?;
         Ok(())
     }
@@ -1716,6 +1740,8 @@ fn row_to_node_record(row: &rusqlite::Row<'_>) -> Result<NodeRecord> {
     let capabilities: CapabilitySnapshot =
         serde_json::from_str(&capabilities_json).context("failed to decode capabilities")?;
     let harness_session_id = row.get::<_, Option<String>>(11)?;
+    let model = row.get::<_, Option<String>>(12)?;
+    let effort = row.get::<_, Option<String>>(13)?;
     Ok(NodeRecord {
         id,
         harness,
@@ -1728,6 +1754,8 @@ fn row_to_node_record(row: &rusqlite::Row<'_>) -> Result<NodeRecord> {
         updated_at,
         external_id,
         harness_session_id,
+        model,
+        effort,
         capabilities,
         tokens_in: 0,
         tokens_out: 0,
@@ -2044,6 +2072,42 @@ mod tests {
         assert!(nodes.is_empty());
         assert!(graph.nodes.is_empty());
         assert!(graph.relationships.is_empty());
+    }
+
+    #[test]
+    fn launch_profile_round_trips_through_node_row() {
+        let store = Store::open_in_memory().unwrap();
+        let node = store.insert_test_node("worker").unwrap();
+
+        // A fresh node has no recorded profile (None = harness default marker).
+        let fresh = store.get_node(node.id).unwrap().unwrap();
+        assert_eq!(fresh.model, None);
+        assert_eq!(fresh.effort, None);
+
+        store
+            .set_node_launch_profile(node.id, Some("opus"), Some("high"))
+            .unwrap();
+
+        // Both get_node and list_nodes (the row-mapping paths) surface it.
+        let got = store.get_node(node.id).unwrap().unwrap();
+        assert_eq!(got.model.as_deref(), Some("opus"));
+        assert_eq!(got.effort.as_deref(), Some("high"));
+        let listed = store
+            .list_nodes()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.id == node.id)
+            .unwrap();
+        assert_eq!(listed.model.as_deref(), Some("opus"));
+        assert_eq!(listed.effort.as_deref(), Some("high"));
+
+        // A partial profile (model only) keeps effort at the default marker.
+        store
+            .set_node_launch_profile(node.id, Some("sonnet"), None)
+            .unwrap();
+        let got = store.get_node(node.id).unwrap().unwrap();
+        assert_eq!(got.model.as_deref(), Some("sonnet"));
+        assert_eq!(got.effort, None);
     }
 
     // M1/M2: compare-and-set liveness only transitions FROM an allowed state.

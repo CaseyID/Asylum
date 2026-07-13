@@ -1452,4 +1452,37 @@ mod tests {
         assert_eq!(spec.env[0].0, "ASYLUM_TOKEN");
         assert_eq!(spec.workspace.as_deref(), Some("/work"));
     }
+
+    #[test]
+    fn launch_spec_carries_profile_flags_into_guest_verbatim() {
+        // Launch-profile flags are baked into ctx.args by create_node before the
+        // spec is built, so they reach the guest launch contract unchanged.
+        let ctx = SubstrateContext {
+            node_id: Uuid::new_v4(),
+            harness: HarnessKind::ClaudeCode,
+            command: "claude".to_string(),
+            args: vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--settings".to_string(),
+                "{}".to_string(),
+                "--model".to_string(),
+                "opus".to_string(),
+                "--effort".to_string(),
+                "high".to_string(),
+            ],
+            workspace: Some("/work".to_string()),
+            env: vec![("ASYLUM_TOKEN".to_string(), "t".to_string())],
+            launch_prompt: None,
+        };
+        let spec = LoonLaunchSpec::from_context(ctx, "asylum-x".to_string());
+        assert_eq!(spec.args, vec![
+            "--dangerously-skip-permissions",
+            "--settings",
+            "{}",
+            "--model",
+            "opus",
+            "--effort",
+            "high",
+        ]);
+    }
 }

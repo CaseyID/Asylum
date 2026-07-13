@@ -76,6 +76,34 @@ impl super::HarnessAdapter for ClaudeHarness {
         context.instruction_prompt()
     }
 
+    fn supports_model(&self) -> bool {
+        true
+    }
+
+    fn supports_effort(&self) -> bool {
+        true
+    }
+
+    fn profile_args(
+        &self,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<Vec<String>, super::UnsupportedProfileOption> {
+        // claude 2.1.207: `--model <value>` (alias or full name) and
+        // `--effort <level>`. Values pass through verbatim -- no catalog, no
+        // validation; claude rejects a bad value itself.
+        let mut args = Vec::new();
+        if let Some(model) = model {
+            args.push("--model".to_string());
+            args.push(model.to_string());
+        }
+        if let Some(effort) = effort {
+            args.push("--effort".to_string());
+            args.push(effort.to_string());
+        }
+        Ok(args)
+    }
+
     fn preassign_session_id(&self) -> Option<uuid::Uuid> {
         // claude accepts a caller-chosen session id via `--session-id`. Pre-assigning
         // it makes the resume key known at create time (recorded on the node row).

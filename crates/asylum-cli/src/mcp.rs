@@ -116,6 +116,8 @@ fn tool_definitions() -> Vec<ToolSpec> {
                     "description": {"type":"string"},
                     "created_by": {"type":"string"},
                     "prompt": {"type":"string","description":"Optional first instruction delivered to the node as a submitted message once its harness is ready"},
+                    "model": {"type":"string","description":"Optional launch-profile model, passed verbatim to the harness (no catalog/validation); omit for the harness default"},
+                    "effort": {"type":"string","description":"Optional launch-profile reasoning effort, passed verbatim to the harness; omit for the harness default"},
                 },
                 "required":["harness","substrate"]
             }),
@@ -202,6 +204,8 @@ fn tool_definitions() -> Vec<ToolSpec> {
                     "role_hint":{"type":"string"},
                     "workspace":{"type":"string"},
                     "description":{"type":"string"},
+                    "model":{"type":"string","description":"Launch-profile model override, passed verbatim; a fork reproduces the source's model by default, set this only to override it"},
+                    "effort":{"type":"string","description":"Launch-profile reasoning effort override, passed verbatim; reproduces the source's effort by default"},
                 },
                 "required":["node_id"]
             }),
@@ -221,6 +225,8 @@ fn tool_definitions() -> Vec<ToolSpec> {
                     "prompt":{"type":"string","description":"Optional first instruction for the spawned peer, delivered as its opening submitted message once its harness is ready"},
                     "relationship_kind":{"type":"string","description":"spawned_for or supervises; defaults to spawned_for"},
                     "relationship_label":{"type":"string"},
+                    "model":{"type":"string","description":"Optional launch-profile model for the peer, passed verbatim; the peer does not inherit the parent's profile, omit for the harness default"},
+                    "effort":{"type":"string","description":"Optional launch-profile reasoning effort for the peer, passed verbatim; omit for the harness default"},
                 }
             }),
 
@@ -698,6 +704,8 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
                 role_hint: Option<String>,
                 workspace: Option<String>,
                 description: Option<String>,
+                model: Option<String>,
+                effort: Option<String>,
             }
             let args: ForkArgs = match serde_json::from_value(params.arguments) {
                 Ok(a) => a,
@@ -712,6 +720,8 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
                 "role_hint": args.role_hint,
                 "workspace": args.workspace,
                 "description": args.description,
+                "model": args.model,
+                "effort": args.effort,
             });
             match client
                 .send_request_json::<Value, _>(reqwest::Method::POST, &path, Some(&body))
@@ -733,6 +743,8 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
                 prompt: Option<String>,
                 relationship_kind: Option<String>,
                 relationship_label: Option<String>,
+                model: Option<String>,
+                effort: Option<String>,
             }
 
             let args: SpawnPeerArgs = match serde_json::from_value(params.arguments) {
@@ -765,6 +777,8 @@ async fn handle_tools_call(client: &AsylumClient, params: Option<Value>) -> RpcR
                 prompt: args.prompt,
                 relationship_kind: args.relationship_kind,
                 relationship_label: args.relationship_label,
+                model: args.model,
+                effort: args.effort,
             };
 
             match client.spawn_peer(source_node, request).await {
@@ -1227,6 +1241,8 @@ async fn handle_node_create(client: &AsylumClient, arguments: Value) -> RpcRespo
         description: Option<String>,
         created_by: Option<String>,
         prompt: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
     }
     let args: CreateArgs = match serde_json::from_value(arguments) {
         Ok(args) => args,
@@ -1242,6 +1258,8 @@ async fn handle_node_create(client: &AsylumClient, arguments: Value) -> RpcRespo
         description: args.description,
         created_by: args.created_by,
         prompt: args.prompt,
+        model: args.model,
+        effort: args.effort,
         launch_args: Vec::new(),
     };
 
@@ -1378,6 +1396,17 @@ mod tests {
                 .is_some(),
             "node.spawn_peer schema must document the prompt param"
         );
+        for tool in ["node.create", "node.spawn_peer"] {
+            let props = find(tool);
+            assert!(
+                props["properties"].get("model").is_some(),
+                "{tool} schema must document the launch-profile model param"
+            );
+            assert!(
+                props["properties"].get("effort").is_some(),
+                "{tool} schema must document the launch-profile effort param"
+            );
+        }
         assert!(
             find("decision.resolve")["properties"]
                 .get("answer")
