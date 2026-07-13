@@ -131,3 +131,32 @@ images move to claude >= 2.1.207. Also verified in this build:
 `UserPromptSubmit` and `SessionStart` hook payloads arrive reliably over the
 injected `--settings` hooks, while claude statusline telemetry carries only
 `used_percentage` (so `tokens_in` cannot be populated from it).
+
+## 2026-07-13 -- Claude 2.1.207 statusline payload (verified live)
+
+The statusline JSON piped to the injected statusLine command carries:
+`session_id`, `transcript_path`, `cwd`, `effort.level`,
+`model.{id,display_name}`, `workspace`, `version`, `output_style`,
+`cost.{total_cost_usd,total_duration_ms,total_api_duration_ms,total_lines_added,total_lines_removed}`,
+`context_window.{total_input_tokens,total_output_tokens,context_window_size,current_usage.{input_tokens,output_tokens,cache_creation_input_tokens,cache_read_input_tokens},used_percentage,remaining_percentage}`,
+`exceeds_200k_tokens`, `fast_mode`, `thinking.enabled`, and post-turn
+`rate_limits.{five_hour,seven_day}`.
+
+Semantics (established from the captured sample's own arithmetic):
+`total_input_tokens` equals `current_usage` input + cache_creation +
+cache_read and divided by `context_window_size` reproduces
+`used_percentage` -- it is the CURRENT context-window occupancy (including
+cached tokens), not a monotonic per-session total; `total_output_tokens`
+mirrors `current_usage.output_tokens`. Both are 0/null on the pre-turn
+render and populate after the first API turn. Asylum passes these through
+to `tokens_in`/`tokens_out` as the harness-reported occupancy snapshot
+(char/4 estimate remains the fallback), documented as not
+magnitude-comparable to codex's cumulative estimate. Statusline renders
+multiple times per turn, so delta-accumulating these snapshots would
+double-count -- a true cumulative needs per-turn structured usage instead.
+
+The loon substrate now shares the local claude launch-prompt
+deliver-and-confirm contract (see the 2026-07-13 readiness section above);
+proven live on a real microVM guest: session_started posted from the guest,
+prompt delivered exactly once, prompt-accepted confirmation dispatched to
+the loon substrate.

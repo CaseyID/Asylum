@@ -206,12 +206,28 @@ case is diagnosable — full correlation would require TUI parsing, which is
 barred). Live-proven twice: prompt lands unassisted, exactly once
 (confirmation latency 0.9s vs the 15s redelivery interval).
 
-Backlog observations recorded during acceptance (for Linear when mirrored):
-`NodeRecord.tokens_in` is never populated from claude telemetry
-(`ingest_statusline` records only `used_percentage`; `turn_complete` + output
-are the authoritative activity signals); the loon substrate keeps the old
-timing-based delivery, so a loon guest image shipping claude >= 2.1.207 would
-hit the same swallow and needs the same deliver-and-confirm port.
+Both acceptance-time backlog observations were closed same-cycle (2026-07-13,
+owner instruction), each implemented, adversarially reviewed, and live-proven:
+
+- **Claude token telemetry**: claude 2.1.207's statusline payload carries
+  real token counts (`context_window.total_input_tokens/total_output_tokens`)
+  that `ingest_statusline` was discarding; they now flow into
+  `tokens_in`/`tokens_out` (char/4 estimate remains the fallback when absent).
+  Live-proven: inspect showed `tokens_in=32651 tokens_out=63` after one turn.
+  Semantics documented honestly in-code: these are the harness's
+  context-window occupancy snapshot (including cached tokens), not a
+  turn-cumulative sum, and are not magnitude-comparable to codex's estimate —
+  a true cross-harness cumulative would need per-turn structured usage (e.g.
+  transcript usage on `turn_complete`), recorded as a possible future
+  refinement, not a gap in this delivery.
+- **Loon deliver-and-confirm port**: the loon substrate now uses the same
+  claude launch-prompt mechanism as local (SessionStart floor,
+  UserPromptSubmit confirmation latch, 15s x3 retry, logged redeliveries and
+  latch exits), with `post_harness_event` dispatching confirmation signals to
+  the substrate that owns the node; codex-on-loon and loon pacing unchanged.
+  Live-proven on a real microVM: `session_started` arrived from the guest,
+  the prompt landed unassisted exactly once, and the prompt-accepted
+  confirmation routed to the loon substrate.
 
 ## Release status
 
