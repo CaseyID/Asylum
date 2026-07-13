@@ -815,6 +815,26 @@ impl CapabilityService {
             });
         }
 
+        // Launch-prompt delivery: route claude's readiness hooks into the local
+        // substrate's delivery task. SessionStart releases the delivery floor;
+        // UserPromptSubmit confirms the prompt landed so redelivery stops. Both
+        // are no-ops for nodes without an active launch delivery (see
+        // LocalSubstrate::launch_signals_for), so this is safe to call
+        // unconditionally on the claude_hook source.
+        if request.source == "claude_hook" {
+            match request
+                .payload
+                .get("hook_event_name")
+                .and_then(|v| v.as_str())
+            {
+                Some("SessionStart") => self.local_substrate.notify_session_started(node_id).await,
+                Some("UserPromptSubmit") => {
+                    self.local_substrate.notify_prompt_accepted(node_id).await
+                }
+                _ => {}
+            }
+        }
+
         // Statusline posts drive telemetry + threshold-based ctx_pressure.
         if mapped.telemetry {
             let event =

@@ -447,6 +447,17 @@ mod tests {
         assert_eq!(post_entry["timeout"], 10);
         assert_eq!(post_entry["async"], true);
 
+        // UserPromptSubmit drives launch-prompt delivery confirmation. Match-all,
+        // async (never blocks a turn from starting), routed to the same bridge.
+        let ups = &hooks["UserPromptSubmit"][0];
+        assert!(ups.get("matcher").is_none(), "UserPromptSubmit must match all prompts");
+        let ups_entry = &ups["hooks"][0];
+        assert_eq!(
+            ups_entry["command"],
+            "'/opt/asylum/bin/asylum' harness-event claude-hook"
+        );
+        assert_eq!(ups_entry["async"], true);
+
         Ok(())
     }
 

@@ -351,6 +351,12 @@ fn claude_settings_json(asylum_binary: &str) -> String {
             "Notification": [group(false, None)],
             "SessionStart": [group(false, None)],
             "SessionEnd": [group(false, None)],
+            // UserPromptSubmit confirms a prompt was actually submitted. The
+            // daemon uses it to gate launch-prompt delivery (redeliver until the
+            // harness confirms it landed), since claude 2.1.207's startup screen
+            // silently swallows typed input with no distinguishing PTY output.
+            // Async so it never adds latency to a turn starting.
+            "UserPromptSubmit": [group(true, None)],
             "PostToolUse": [group(true, None)],
             // AskUserQuestion menu dialogs: the PreToolUse payload carries the
             // structured question + option list (verified against claude 2.1.207),
