@@ -1817,6 +1817,15 @@ fn hydrate_node_telemetry(conn: &Connection, node: &mut NodeRecord) -> Result<()
     // Harness-reported context usage (claude statusline `used_percentage`),
     // authoritative over the crude token estimate below when present.
     let mut harness_used_percentage: Option<f64> = None;
+    // Harness-reported context-window token snapshot (claude statusline
+    // `context_window.total_{input,output}_tokens`), preferred over the char/4
+    // estimate below when present -- a real harness value, not a guess. NOTE:
+    // this is a snapshot of the CURRENT context-window occupancy (input side
+    // includes cached tokens), NOT a monotonic per-session cumulative, so it is
+    // not magnitude-comparable to codex's char/4 running sum. Latest post wins
+    // (newest snapshot); we do not sum snapshots.
+    let mut harness_tokens_in: Option<u64> = None;
+    let mut harness_tokens_out: Option<u64> = None;
 
     while let Some(row) = rows.next()? {
         let kind_text: String = row.get(0)?;
@@ -1826,13 +1835,16 @@ fn hydrate_node_telemetry(conn: &Connection, node: &mut NodeRecord) -> Result<()
 
         let kind = parse_event_kind(&kind_text)?;
         if matches!(kind, NodeEventKind::HarnessEvent) {
-            if let Some(pct) = serde_json::from_str::<JsonValue>(&body_text)
-                .ok()
-                .as_ref()
-                .and_then(|value| value.get("used_percentage"))
-                .and_then(|value| value.as_f64())
-            {
-                harness_used_percentage = Some(pct);
+            if let Some(value) = serde_json::from_str::<JsonValue>(&body_text).ok().as_ref() {
+                if let Some(pct) = value.get("used_percentage").and_then(|v| v.as_f64()) {
+                    harness_used_percentage = Some(pct);
+                }
+                if let Some(t) = value.get("total_input_tokens").and_then(|v| v.as_u64()) {
+                    harness_tokens_in = Some(t);
+                }
+                if let Some(t) = value.get("total_output_tokens").and_then(|v| v.as_u64()) {
+                    harness_tokens_out = Some(t);
+                }
             }
         }
         let text_len = match serde_json::from_str::<JsonValue>(&body_text)
@@ -1872,8 +1884,10 @@ fn hydrate_node_telemetry(conn: &Connection, node: &mut NodeRecord) -> Result<()
         }
     }
 
-    node.tokens_in = tokens_in;
-    node.tokens_out = tokens_out;
+    // Prefer the harness-reported context-window snapshot when present; fall back
+    // to the char/4 estimate otherwise (honest gap, never fabricated).
+    node.tokens_in = harness_tokens_in.unwrap_or(tokens_in);
+    node.tokens_out = harness_tokens_out.unwrap_or(tokens_out);
     node.tool_calls = tool_calls;
     node.ctx_pct = match harness_used_percentage {
         Some(pct) => (pct as f32 / 100.0).clamp(0.0, 1.0),
@@ -2315,6 +2329,96 @@ mod tests {
         assert!(hydrated.tokens_out >= 1);
         assert_eq!(hydrated.tool_calls, 1);
         assert!(hydrated.ctx_pct >= 0.0 && hydrated.ctx_pct <= 1.0);
+    }
+
+    #[test]
+    fn harness_reported_token_totals_override_estimate() {
+        let store = Store::open_in_memory().unwrap();
+        let node = store.insert_test_node("worker").unwrap();
+        // A char/4 estimate would land on these events...
+        store
+            .record_event(
+                node.id,
+                NodeEventKind::InputSent,
+                serde_json::json!({"text": "abcdefgh"}),
+            )
+            .unwrap();
+        store
+            .append_transcript_chunk(node.id, "some output text here")
+            .unwrap();
+        // ...but a real statusline token snapshot overrides it.
+        store
+            .record_event(
+                node.id,
+                NodeEventKind::HarnessEvent,
+                serde_json::json!({
+                    "event": "node.telemetry",
+                    "source": "claude_statusline",
+                    "used_percentage": 3.0,
+                    "total_input_tokens": 30496u64,
+                    "total_output_tokens": 15u64,
+                }),
+            )
+            .unwrap();
+        let hydrated = store.get_node(node.id).unwrap().unwrap();
+        assert_eq!(hydrated.tokens_in, 30496);
+        assert_eq!(hydrated.tokens_out, 15);
+    }
+
+    #[test]
+    fn harness_reported_token_totals_latest_post_wins() {
+        let store = Store::open_in_memory().unwrap();
+        let node = store.insert_test_node("worker").unwrap();
+        for (input, output) in [(100u64, 5u64), (30496u64, 15u64)] {
+            store
+                .record_event(
+                    node.id,
+                    NodeEventKind::HarnessEvent,
+                    serde_json::json!({
+                        "event": "node.telemetry",
+                        "source": "claude_statusline",
+                        "used_percentage": 3.0,
+                        "total_input_tokens": input,
+                        "total_output_tokens": output,
+                    }),
+                )
+                .unwrap();
+        }
+        // Latest snapshot wins: the most recent post's totals are used, not summed.
+        let hydrated = store.get_node(node.id).unwrap().unwrap();
+        assert_eq!(hydrated.tokens_in, 30496);
+        assert_eq!(hydrated.tokens_out, 15);
+    }
+
+    #[test]
+    fn malformed_token_totals_fall_back_to_estimate_not_fabricated() {
+        let store = Store::open_in_memory().unwrap();
+        let node = store.insert_test_node("worker").unwrap();
+        store
+            .record_event(
+                node.id,
+                NodeEventKind::InputSent,
+                serde_json::json!({"text": "abcdefgh"}),
+            )
+            .unwrap();
+        // Non-numeric token fields are ignored; the honest estimate remains.
+        store
+            .record_event(
+                node.id,
+                NodeEventKind::HarnessEvent,
+                serde_json::json!({
+                    "event": "node.telemetry",
+                    "source": "claude_statusline",
+                    "used_percentage": 3.0,
+                    "total_input_tokens": "not-a-number",
+                    "total_output_tokens": null,
+                }),
+            )
+            .unwrap();
+        let hydrated = store.get_node(node.id).unwrap().unwrap();
+        // Falls back to the char/4 estimate (8/4 = 2), never a fabricated value.
+        assert_eq!(hydrated.tokens_in, 2);
+        assert_eq!(hydrated.tokens_out, 0);
     }
 
     #[test]

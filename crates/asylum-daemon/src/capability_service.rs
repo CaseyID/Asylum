@@ -992,21 +992,43 @@ impl CapabilityService {
         payload: &JsonValue,
         session_id: Option<&str>,
     ) -> Result<Option<String>> {
-        let Some(used) = payload
-            .get("context_window")
+        let ctx = payload.get("context_window");
+        let Some(used) = ctx
             .and_then(|c| c.get("used_percentage"))
             .and_then(|v| v.as_f64())
         else {
             return Ok(None);
         };
 
-        // Persist the telemetry datapoint; hydrate_node_telemetry prefers this
-        // harness-reported value for the displayed ctx_pct.
+        // claude 2.1.207's statusline payload carries `context_window.
+        // {total_input_tokens,total_output_tokens}` -- a snapshot of the CURRENT
+        // context-window occupancy, not a monotonic session sum. In the captured
+        // sample total_input_tokens (30496) == current_usage.{input_tokens +
+        // cache_creation_input_tokens + cache_read_input_tokens} and 30496 /
+        // context_window_size (1000000) == used_percentage (3), so the input side
+        // is context occupancy INCLUDING cached tokens and the output side tracks
+        // the current context/turn's output. These are real harness-reported
+        // values (not char/4 estimates), so we persist and prefer them for display,
+        // but they are NOT turn-cumulative and NOT magnitude-comparable to codex's
+        // char/4 accumulation over every OutputChunk. Extract mechanically;
+        // absent/non-numeric fields are simply omitted (older builds, pre-turn
+        // renders) and the estimate remains the honest fallback.
+        let total_input_tokens = ctx
+            .and_then(|c| c.get("total_input_tokens"))
+            .and_then(|v| v.as_u64());
+        let total_output_tokens = ctx
+            .and_then(|c| c.get("total_output_tokens"))
+            .and_then(|v| v.as_u64());
+
+        // Persist the telemetry datapoint; hydrate_node_telemetry prefers these
+        // harness-reported values for the displayed ctx_pct and token totals.
         let telemetry_body = json!({
             "event": "node.telemetry",
             "source": "claude_statusline",
             "node": { "id": node_id.to_string() },
             "used_percentage": used,
+            "total_input_tokens": total_input_tokens,
+            "total_output_tokens": total_output_tokens,
             "session_id": session_id,
         });
         self.store
@@ -7494,6 +7516,58 @@ mod tests {
             .filter_map(|b| b.get("threshold").and_then(|v| v.as_f64()))
             .collect();
         assert_eq!(pressure_thresholds, vec![75.0, 90.0]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn statusline_populates_real_token_totals() -> Result<(), Box<dyn std::error::Error>> {
+        let (_workdir, store) = open_test_store();
+        let node = insert_active_node(&store, HarnessKind::ClaudeCode);
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+
+        // A complete claude 2.1.207 statusline payload captured live (post-turn).
+        // context_window carries a current-occupancy token snapshot: note
+        // total_input_tokens (30496) == current_usage.{input + cache_creation +
+        // cache_read} and 30496 / context_window_size (1000000) == used_percentage
+        // (3) -- occupancy including cached tokens, not a session cumulative.
+        let payload = json!({
+            "session_id": "80ebb853-4188-47b1-a607-83979809606b",
+            "transcript_path": "/home/casey/.claude/projects/-tmp-tele-cap-ws/80ebb853.jsonl",
+            "cwd": "/tmp/tele-cap/ws",
+            "model": { "id": "claude-fable-5", "display_name": "Fable 5" },
+            "version": "2.1.207",
+            "cost": { "total_cost_usd": 0.61065, "total_duration_ms": 13659 },
+            "context_window": {
+                "total_input_tokens": 30496,
+                "total_output_tokens": 15,
+                "context_window_size": 1000000,
+                "current_usage": {
+                    "input_tokens": 2,
+                    "output_tokens": 15,
+                    "cache_creation_input_tokens": 30494,
+                    "cache_read_input_tokens": 0
+                },
+                "used_percentage": 3,
+                "remaining_percentage": 97
+            }
+        });
+
+        let resp = service
+            .post_harness_event(
+                node.id,
+                HarnessEventRequest {
+                    source: "claude_statusline".to_string(),
+                    payload,
+                },
+            )
+            .await?;
+        assert!(resp.accepted);
+
+        let hydrated = store.get_node(node.id)?.expect("node");
+        assert_eq!(hydrated.tokens_in, 30496);
+        assert_eq!(hydrated.tokens_out, 15);
+        // ctx_pct still tracks used_percentage.
+        assert!((hydrated.ctx_pct - 0.03).abs() < 0.001);
         Ok(())
     }
 
