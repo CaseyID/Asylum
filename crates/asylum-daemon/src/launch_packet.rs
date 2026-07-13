@@ -111,12 +111,28 @@ one on `node.errored` (`send_input` to nudge, or `spawn` to replace).
 
 ### Etiquette
 
+**Choosing the right layer**, in order of preference:
+1. Work you can do directly in your own session: do it. No delegation.
+2. Fine-grained fan-out inside one body of work (many files, many checks,
+   draft alternatives): use your harness's own subagents, agent teams, or
+   scripted workflows -- cheap, fast, share your workspace.
+3. Work needing independent lifetime, isolation, separate supervision, or a
+   different workspace/harness/substrate/launch profile: spawn a node with
+   `node.spawn_peer` and a concrete assignment and completion criteria.
+
+**Verifying substantial results**: verify in a fresh context with a distinct
+adversarial framing -- an evaluator peer node, or your harness's in-harness
+equivalent primed to refute rather than confirm. Same-context self-review is
+weak: an agent that just finished the work is an anchored judge of it. This
+is a recommendation, not a gate -- Asylum does not block completion on
+verification.
+
 - Prefer hooks over polling `node.list` / `node.inspect` in a loop.
 - Call `graph.get` once to orient yourself, not repeatedly.
 - Give a worker a concrete `prompt` at spawn time rather than a vague
   `description` plus a follow-up `send_input`.
-- Do not simulate worker nodes inside your own harness session -- spawn a real
-  node for real parallel work.
+- Never simulate a worker in your own transcript. Real fan-out is either a
+  real in-harness subagent or a real node.
 "#;
 
 pub fn launch_packet_markdown(
@@ -248,5 +264,37 @@ mod tests {
         assert!(markdown.contains("ntfy-default"));
         assert!(!markdown.contains("recipe"));
         assert!(!markdown.contains("transcript.checkpoint"));
+    }
+
+    /// LAYER-003/LAYER-004 drift guard: the manual must keep the layer-choice
+    /// and verification etiquette markers so the doctrine can't silently
+    /// erode back to "spawn a node for everything" or a same-context review.
+    #[test]
+    fn markdown_includes_layer_choice_and_verification_etiquette() {
+        let markdown = launch_packet_markdown(
+            "node-1",
+            "http://127.0.0.1:7717",
+            "supervisor",
+            "claude_code",
+            "local",
+            &[],
+            "no graph",
+        );
+
+        assert!(markdown.contains("Choosing the right layer"));
+        assert!(markdown.contains("Work you can do directly in your own session: do it. No delegation."));
+        assert!(markdown.contains(
+            "use your harness's own subagents, agent teams, or\n   scripted workflows"
+        ));
+        assert!(markdown.contains("spawn a node with\n   `node.spawn_peer`"));
+
+        assert!(markdown.contains("Verifying substantial results"));
+        assert!(markdown.contains("verify in a fresh context with a distinct\nadversarial framing"));
+        assert!(markdown.contains("Same-context self-review is\nweak"));
+        assert!(markdown.contains("This\nis a recommendation, not a gate"));
+
+        assert!(markdown.contains("Never simulate a worker in your own transcript. Real fan-out is either a\n  real in-harness subagent or a real node."));
+        // Point 5 must ban fiction, not in-harness parallelism.
+        assert!(!markdown.contains("Do not simulate worker nodes inside your own harness session"));
     }
 }
