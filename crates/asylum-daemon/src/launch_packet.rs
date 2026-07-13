@@ -91,6 +91,11 @@ one on `node.errored` (`send_input` to nudge, or `spawn` to replace).
   `denied`; a non-empty `answer` is delivered to the node verbatim, overriding
   the yes/no derived from `status`. This injects straight into the worker's
   input and closes out the decision record in one call.
+- If a decision carries menu options (claude multiple-choice questions), the
+  `answer` must name one option label (case-insensitive); the named option is
+  then selected in the menu itself. An answer matching no option returns an
+  error and leaves the decision pending -- it will not fall through to the
+  menu's default.
 - `decision.create(text, node_id?)` lets you raise a question yourself instead
   of waiting for a worker's harness to ask one.
 - A phone reply to a `channel`-hook ntfy escalation is correlated by node and
