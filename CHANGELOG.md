@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.0 — 2026-07-13
+
+The orchestration-alignment release: per-node launch profiles, typed menu-decision delivery, layer-choice coordination guidance, and claude launch-prompt reliability — every workstream adversarially reviewed and live-verified against real Claude Code sessions and a real Loon microVM (docs/superpowers/plans/2026-07-12-orchestration-alignment.md Delivery record).
+
+### Added
+
+- Launch profiles (spec `HARN-005`..`HARN-007`): `asylum node create`/`node spawn`/`node fork`, the API, and MCP `node.create`/`node.spawn_peer` accept optional per-node `model` and `effort` options, passed through to the harness verbatim (claude `--model`/`--effort`; codex `-c model=`/`-c model_reasoning_effort=`) with no Asylum-side catalogs or validation. Harness descriptors advertise which options each adapter supports; an option an adapter cannot express returns an honest unsupported error. The effective profile is recorded on the node (unset = explicit harness default), survives restart/resume (resume relaunches with the recorded profile), and is visible in inspect, CLI, MCP, and Cockpit. Peers do not inherit the parent's profile; fork reproduces the source node's profile unless overridden.
+- Cockpit: launch-profile controls on the create screen (rendered only when the selected harness advertises support; free-text with a harness-default placeholder) and the recorded profile (or "harness default") on the node detail screen.
+- Menu-decision fidelity (spec `DECISION-004`): claude single-select AskUserQuestion menus are captured with their option labels (injected PreToolUse hook) onto the pending decision; a resolution answer naming an option (case-insensitive) selects that option in the menu itself via paced arrow-key delivery — proven live with a non-default selection. An answer matching no option returns an error naming the stored options and leaves the decision pending instead of silently taking the menu default. Multi-select and multi-question dialogs keep the free-text path.
+- Launch packet: "Choosing the right layer" and fresh-context verification etiquette (spec `LAYER-003`/`LAYER-004`), drift-checked by tests; the final etiquette rule now bans simulating workers rather than in-harness subagents; menu answer contract for `decision.resolve` documented.
+- Claude token telemetry: `tokens_in`/`tokens_out` now populate from the claude statusline's context-window totals (the harness-reported occupancy snapshot, including cached tokens; the char/4 estimate remains the fallback when absent).
+
+### Changed
+
+- Claude launch-prompt delivery is now deliver-and-confirm on both substrates: gated on the SessionStart event, confirmed via an injected UserPromptSubmit hook, with a bounded logged retry budget (15s interval, 3 attempts). Fixes claude 2.1.207's longer startup swallowing the launch prompt (neither output quiescence nor SessionStart alone is a sufficient readiness gate on that build). Codex keeps its existing timing and submit-nudge path unchanged.
+
+### Notes
+
+- The one-time claude 2.1.202 local-`portable_pty` "output.write assertion" crash from the v0.2.0 final live check is closed as not reproducible on claude 2.1.207 (5/5 clean repro attempts mirroring the exact launch sequence).
+
 ## 0.2.0 — 2026-07-07
 
 The completion-mission release: the autonomy loop, Loon microVM parity, and daemon durability delivered by the 2026-07-06/07 completion mission (docs/superpowers/specs/2026-07-06-asylum-completion-mission.md), all live-gated against real Claude Code sessions, a real ntfy round trip, and real Firecracker microVMs.
