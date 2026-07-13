@@ -371,6 +371,31 @@ fn map_harness_event(source: &str, payload: &JsonValue) -> MappedHarnessEvent {
                         mapped.detail = json!({ "reason": reason });
                     }
                 }
+                "PreToolUse" => {
+                    // Only AskUserQuestion is wired (the injected settings scope
+                    // the PreToolUse hook to that matcher). Its payload carries the
+                    // structured question + option list, which lets a decision
+                    // resolution select the exact menu option. Single-select only:
+                    // multi-select / multi-question dialogs fall through to the
+                    // free-text awaiting-input path (Notification hook).
+                    let tool = payload
+                        .get("tool_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    if tool == "AskUserQuestion" {
+                        if let Some((prompt, options)) =
+                            menu_question_from_ask_user_question(payload)
+                        {
+                            mapped.event = Some("node.awaiting_input");
+                            mapped.liveness = Some(NodeLiveness::WaitingForInput);
+                            mapped.detail = json!({
+                                "type": "menu",
+                                "message": prompt,
+                                "options": options,
+                            });
+                        }
+                    }
+                }
                 "PostToolUse" => {
                     mapped.event = Some("node.tool_call");
                     mapped.liveness = Some(NodeLiveness::Running);
@@ -901,26 +926,36 @@ impl CapabilityService {
         // Atomic create-or-refresh (M6): the partial unique index guarantees at
         // most one pending decision per node even under concurrent posts.
         match self.store.upsert_pending_node_decision(node_id, &text) {
-            Ok((record, true)) => {
+            Ok((record, created)) => {
                 let decision = map_decision(record);
-                let _ = self.store.insert_notification(
-                    Some(node_id),
-                    "decision",
-                    "Decision requested",
-                    &decision.text,
-                );
-                let _ = self.store.record_event(
-                    node_id,
-                    NodeEventKind::HumanInputRequested,
-                    json!({
-                        "decision": decision.id,
-                        "text": decision.text,
-                        "source": "harness_event",
-                    }),
-                );
+                // Persist structured menu options when this awaiting-input carried
+                // them (AskUserQuestion PreToolUse). Applied on both create AND
+                // refresh: a text-only Notification may create the decision before
+                // the options-bearing PreToolUse refreshes it, and vice versa.
+                if let Some(options) = menu_option_labels(payload) {
+                    if let Err(e) = self.store.set_decision_menu_options(&decision.id, &options) {
+                        tracing::warn!(error = %e, node_id = %node_id, "failed to persist menu options for decision");
+                    }
+                }
+                // Refresh of an existing pending decision: no duplicate notification.
+                if created {
+                    let _ = self.store.insert_notification(
+                        Some(node_id),
+                        "decision",
+                        "Decision requested",
+                        &decision.text,
+                    );
+                    let _ = self.store.record_event(
+                        node_id,
+                        NodeEventKind::HumanInputRequested,
+                        json!({
+                            "decision": decision.id,
+                            "text": decision.text,
+                            "source": "harness_event",
+                        }),
+                    );
+                }
             }
-            // Refreshed an existing pending decision: no duplicate notification.
-            Ok((_, false)) => {}
             Err(e) => {
                 tracing::warn!(error = %e, node_id = %node_id, "failed to create/refresh pending decision from awaiting_input");
             }
@@ -2836,6 +2871,31 @@ impl CapabilityService {
         Ok(())
     }
 
+    /// Deliver a single-select menu choice to the node's harness by 0-based
+    /// `option_index` (typed option-select key sequence, not free text). Used by
+    /// decision resolution for AskUserQuestion-style menus so the harness acts on
+    /// the exact option instead of its default.
+    async fn send_menu_selection(&self, node_id: Uuid, option_index: usize) -> Result<()> {
+        let node = self.store.get_node(node_id)?.context("node not found")?;
+        match node.substrate {
+            SubstrateKind::Local => {
+                self.local_substrate
+                    .send_menu_selection(node_id, option_index)
+                    .await?
+            }
+            SubstrateKind::Loon => {
+                let (loon, external_id) = self.require_loon_target(&node)?;
+                loon.send_menu_selection(external_id, option_index).await?;
+            }
+        }
+        self.store.record_event(
+            node_id,
+            NodeEventKind::InputSent,
+            json!({ "menu_option_index": option_index }),
+        )?;
+        Ok(())
+    }
+
     pub async fn interrupt_node(&self, node_id: Uuid) -> Result<()> {
         let node = self.store.get_node(node_id)?.context("node not found")?;
         match node.substrate {
@@ -3414,26 +3474,50 @@ impl CapabilityService {
             _ => return Err(anyhow!("decision status must be approved, denied, or answered")),
         };
         let before = self.get_decision(id).await?;
-        if !self.store.resolve_decision(id, &status)? {
-            return Err(anyhow!("decision not found"));
-        }
-        let after = self.get_decision(id).await?;
         let node_id = before
             .node_id
             .as_deref()
             .and_then(|raw| Uuid::parse_str(raw).ok());
-        // Close the loop: inject the resolution back into the node's PTY via the
-        // send_input path (types AND submits). A free-text answer is delivered
-        // verbatim; a bare approve/deny maps to a simple affirmative/negative.
-        let feedback = decision_feedback_text(&after.status, request.answer.as_deref());
+        // Menu decision: resolve the answer to an exact option index BEFORE marking
+        // the decision resolved. A non-matching answer is a hard error that leaves
+        // the decision pending -- we never silently fall through to Enter, which
+        // would select the harness's default option (DECISION-004).
+        let menu_options = self
+            .store
+            .decision_menu_options(id)?
+            .filter(|options| !options.is_empty());
+        let menu_index = match &menu_options {
+            Some(options) => {
+                let answer = request.answer.as_deref().unwrap_or_default();
+                Some(resolve_menu_option_index(options, answer).with_context(|| {
+                    format!(
+                        "decision answer {:?} matches none of the menu options {:?}",
+                        answer, options
+                    )
+                })?)
+            }
+            None => None,
+        };
+        if !self.store.resolve_decision(id, &status)? {
+            return Err(anyhow!("decision not found"));
+        }
+        let after = self.get_decision(id).await?;
         if let Some(node_id) = node_id {
             if let Ok(Some(node)) = self.store.get_node(node_id) {
                 if is_active_liveness(&node.liveness) {
-                    if let Err(e) = self
-                        .send_input(node_id, SendInputRequest { text: feedback })
-                        .await
-                    {
-                        tracing::warn!(error = %e, node_id = %node_id, "failed to inject decision feedback into node");
+                    // Close the loop back into the node's PTY. A menu decision emits
+                    // the typed option-select key sequence; a free-text/confirmation
+                    // decision delivers its answer verbatim (approve/deny -> yes/no).
+                    let delivery = match menu_index {
+                        Some(index) => self.send_menu_selection(node_id, index).await,
+                        None => {
+                            let feedback =
+                                decision_feedback_text(&after.status, request.answer.as_deref());
+                            self.send_input(node_id, SendInputRequest { text: feedback }).await
+                        }
+                    };
+                    if let Err(e) = delivery {
+                        tracing::warn!(error = %e, node_id = %node_id, "failed to inject decision resolution into node");
                     }
                 }
                 if matches!(node.liveness, NodeLiveness::WaitingForInput) {
@@ -4306,6 +4390,81 @@ fn decision_feedback_text(status: &str, answer: Option<&str>) -> String {
         "approved" => "yes".to_string(),
         _ => "no".to_string(),
     }
+}
+
+/// Extract the single-select question prompt and its option labels from a claude
+/// AskUserQuestion PreToolUse payload. Returns `None` unless there is exactly one
+/// question, it is single-select (`multiSelect` false/absent), and it has at least
+/// one labelled option -- only that shape maps cleanly to typed option delivery.
+/// Pure and unit-tested.
+fn menu_question_from_ask_user_question(payload: &JsonValue) -> Option<(String, Vec<String>)> {
+    let questions = payload
+        .get("tool_input")
+        .and_then(|ti| ti.get("questions"))
+        .and_then(JsonValue::as_array)?;
+    // Only a single-question dialog maps to one decision.
+    let [question] = questions.as_slice() else {
+        return None;
+    };
+    if question
+        .get("multiSelect")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let options: Vec<String> = question
+        .get("options")
+        .and_then(JsonValue::as_array)?
+        .iter()
+        .filter_map(|opt| {
+            opt.get("label")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    if options.is_empty() {
+        return None;
+    }
+    let prompt = question
+        .get("question")
+        .and_then(JsonValue::as_str)
+        .or_else(|| question.get("header").and_then(JsonValue::as_str))
+        .unwrap_or("Node is awaiting a menu choice")
+        .to_string();
+    Some((prompt, options))
+}
+
+/// The menu option labels carried by a mapped awaiting-input payload, if any.
+/// Pure and unit-tested.
+fn menu_option_labels(payload: &JsonValue) -> Option<Vec<String>> {
+    let options: Vec<String> = payload
+        .get("options")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    (!options.is_empty()).then_some(options)
+}
+
+/// Map a decision answer to a 0-based menu option index: exact match first, then
+/// case-insensitive (both trimmed). Errors when the answer matches no option --
+/// the caller must NOT fall back to Enter-takes-default. Pure and unit-tested.
+fn resolve_menu_option_index(options: &[String], answer: &str) -> Result<usize> {
+    let answer = answer.trim();
+    if answer.is_empty() {
+        return Err(anyhow!("a menu decision requires an answer naming an option"));
+    }
+    if let Some(i) = options.iter().position(|opt| opt.trim() == answer) {
+        return Ok(i);
+    }
+    if let Some(i) = options
+        .iter()
+        .position(|opt| opt.trim().eq_ignore_ascii_case(answer))
+    {
+        return Ok(i);
+    }
+    Err(anyhow!("answer does not match any menu option"))
 }
 
 fn map_decision(
@@ -7484,6 +7643,179 @@ mod tests {
         assert_eq!(decision_feedback_text("denied", Some("   ")), "no");
     }
 
+    #[test]
+    fn menu_question_extracts_single_select_prompt_and_options() {
+        // Matches the verified claude 2.1.207 AskUserQuestion PreToolUse payload.
+        let payload = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_input": {
+                "questions": [{
+                    "question": "Pick?",
+                    "header": "Pick",
+                    "options": [
+                        { "label": "Alpha", "description": "Choose Alpha" },
+                        { "label": "Beta", "description": "Choose Beta" },
+                        { "label": "Gamma", "description": "Choose Gamma" }
+                    ],
+                    "multiSelect": false
+                }]
+            }
+        });
+        let (prompt, options) = menu_question_from_ask_user_question(&payload).unwrap();
+        assert_eq!(prompt, "Pick?");
+        assert_eq!(options, vec!["Alpha", "Beta", "Gamma"]);
+    }
+
+    #[test]
+    fn menu_question_rejects_multiselect_and_multi_question_and_empty() {
+        // multiSelect is not typed-delivered.
+        let multi = json!({
+            "tool_input": { "questions": [{
+                "question": "q", "multiSelect": true,
+                "options": [{ "label": "A" }]
+            }]}
+        });
+        assert!(menu_question_from_ask_user_question(&multi).is_none());
+        // More than one question does not map to a single decision.
+        let two = json!({
+            "tool_input": { "questions": [
+                { "question": "q1", "options": [{ "label": "A" }] },
+                { "question": "q2", "options": [{ "label": "B" }] }
+            ]}
+        });
+        assert!(menu_question_from_ask_user_question(&two).is_none());
+        // No labelled options: nothing to select.
+        let empty = json!({ "tool_input": { "questions": [{ "question": "q", "options": [] }] } });
+        assert!(menu_question_from_ask_user_question(&empty).is_none());
+    }
+
+    #[test]
+    fn map_harness_event_maps_ask_user_question_pretooluse_to_menu_awaiting_input() {
+        let payload = json!({
+            "session_id": "s1",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_input": { "questions": [{
+                "question": "Pick?",
+                "options": [{ "label": "Alpha" }, { "label": "Beta" }],
+                "multiSelect": false
+            }]}
+        });
+        let mapped = map_harness_event("claude_hook", &payload);
+        assert_eq!(mapped.event, Some("node.awaiting_input"));
+        assert!(matches!(mapped.liveness, Some(NodeLiveness::WaitingForInput)));
+        assert_eq!(mapped.detail["type"], json!("menu"));
+        assert_eq!(mapped.detail["options"], json!(["Alpha", "Beta"]));
+        // A non-AskUserQuestion PreToolUse produces no mapped event.
+        let other = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {}
+        });
+        assert_eq!(map_harness_event("claude_hook", &other).event, None);
+    }
+
+    #[test]
+    fn menu_option_labels_reads_string_array_or_none() {
+        assert_eq!(
+            menu_option_labels(&json!({ "options": ["A", "B"] })),
+            Some(vec!["A".to_string(), "B".to_string()])
+        );
+        assert_eq!(menu_option_labels(&json!({ "options": [] })), None);
+        assert_eq!(menu_option_labels(&json!({ "message": "hi" })), None);
+    }
+
+    #[test]
+    fn resolve_menu_option_index_exact_then_case_insensitive_then_error() {
+        let options = vec!["Alpha".to_string(), "Beta".to_string(), "Gamma".to_string()];
+        // Exact match wins, whitespace trimmed on both sides.
+        assert_eq!(resolve_menu_option_index(&options, "Beta").unwrap(), 1);
+        assert_eq!(resolve_menu_option_index(&options, "  Gamma ").unwrap(), 2);
+        // Case-insensitive fallback.
+        assert_eq!(resolve_menu_option_index(&options, "alpha").unwrap(), 0);
+        // No match is a hard error (never Enter-takes-default).
+        assert!(resolve_menu_option_index(&options, "Delta").is_err());
+        // Empty answer is an error, not the first option.
+        assert!(resolve_menu_option_index(&options, "   ").is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_menu_decision_errors_on_unmatched_answer_and_stays_pending(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_workdir, store) = open_test_store();
+        let node = insert_active_node(&store, HarnessKind::ClaudeCode);
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+        let decision = service
+            .create_decision(DecisionCreateRequest {
+                node_id: Some(node.id.to_string()),
+                text: "Pick?".to_string(),
+            })
+            .await?;
+        store.set_decision_menu_options(
+            &decision.id,
+            &["Alpha".to_string(), "Beta".to_string(), "Gamma".to_string()],
+        )?;
+        // An answer that names no option is a hard error, and must leave the
+        // decision pending (never silently deliver Enter-takes-default).
+        let result = service
+            .resolve_decision(
+                &decision.id,
+                DecisionResolveRequest {
+                    status: "answered".to_string(),
+                    answer: Some("Delta".to_string()),
+                },
+            )
+            .await;
+        assert!(result.is_err(), "unmatched menu answer must error");
+        assert_eq!(service.get_decision(&decision.id).await?.status, "pending");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_menu_decision_with_matching_answer_resolves_decision(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_workdir, store) = open_test_store();
+        let node = insert_active_node(&store, HarnessKind::ClaudeCode);
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, test_app_config());
+        let decision = service
+            .create_decision(DecisionCreateRequest {
+                node_id: Some(node.id.to_string()),
+                text: "Pick?".to_string(),
+            })
+            .await?;
+        store.set_decision_menu_options(
+            &decision.id,
+            &["Alpha".to_string(), "Beta".to_string(), "Gamma".to_string()],
+        )?;
+        // A matching (non-default) answer resolves the decision. The typed key
+        // delivery targets a node with no live PTY here, so delivery itself is a
+        // logged no-op; the live non-default proof happens at integration.
+        let after = service
+            .resolve_decision(
+                &decision.id,
+                DecisionResolveRequest {
+                    status: "answered".to_string(),
+                    answer: Some("Beta".to_string()),
+                },
+            )
+            .await?;
+        assert_eq!(after.status, "answered");
+        Ok(())
+    }
+
+    #[test]
+    fn decision_menu_options_roundtrip_and_absent() -> Result<(), Box<dyn std::error::Error>> {
+        let (_workdir, store) = open_test_store();
+        let decision = store.insert_decision(None, "Pick?")?;
+        // Absent until set: a free-text decision has no options.
+        assert_eq!(store.decision_menu_options(&decision.0)?, None);
+        let options = vec!["Alpha".to_string(), "Beta".to_string()];
+        store.set_decision_menu_options(&decision.0, &options)?;
+        assert_eq!(store.decision_menu_options(&decision.0)?, Some(options));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn awaiting_input_produces_single_pending_decision_deduped(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -7734,6 +8066,99 @@ mod tests {
             delivered,
             "resolve_decision feedback did not reach node stdin; sink: {:?}",
             std::fs::read_to_string(&sink_path).unwrap_or_default()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_menu_decision_injects_typed_option_index_not_free_text(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // DECISION-004 live proof: a matched non-default menu answer ("Beta",
+        // index 1) must reach the node's PTY as the TYPED key sequence
+        // (one down-arrow \x1b[B then the submit CR), NOT as the free-text
+        // answer verbatim. This kills an inverted dispatch: if resolve_decision
+        // routed a matched menu answer through send_input, the PTY would receive
+        // the bytes "Beta" (which would land on the default option) instead of
+        // the navigation keystroke, and this test would fail.
+        let _guard = env_lock();
+        let workdir = tempfile::tempdir()?;
+        let home = workdir.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let _home = EnvVarGuard::set_var("HOME", &home);
+        let workspace = workdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let path = workdir.path().join("asylum.sqlite3").display().to_string();
+        let sink_path = workdir.path().join("stdin.txt");
+        let script_path = workdir.path().join("fake-stdin.sh");
+        // Canonical-mode PTY: the harness reads a full line only when a CR
+        // (translated to NL) arrives, so a completed line in the sink means the
+        // whole keystroke sequence was delivered. The down-arrow ESC bytes ride
+        // through as ordinary line content.
+        let script = format!(
+            "#!/bin/sh\nprintf 'READY\\r\\n'\nwhile IFS= read -r line; do printf '%s\\n' \"$line\" >> '{}'; done\n",
+            sink_path.display()
+        );
+        write_executable_script(&script_path, &script)?;
+
+        let store = Store::open(path)?;
+        let mut config = test_app_config();
+        config.harness.codex_command = script_path.display().to_string();
+        let service = CapabilityService::new(store.clone(), AuthMode::Disabled, config);
+
+        let response = service
+            .create_node(local_create_request_with_workspace(
+                "",
+                &workspace.display().to_string(),
+            ))
+            .await?;
+        let node_id = Uuid::parse_str(&response.node_id)?;
+
+        let decision = service
+            .create_decision(DecisionCreateRequest {
+                node_id: Some(node_id.to_string()),
+                text: "Pick?".to_string(),
+            })
+            .await?;
+        store.set_decision_menu_options(
+            &decision.id,
+            &["Alpha".to_string(), "Beta".to_string(), "Gamma".to_string()],
+        )?;
+        service
+            .resolve_decision(
+                &decision.id,
+                DecisionResolveRequest {
+                    status: "answered".to_string(),
+                    answer: Some("Beta".to_string()),
+                },
+            )
+            .await?;
+
+        // The submit CR completes exactly one line; wait until it lands.
+        let down_arrow = b"\x1b[B";
+        let mut sink = Vec::new();
+        for _ in 0..250 {
+            sink = std::fs::read(&sink_path).unwrap_or_default();
+            if !sink.is_empty() {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        let _ = service.stop_node(node_id).await;
+
+        let down_arrows = sink
+            .windows(down_arrow.len())
+            .filter(|w| *w == down_arrow)
+            .count();
+        // Index 1 (Beta) selects with exactly one down-arrow keystroke — proving
+        // both the typed path and the derived index. A free-text dispatch would
+        // instead deliver the literal answer.
+        assert_eq!(
+            down_arrows, 1,
+            "expected one typed down-arrow for menu index 1; sink bytes: {sink:?}"
+        );
+        assert!(
+            !sink.windows(4).any(|w| w == b"Beta"),
+            "matched menu answer must not reach the PTY as free text; sink bytes: {sink:?}"
         );
         Ok(())
     }

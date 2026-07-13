@@ -380,6 +380,30 @@ impl LocalSubstrate {
         Ok(())
     }
 
+    /// Select the option at 0-based `option_index` in the harness's currently
+    /// displayed single-select menu (e.g. claude AskUserQuestion). Delivers the
+    /// down-arrow navigation and the submit CR as distinct paced PTY writes (see
+    /// `menu_selection_writes`), holding the per-node submit lock across the whole
+    /// sequence so a concurrent submit cannot interleave its own keystrokes. This
+    /// is the typed-delivery path decision resolution uses instead of free-text +
+    /// Enter, which would land on the default option.
+    pub async fn send_menu_selection(&self, node_id: Uuid, option_index: usize) -> Result<()> {
+        let (writer, submit_lock) = self.writer_and_submit_lock_for(node_id).await?;
+        let _submit = submit_lock.lock().await;
+        for write in crate::substrate::menu_selection_writes(option_index) {
+            {
+                let mut w = writer.lock().await;
+                w.write_all(&write)?;
+                w.flush()?;
+            }
+            // Gap between keystrokes: claude's TUI treats a bundled burst as a
+            // paste, so the navigation keys and the submit CR must each arrive as
+            // their own keypress (same reasoning as the text-submit gap).
+            tokio::time::sleep(SUBMIT_GAP).await;
+        }
+        Ok(())
+    }
+
     /// Clone the shared writer handle for a running node, releasing the runtimes
     /// map lock before the caller writes (so a slow PTY write never blocks other
     /// runtime lookups).

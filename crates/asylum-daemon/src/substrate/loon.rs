@@ -756,6 +756,22 @@ impl LoonSubstrate {
         Ok(())
     }
 
+    /// Select the option at 0-based `option_index` in the harness's currently
+    /// displayed single-select menu (claude AskUserQuestion). Mirrors the local
+    /// substrate: the down-arrow navigation and submit CR are delivered as distinct
+    /// paced writes (`menu_selection_writes`) under the per-node submit lock, so the
+    /// harness selects the exact option instead of the Enter-takes-default choice.
+    pub async fn send_menu_selection(&self, external_id: &str, option_index: usize) -> Result<()> {
+        let (tx, submit_lock) = self.input_and_submit_lock_for(external_id).await?;
+        let _submit = submit_lock.lock().await;
+        for write in crate::substrate::menu_selection_writes(option_index) {
+            tx.send(write).map_err(|_| anyhow!("node not running"))?;
+            // Each keystroke as its own paced write (claude paste-coalescing).
+            tokio::time::sleep(SUBMIT_GAP).await;
+        }
+        Ok(())
+    }
+
     /// Raw PTY write with no appended submit key (interactive attach path).
     pub async fn send_input_raw(&self, external_id: &str, bytes: &[u8]) -> Result<()> {
         let tx = self.input_for(external_id).await?;

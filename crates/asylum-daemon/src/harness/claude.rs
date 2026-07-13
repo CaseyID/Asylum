@@ -325,10 +325,11 @@ fn claude_settings_json(asylum_binary: &str) -> String {
     let statusline_cmd = format!("{bin} harness-event claude-statusline");
 
     // A single matcher-group forwarding one event to the bridge. `async_tool` marks
-    // the PostToolUse group fire-and-forget so tool execution is never blocked. A
-    // short 10s timeout keeps a slow/unreachable daemon from stalling the session
-    // near claude's 600s hook default.
-    let group = |async_tool: bool| -> Value {
+    // the group fire-and-forget so tool execution is never blocked. `matcher`
+    // scopes the group to a tool name (only PreToolUse/PostToolUse honour it);
+    // `None` forwards every occurrence. A short 10s timeout keeps a slow/unreachable
+    // daemon from stalling the session near claude's 600s hook default.
+    let group = |async_tool: bool, matcher: Option<&str>| -> Value {
         let mut entry = serde_json::Map::new();
         entry.insert("type".to_string(), Value::String("command".to_string()));
         entry.insert("command".to_string(), Value::String(hook_cmd.clone()));
@@ -336,16 +337,27 @@ fn claude_settings_json(asylum_binary: &str) -> String {
         if async_tool {
             entry.insert("async".to_string(), Value::Bool(true));
         }
-        serde_json::json!({ "hooks": [Value::Object(entry)] })
+        let mut g = serde_json::Map::new();
+        if let Some(m) = matcher {
+            g.insert("matcher".to_string(), Value::String(m.to_string()));
+        }
+        g.insert("hooks".to_string(), Value::Array(vec![Value::Object(entry)]));
+        Value::Object(g)
     };
 
     serde_json::json!({
         "hooks": {
-            "Stop": [group(false)],
-            "Notification": [group(false)],
-            "SessionStart": [group(false)],
-            "SessionEnd": [group(false)],
-            "PostToolUse": [group(true)],
+            "Stop": [group(false, None)],
+            "Notification": [group(false, None)],
+            "SessionStart": [group(false, None)],
+            "SessionEnd": [group(false, None)],
+            "PostToolUse": [group(true, None)],
+            // AskUserQuestion menu dialogs: the PreToolUse payload carries the
+            // structured question + option list (verified against claude 2.1.207),
+            // which lets a decision resolution map to the exact menu option instead
+            // of landing Enter-takes-default. Async so the menu render is never
+            // blocked on the bridge; we only need the payload forwarded.
+            "PreToolUse": [group(true, Some("AskUserQuestion"))],
         },
         "statusLine": { "type": "command", "command": statusline_cmd }
     })

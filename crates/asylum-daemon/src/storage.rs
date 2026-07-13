@@ -263,6 +263,10 @@ impl Store {
         // never has to load-and-scan every prior harness-event body per post.
         ensure_column(&conn, "nodes", "ctx_pressure_session", "TEXT")?;
         ensure_column(&conn, "nodes", "ctx_pressure_max", "REAL")?;
+        // ws4b: structured menu options for AskUserQuestion-style decisions,
+        // stored as a JSON array of option labels. Present only for menu
+        // decisions; resolution maps the answer to the exact option index.
+        ensure_column(&conn, "decisions", "options_json", "TEXT")?;
         Ok(())
     }
 
@@ -1164,6 +1168,38 @@ impl Store {
                 Ok((existing, false))
             }
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Persist the structured menu option labels for a decision (JSON array).
+    /// Idempotent: re-called if a text-only awaiting-input created the decision
+    /// before the AskUserQuestion PreToolUse that carries the options.
+    pub fn set_decision_menu_options(&self, id: &str, options: &[String]) -> Result<()> {
+        let json = serde_json::to_string(options)?;
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE decisions SET options_json = ?1 WHERE id = ?2",
+            params![json, id],
+        )?;
+        Ok(())
+    }
+
+    /// The structured menu option labels for a decision, if it is a menu decision.
+    /// `None` for a free-text/confirmation decision (no options column value).
+    pub fn decision_menu_options(&self, id: &str) -> Result<Option<Vec<String>>> {
+        let conn = self.conn()?;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT options_json FROM decisions WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("decision menu options")?
+            .flatten();
+        match raw {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
         }
     }
 
