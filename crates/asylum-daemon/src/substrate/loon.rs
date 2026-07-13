@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,7 +32,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::process::Command;
-use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -54,9 +55,35 @@ const SUBMIT_GAP: Duration = Duration::from_millis(50);
 const ATTACH_WS_PING_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Readiness gating for launch-prompt delivery over the guest PTY (timing only).
+/// Used by the codex path and as the render-settle floor before claude's first
+/// confirmed attempt.
 const LAUNCH_FIRST_OUTPUT_TIMEOUT: Duration = Duration::from_secs(45);
 const LAUNCH_QUIET_WINDOW: Duration = Duration::from_millis(700);
 const LAUNCH_READY_MAX: Duration = Duration::from_secs(20);
+
+/// claude launch-prompt delivery gate over the guest PTY. Mirrors the local
+/// substrate's deliver-and-confirm design: a guest image shipping claude
+/// >= 2.1.207 swallows typed input during a silent multi-second "connecting"
+/// window that produces no distinguishing PTY output, so the timing heuristic
+/// delivers into a dead composer and the prompt is lost. Instead of guessing
+/// readiness we observe the OUTCOME -- deliver, wait for the guest's
+/// `UserPromptSubmit` hook (posted to the daemon over guest-control HTTP and
+/// routed here via `notify_prompt_accepted`), and redeliver if it did not land.
+/// Confirmation only; no TUI text is parsed. Loon keeps its own timing/pacing
+/// constants above (guest cold-boot is slower); the session floor and retry
+/// budget match the local substrate exactly.
+///
+/// Floor before the first attempt: don't type before the composer exists. The
+/// guest claude `SessionStart` hook releases it; bounded so a hookless/broken
+/// guest still proceeds into the self-correcting retry loop.
+const SESSION_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Redelivery cap and spacing -- identical to the local substrate. The
+/// `UserPromptSubmit` confirmation is async, so too-fast redelivery duplicates a
+/// prompt that already landed while too-slow gives up mid-connect; 15s clears the
+/// observed ~9s swallow window with margin while a healthy confirmation arrives
+/// well under it, and 3 attempts caps worst-case duplicates at 2.
+const MAX_LAUNCH_ATTEMPTS: u32 = 3;
+const LAUNCH_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 
 /// How long to wait for the freshly-created guest to answer a trivial exec
 /// before giving up on provisioning (cold boot + guest agent up).
@@ -157,6 +184,23 @@ struct LoonProfile {
     fingerprint_sha256: String,
 }
 
+/// Per-node launch-prompt delivery signals, mirroring the local substrate's
+/// `LaunchSignals`. The capability service posts the guest's claude hook events
+/// onto these (routed by `node.substrate`) to gate and confirm delivery. Only
+/// created for a claude loon node that has a launch prompt.
+#[derive(Default)]
+pub(crate) struct LaunchSignals {
+    /// Fired when the guest's claude `SessionStart` hook posts (the session/
+    /// composer is coming up). Gates the first delivery attempt.
+    session_started: Notify,
+    /// Fired when the guest's claude `UserPromptSubmit` hook posts (a prompt was
+    /// actually submitted). Wakes the retry loop so it stops redelivering.
+    prompt_accepted: Notify,
+    /// Latches true on the first acceptance so the retry loop never redelivers
+    /// after the prompt has landed, closing the notify/wait race.
+    accepted: AtomicBool,
+}
+
 #[derive(Clone)]
 struct LoonRuntime {
     node_id: Uuid,
@@ -168,6 +212,10 @@ struct LoonRuntime {
     /// M5: per-node lock held across a whole submit (body burst -> gap -> CR) so
     /// concurrent send_input calls cannot interleave their bytes on the guest PTY.
     submit_lock: Arc<Mutex<()>>,
+    /// Launch-prompt delivery signals, present only for a claude loon node
+    /// launched with a prompt. The capability service posts SessionStart /
+    /// UserPromptSubmit guest hook events onto these to gate and confirm delivery.
+    launch_signals: Option<Arc<LaunchSignals>>,
 }
 
 /// How a guest harness process ended (mirrors the local `ExitOutcome`).
@@ -714,6 +762,23 @@ impl LoonSubstrate {
             }
         });
 
+        let submit_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        // claude loon nodes with a launch prompt use hook-confirmed delivery (see
+        // `LaunchSignals`); the capability service posts SessionStart /
+        // UserPromptSubmit guest hook events onto these to gate and confirm
+        // delivery. Other harnesses (codex) use the timing heuristic, unchanged.
+        let has_prompt = spec
+            .launch_prompt
+            .as_ref()
+            .map(|p| !p.is_empty())
+            .unwrap_or(false);
+        let launch_signals: Option<Arc<LaunchSignals>> =
+            if has_prompt && matches!(spec.harness, HarnessKind::ClaudeCode) {
+                Some(Arc::new(LaunchSignals::default()))
+            } else {
+                None
+            };
+
         let runtime = LoonRuntime {
             node_id,
             vm_id: vm_id.to_string(),
@@ -721,7 +786,8 @@ impl LoonSubstrate {
             input_tx: input_tx.clone(),
             output_tx: output_tx.clone(),
             tasks: Arc::new(Mutex::new(vec![read_task, write_task, exit_task])),
-            submit_lock: Arc::new(Mutex::new(())),
+            submit_lock: submit_lock.clone(),
+            launch_signals: launch_signals.clone(),
         };
         self.runtimes
             .write()
@@ -734,7 +800,20 @@ impl LoonSubstrate {
         // Deliver the launch prompt as a submitted message once the TUI settles.
         if let Some(prompt) = spec.launch_prompt.clone().filter(|p| !p.is_empty()) {
             let rx = output_tx.subscribe();
-            tokio::spawn(await_ready_and_deliver(input_tx, rx, prompt, node_id));
+            match launch_signals {
+                // claude: hook-confirmed, self-correcting delivery (fixes the
+                // >= 2.1.207 connecting-screen swallow on a newer guest image).
+                Some(signals) => {
+                    tokio::spawn(await_ready_and_deliver_claude(
+                        signals, submit_lock, input_tx, rx, prompt, node_id,
+                    ));
+                }
+                // codex (and any harness without launch signals): timing
+                // heuristic, unchanged.
+                None => {
+                    tokio::spawn(await_ready_and_deliver_codex(input_tx, rx, prompt, node_id));
+                }
+            }
         }
         Ok(())
     }
@@ -829,6 +908,41 @@ impl LoonSubstrate {
 
     pub async fn has_runtime(&self, external_id: &str) -> bool {
         self.runtimes.read().await.contains_key(external_id)
+    }
+
+    /// Clone the launch-delivery signals for a node, if it has any (claude loon
+    /// nodes launched with a prompt). Runtimes are keyed by the guest VM id, but
+    /// the capability service routes hook events by node id, so this scans by
+    /// `node_id` (the runtime map is small).
+    async fn launch_signals_for(&self, node_id: Uuid) -> Option<Arc<LaunchSignals>> {
+        self.runtimes
+            .read()
+            .await
+            .values()
+            .find(|runtime| runtime.node_id == node_id)
+            .and_then(|runtime| runtime.launch_signals.clone())
+    }
+
+    /// Signal that the guest's claude `SessionStart` hook fired for `node_id`: the
+    /// session/composer is coming up, so the delivery task may make its first
+    /// attempt. No-op for nodes without launch signals (codex, no-prompt, gone).
+    pub async fn notify_session_started(&self, node_id: Uuid) {
+        if let Some(signals) = self.launch_signals_for(node_id).await {
+            signals.session_started.notify_one();
+        }
+    }
+
+    /// Signal that the guest's claude `UserPromptSubmit` hook fired for `node_id`:
+    /// a prompt was actually submitted, so the delivery task should stop
+    /// redelivering. The latch closes the notify/wait race. No-op for nodes
+    /// without launch signals. This is ANY prompt submission, not specifically the
+    /// launch prompt's -- see the accepted-bounded-behaviour note on
+    /// `deliver_launch_prompt_with_retry`.
+    pub async fn notify_prompt_accepted(&self, node_id: Uuid) {
+        if let Some(signals) = self.launch_signals_for(node_id).await {
+            signals.accepted.store(true, Ordering::Release);
+            signals.prompt_accepted.notify_one();
+        }
     }
 
     /// Whether a VM with this instance id still exists on the loon host. Queries
@@ -1103,24 +1217,62 @@ fn exit_watch_to_outcome(watch: ExitWatch) -> super::ExitOutcome {
     }
 }
 
-/// Wait for the guest TUI to settle (first frame + a quiet window, all bounded),
-/// then deliver the launch prompt as a submitted message over the PTY input
-/// channel. Timing only; no output content is inspected.
-async fn await_ready_and_deliver(
+/// Deliver `text` to the guest PTY as a SUBMITTED message over the input channel:
+/// send the body, pause, then send a lone carriage return as a DISTINCT write.
+/// Mirrors the local substrate's `submit_over_writer` (W0 two-write submit
+/// contract): the interactive TUI absorbs a CR bundled into the body write as
+/// pasted content, so only a CR arriving as its own keystroke submits. The
+/// per-node submit lock is held across the whole body -> gap -> CR sequence so a
+/// concurrent submit cannot interleave its bytes on the guest PTY (M5).
+async fn submit_over_input(
+    submit_lock: &Arc<Mutex<()>>,
+    input_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    text: &str,
+) -> Result<()> {
+    let _submit = submit_lock.lock().await;
+    input_tx
+        .send(text.as_bytes().to_vec())
+        .map_err(|_| anyhow!("node not running"))?;
+    tokio::time::sleep(SUBMIT_GAP).await;
+    input_tx
+        .send(b"\r".to_vec())
+        .map_err(|_| anyhow!("node not running"))?;
+    Ok(())
+}
+
+/// Wait for the guest TUI's initial render to settle: first PTY frame seen, then
+/// output quiet for a full window. No output content is inspected -- timing only,
+/// keeping Asylum as dumb plumbing. Bounded so a silent or continuously-redrawing
+/// guest still proceeds. Mirrors the local substrate's helper of the same name.
+async fn await_first_output_and_settle(rx: &mut broadcast::Receiver<String>) {
+    let _ = tokio::time::timeout(LAUNCH_FIRST_OUTPUT_TIMEOUT, rx.recv()).await;
+    let deadline = tokio::time::Instant::now() + LAUNCH_READY_MAX;
+    loop {
+        match tokio::time::timeout(LAUNCH_QUIET_WINDOW, rx.recv()).await {
+            // Output arrived inside the window: still rendering; keep waiting
+            // unless we have hit the overall deadline.
+            Ok(Ok(_)) => {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+            }
+            // Quiet window elapsed, or the channel closed/lagged: treat as ready.
+            _ => break,
+        }
+    }
+}
+
+/// codex launch-prompt delivery over the guest PTY: settle on the initial render,
+/// then deliver as a submitted message. Unchanged behaviour -- codex has no
+/// session/acceptance hooks, and its startup does not swallow a delivered body the
+/// way a newer claude's connecting screen does. Timing only; no output parsed.
+async fn await_ready_and_deliver_codex(
     input_tx: mpsc::UnboundedSender<Vec<u8>>,
     mut rx: broadcast::Receiver<String>,
     prompt: String,
     node_id: Uuid,
 ) {
-    let _ = tokio::time::timeout(LAUNCH_FIRST_OUTPUT_TIMEOUT, rx.recv()).await;
-    let deadline = tokio::time::Instant::now() + LAUNCH_READY_MAX;
-    while let Ok(Ok(_)) = tokio::time::timeout(LAUNCH_QUIET_WINDOW, rx.recv()).await {
-        // Output still arriving inside the window: keep waiting unless the overall
-        // readiness deadline has passed.
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-    }
+    await_first_output_and_settle(&mut rx).await;
     if input_tx.send(prompt.into_bytes()).is_err() {
         tracing::warn!(node_id = %node_id, "loon launch prompt delivery failed (body)");
         return;
@@ -1131,6 +1283,106 @@ async fn await_ready_and_deliver(
         return;
     }
     tracing::debug!(node_id = %node_id, "delivered loon launch prompt");
+}
+
+/// claude launch-prompt delivery over the guest PTY: wait for the session-up floor
+/// (guest `SessionStart` hook), let the initial render settle, then
+/// deliver-and-confirm with redelivery (see `LaunchSignals` and
+/// `SESSION_READY_TIMEOUT`). This replaces the pure timing heuristic, which races
+/// a newer claude's input-swallowing connecting screen. Mirrors the local
+/// substrate's `await_ready_and_deliver_claude`.
+async fn await_ready_and_deliver_claude(
+    signals: Arc<LaunchSignals>,
+    submit_lock: Arc<Mutex<()>>,
+    input_tx: mpsc::UnboundedSender<Vec<u8>>,
+    mut rx: broadcast::Receiver<String>,
+    prompt: String,
+    node_id: Uuid,
+) {
+    // Floor: don't type before the composer exists.
+    let _ = tokio::time::timeout(SESSION_READY_TIMEOUT, signals.session_started.notified()).await;
+    // Let the initial welcome render settle before the first attempt.
+    await_first_output_and_settle(&mut rx).await;
+    deliver_launch_prompt_with_retry(
+        &signals,
+        &submit_lock,
+        &input_tx,
+        &prompt,
+        node_id,
+        MAX_LAUNCH_ATTEMPTS,
+        LAUNCH_RETRY_INTERVAL,
+    )
+    .await;
+}
+
+/// Deliver the launch prompt over the guest PTY, redelivering until the guest
+/// confirms a prompt submission (`signals.accepted`, set from claude's
+/// `UserPromptSubmit` hook) or the attempt budget is exhausted. Confirmation-
+/// driven, not text-parsing: we observe whether the prompt actually landed and
+/// retry if not, the only robust gate for a newer claude's connecting screen
+/// (which swallows input during a silent window no timing heuristic can detect).
+/// Mirrors the local substrate's function of the same name.
+///
+/// Accepted bounded behaviour: the confirmation is ANY UserPromptSubmit, not
+/// specifically ours -- correlating a confirmation to a specific submission would
+/// require parsing TUI output, which is barred (dumb plumbing). So an operator who
+/// types into a just-launched node during the retry window takes over: their
+/// submission stops the loop even if the launch prompt itself never landed. The
+/// acceptance-exit log makes that narrow case diagnosable.
+async fn deliver_launch_prompt_with_retry(
+    signals: &LaunchSignals,
+    submit_lock: &Arc<Mutex<()>>,
+    input_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    prompt: &str,
+    node_id: Uuid,
+    max_attempts: u32,
+    retry_interval: Duration,
+) {
+    for attempt in 0..max_attempts {
+        // A prior attempt may have landed while we were between iterations.
+        if signals.accepted.load(Ordering::Acquire) {
+            tracing::info!(
+                node_id = %node_id,
+                attempt,
+                "launch prompt delivery loop stopped: a prompt submission was confirmed"
+            );
+            return;
+        }
+        if let Err(e) = submit_over_input(submit_lock, input_tx, prompt).await {
+            tracing::warn!(node_id = %node_id, error = %e, "launch prompt delivery failed");
+            return;
+        }
+        if attempt == 0 {
+            tracing::debug!(node_id = %node_id, attempt, "delivered launch prompt");
+        } else {
+            // Every redelivery is warn-logged: if the prior attempt actually
+            // landed but its async confirmation was slow or dropped, this
+            // redelivery duplicates the task in a live composer -- the log makes
+            // any duplicate diagnosable from the daemon log alone.
+            tracing::warn!(
+                node_id = %node_id,
+                attempt,
+                "redelivered launch prompt (previous attempt unconfirmed)"
+            );
+        }
+        // Wait for the guest to confirm the submission before redelivering.
+        // notify_one stores a permit, so an acceptance that fires before this
+        // await still wakes it; the accepted latch closes the remaining race.
+        let _ = tokio::time::timeout(retry_interval, signals.prompt_accepted.notified()).await;
+        if signals.accepted.load(Ordering::Acquire) {
+            tracing::info!(
+                node_id = %node_id,
+                attempt,
+                "launch prompt delivery loop stopped: a prompt submission was confirmed"
+            );
+            return;
+        }
+    }
+    tracing::warn!(
+        node_id = %node_id,
+        attempts = max_attempts,
+        "launch prompt not confirmed after retry budget"
+    );
 }
 
 // ---- loon client config + TLS pinning -------------------------------------
@@ -1373,6 +1625,178 @@ mod tests {
         assert_eq!(decode_hex("00ff10"), Some(vec![0x00, 0xff, 0x10]));
         assert_eq!(decode_hex("aa:bb"), Some(vec![0xaa, 0xbb]));
         assert_eq!(decode_hex("abc"), None);
+    }
+
+    /// Drain every buffered write off the guest input channel (the sender must be
+    /// dropped first), so a test can assert the exact submit sequence delivered
+    /// over the PTY input path.
+    fn drain(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Ok(bytes) = rx.try_recv() {
+            out.push(bytes);
+        }
+        out
+    }
+
+    /// Guard on the retry budget's duplication bound, mirroring the local
+    /// substrate. The UserPromptSubmit confirmation is async, so a too-short retry
+    /// interval redelivers a prompt that already landed (duplicate task
+    /// execution); the interval must clear both the observed connecting window
+    /// (~9s) and a slow-confirm margin, and the attempt cap bounds worst-case
+    /// duplicates at MAX-1. Retuning these should be a conscious act.
+    #[test]
+    fn launch_retry_budget_bounds_duplicate_submissions() {
+        assert!(
+            LAUNCH_RETRY_INTERVAL >= Duration::from_secs(15),
+            "retry interval must comfortably outlast the ~9s connecting window \
+             and in-flight async confirmations"
+        );
+        assert!(
+            MAX_LAUNCH_ATTEMPTS <= 3,
+            "attempt cap bounds worst-case duplicate submissions at MAX-1"
+        );
+    }
+
+    /// Retry core: once the guest confirms acceptance, delivery stops after the
+    /// single landing attempt (body + CR = two channel writes) -- no redelivery.
+    #[tokio::test]
+    async fn retry_delivers_once_when_prompt_is_accepted() {
+        let signals = Arc::new(LaunchSignals::default());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let submit_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+
+        // Confirm acceptance shortly after the first delivery.
+        let confirm = signals.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            confirm.accepted.store(true, Ordering::Release);
+            confirm.prompt_accepted.notify_one();
+        });
+
+        deliver_launch_prompt_with_retry(
+            &signals,
+            &submit_lock,
+            &tx,
+            "GO",
+            Uuid::new_v4(),
+            5,
+            Duration::from_millis(500),
+        )
+        .await;
+
+        drop(tx);
+        let writes = drain(&mut rx);
+        assert_eq!(
+            writes.len(),
+            2,
+            "an accepted prompt is delivered exactly once (body, CR); got {writes:?}"
+        );
+        assert_eq!(writes[0], b"GO");
+        assert_eq!(writes[1], b"\r");
+    }
+
+    /// Retry core: when the prompt is never confirmed (e.g. guest hooks broken),
+    /// it is redelivered up to the attempt budget -- the fallback that guarantees
+    /// no prompt is silently dropped.
+    #[tokio::test]
+    async fn retry_redelivers_up_to_budget_when_never_accepted() {
+        let signals = Arc::new(LaunchSignals::default());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let submit_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+
+        deliver_launch_prompt_with_retry(
+            &signals,
+            &submit_lock,
+            &tx,
+            "GO",
+            Uuid::new_v4(),
+            3,
+            Duration::from_millis(10),
+        )
+        .await;
+
+        drop(tx);
+        // 3 attempts * (body, CR) = 6 writes.
+        let writes = drain(&mut rx);
+        assert_eq!(
+            writes.len(),
+            6,
+            "unconfirmed prompt should retry to the budget; got {writes:?}"
+        );
+    }
+
+    /// Retry core: a prompt already confirmed before the loop starts (acceptance
+    /// raced ahead of the first attempt) is never delivered -- no double submit.
+    #[tokio::test]
+    async fn retry_delivers_nothing_when_already_accepted() {
+        let signals = Arc::new(LaunchSignals::default());
+        signals.accepted.store(true, Ordering::Release);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let submit_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+
+        deliver_launch_prompt_with_retry(
+            &signals,
+            &submit_lock,
+            &tx,
+            "GO",
+            Uuid::new_v4(),
+            3,
+            Duration::from_millis(10),
+        )
+        .await;
+
+        drop(tx);
+        assert!(
+            drain(&mut rx).is_empty(),
+            "an already-accepted prompt must not be delivered"
+        );
+    }
+
+    /// Session-start floor: claude delivery over the guest PTY does NOT type into
+    /// the composer until `session_started` fires, then delivers and stops once
+    /// acceptance is confirmed. Proves the floor gate and the signal wiring on the
+    /// loon delivery task (the loon analogue of the local end-to-end gate test).
+    #[tokio::test]
+    async fn claude_delivery_waits_for_session_start_floor() {
+        let signals = Arc::new(LaunchSignals::default());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let submit_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        let (out_tx, out_rx) = broadcast::channel::<String>(16);
+        let node_id = Uuid::new_v4();
+
+        let handle = tokio::spawn(await_ready_and_deliver_claude(
+            signals.clone(),
+            submit_lock,
+            tx,
+            out_rx,
+            "MARK".to_string(),
+            node_id,
+        ));
+
+        // Parked on the floor gate: nothing is typed into the (still-connecting)
+        // composer before session_started.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "claude prompt must not be delivered before session_started"
+        );
+
+        // Session comes up. Dropping the output sender closes the settle channel so
+        // the render-settle gate returns immediately (no real PTY frames here).
+        signals.session_started.notify_one();
+        drop(out_tx);
+
+        // Delivery now proceeds: the body lands first.
+        let body = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("delivery should proceed after session_started")
+            .expect("body should be sent");
+        assert_eq!(body, b"MARK");
+
+        // Confirm acceptance so the retry loop stops cleanly, then let the task end.
+        signals.accepted.store(true, Ordering::Release);
+        signals.prompt_accepted.notify_one();
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
     }
 
     // C1: the exit-watch -> ExitOutcome mapping must be honest. Only a parsed

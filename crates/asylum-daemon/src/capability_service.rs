@@ -815,22 +815,40 @@ impl CapabilityService {
             });
         }
 
-        // Launch-prompt delivery: route claude's readiness hooks into the local
-        // substrate's delivery task. SessionStart releases the delivery floor;
-        // UserPromptSubmit confirms the prompt landed so redelivery stops. Both
-        // are no-ops for nodes without an active launch delivery (see
-        // LocalSubstrate::launch_signals_for), so this is safe to call
+        // Launch-prompt delivery: route claude's readiness hooks into the
+        // delivery task of whichever substrate owns the node. SessionStart
+        // releases the delivery floor; UserPromptSubmit confirms the prompt landed
+        // so redelivery stops. Loon guests post the same claude hook events over
+        // guest-control HTTP, so both substrates confirm through this same path.
+        // Every notify is a no-op for nodes without an active launch delivery (see
+        // each substrate's launch_signals_for), so this is safe to call
         // unconditionally on the claude_hook source.
         if request.source == "claude_hook" {
-            match request
+            let hook_event = request
                 .payload
                 .get("hook_event_name")
-                .and_then(|v| v.as_str())
-            {
-                Some("SessionStart") => self.local_substrate.notify_session_started(node_id).await,
-                Some("UserPromptSubmit") => {
-                    self.local_substrate.notify_prompt_accepted(node_id).await
-                }
+                .and_then(|v| v.as_str());
+            match hook_event {
+                Some("SessionStart") => match node.substrate {
+                    SubstrateKind::Local => {
+                        self.local_substrate.notify_session_started(node_id).await
+                    }
+                    SubstrateKind::Loon => {
+                        if let Some(loon) = self.loon_substrate.as_deref() {
+                            loon.notify_session_started(node_id).await;
+                        }
+                    }
+                },
+                Some("UserPromptSubmit") => match node.substrate {
+                    SubstrateKind::Local => {
+                        self.local_substrate.notify_prompt_accepted(node_id).await
+                    }
+                    SubstrateKind::Loon => {
+                        if let Some(loon) = self.loon_substrate.as_deref() {
+                            loon.notify_prompt_accepted(node_id).await;
+                        }
+                    }
+                },
                 _ => {}
             }
         }
