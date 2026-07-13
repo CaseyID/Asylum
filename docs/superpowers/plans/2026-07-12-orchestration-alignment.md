@@ -1,10 +1,12 @@
 # Orchestration Alignment Implementation Plan
 
-**Status:** planned, not started. The product-level alignment (spec `LAYER-*`,
+**Status:** DELIVERED 2026-07-13 on main. All four workstreams implemented,
+adversarially reviewed, and merged; full suite green (200 daemon + 71 cli +
+11 types Rust tests, 112 cockpit vitest); live checks recorded in the
+Delivery record below. The product-level alignment (spec `LAYER-*`,
 `HARN-005`..`HARN-007`, `UX-005`, `DOC-007`, plus
 [docs/concepts/orchestration-layers.md](../../concepts/orchestration-layers.md))
-landed as docs on 2026-07-12; this plan is the code-level follow-through so it
-can be executed quickly in one later delivery step.
+landed as docs on 2026-07-12; this plan was the code-level follow-through.
 
 **Date:** 2026-07-12
 
@@ -33,19 +35,19 @@ Two spec gaps are implementation gaps today:
 Branch: `launch-packet-layer-etiquette`. Touches
 `crates/asylum-daemon/src/launch_packet.rs` and its tests only.
 
-- [ ] Add a short "Choosing the right layer" etiquette block to
+- [x] Add a short "Choosing the right layer" etiquette block to
   `FLEET_OPERATING_MANUAL`, in the concepts doc's preference order: direct
   work in-session; in-harness subagents/workflows for fine-grained fan-out
   inside one body of work; `node.spawn_peer` for work needing independent
   lifetime, isolation, separate supervision, or a different
   workspace/harness/substrate/launch profile.
-- [ ] Add verification etiquette: verify substantial results in a fresh
+- [x] Add verification etiquette: verify substantial results in a fresh
   context with a distinct adversarial framing (evaluator peer or in-harness
   equivalent); same-context self-review is weak. Recommendation, not a gate.
-- [ ] Reword the final etiquette line so it bans fiction, not in-harness
+- [x] Reword the final etiquette line so it bans fiction, not in-harness
   parallelism: "Never simulate a worker in your own transcript. Real fan-out
   is either a real in-harness subagent or a real node."
-- [ ] Extend the drift-guard test so the manual must contain the layer-choice
+- [x] Extend the drift-guard test so the manual must contain the layer-choice
   and verification etiquette markers (same pattern as the existing
   catalog-event guard), keeping `LAYER-003`'s "drift-checked" acceptance true.
 
@@ -58,7 +60,7 @@ Branch: `launch-profile`. The dumb-plumbing rule governs everything here:
 Asylum passes profile values through verbatim, maintains no model/effort
 catalogs, and surfaces harness rejections honestly (`HARN-005`).
 
-- [ ] **Verify harness mechanisms first** (the harness-contract-notes
+- [x] **Verify harness mechanisms first** (the harness-contract-notes
   practice: check live `--help` on this machine before coding):
   - Claude Code: `--model <value>` per-launch; confirm the current mechanism
     for per-launch reasoning effort (expected: a settings key via the
@@ -69,41 +71,41 @@ catalogs, and surfaces harness rejections honestly (`HARN-005`).
     version.
   - Record findings in `docs/superpowers/specs/2026-07-06-harness-contract-notes.md`
     (append a dated section).
-- [ ] **Types** (`crates/asylum-types`): optional `model: Option<String>` and
+- [x] **Types** (`crates/asylum-types`): optional `model: Option<String>` and
   `effort: Option<String>` on `CreateNodeRequest` and `SpawnPeerRequest`
   (spawn inherits none from the parent unless explicitly set — profile is not
   accidental control state, per `WORK-005`'s spirit). Persist the effective
   profile on the node record with an explicit harness-default marker when
   unset (`HARN-007`).
-- [ ] **Adapters** (`crates/asylum-daemon` harness adapters): translate
+- [x] **Adapters** (`crates/asylum-daemon` harness adapters): translate
   profile fields into the verified per-launch flags/config for local claude
   and codex launches; Loon launches carry the same fields through the guest
   launch contract. An option the adapter cannot express returns an honest
   unsupported error (`CAP-012` shape), never a silent no-op.
-- [ ] **Descriptors**: harness descriptors advertise which profile options the
+- [x] **Descriptors**: harness descriptors advertise which profile options the
   adapter supports (`supports_model`, `supports_effort`), so Cockpit/CLI/MCP
   can offer only real controls (`HARN-005`). No hardcoded model lists.
-- [ ] **CLI**: `asylum node create --model ... --effort ...` and the same on
+- [x] **CLI**: `asylum node create --model ... --effort ...` and the same on
   `node spawn`; inspect output shows the recorded profile.
-- [ ] **MCP**: `node.create`/`node.spawn_peer` tool schemas gain the optional
+- [x] **MCP**: `node.create`/`node.spawn_peer` tool schemas gain the optional
   params; the launch-packet manual's spawn documentation is updated in the
   same PR (its drift test will force this).
-- [ ] **Storage**: profile fields on the node row + wire contracts; recorded
+- [x] **Storage**: profile fields on the node row + wire contracts; recorded
   at launch time from what was actually applied, surviving restart/resume.
-- [ ] Unit/integration tests across types, adapters (arg construction),
+- [x] Unit/integration tests across types, adapters (arg construction),
   descriptors, CLI parse, MCP schema.
 
 ## Workstream 3 — Cockpit surfacing (small)
 
 Branch: `cockpit-launch-profile`. Depends on workstream 2's API.
 
-- [ ] `CreateScreen`: advanced launch-profile controls (model, effort),
+- [x] `CreateScreen`: advanced launch-profile controls (model, effort),
   rendered only when the selected harness descriptor advertises support;
   free-text with harness-default placeholder, not an Asylum-owned dropdown
   catalog (`UX-005`).
-- [ ] Node detail/inspect surfaces: show the recorded profile or "harness
+- [x] Node detail/inspect surfaces: show the recorded profile or "harness
   default" for live and historical nodes (`HARN-007`).
-- [ ] Vitest coverage for the conditional controls and the detail display.
+- [x] Vitest coverage for the conditional controls and the detail display.
 
 ## Verification
 
@@ -123,18 +125,26 @@ Branch: `cockpit-launch-profile`. Depends on workstream 2's API.
 The two loose ends left open at mission close ride this delivery so nothing
 stays unresolved:
 
-- [ ] **Menu-dialog answer fidelity** (`DECISION-004`): a decision resolution
+- [x] **Menu-dialog answer fidelity** (`DECISION-004`): a decision resolution
   answering a menu-style harness question must select the named non-default
   option, not deliver Enter-takes-default. Investigate the harness's menu
   input contract (arrow-key/number sequences over the PTY), implement typed
   delivery for claude AskUserQuestion-style menus, and prove a non-default
   selection live. Remove the corresponding README known-limit line when done.
-- [ ] **Claude local PTY crash follow-up**: the one-time claude 2.1.202
+- [x] **Claude local PTY crash follow-up**: the one-time claude 2.1.202
   local-`portable_pty` "output.write assertion" crash from the final live
   check. Reproduce against the currently installed claude version first; if
   unreproducible on current versions, record that and close it; if
   reproducible, pin/document the failing version range and fix or guard the
   local launch path.
+  **Outcome (2026-07-13): CLOSED, not reproducible.** A standalone repro
+  mirroring `local.rs`'s exact launch sequence (openpty -> spawn_command ->
+  reader thread -> two-write `/exit` submit) ran 5/5 clean against claude
+  2.1.207 / portable-pty 0.8.1 — exit 0 every time, no assertion, no code
+  change. The failing range could not be pinned (single occurrence ever; the
+  2.1.202 binary is gone). If it recurs, capture the exact assertion text and
+  `claude --version` at the time. Dated record appended to
+  [2026-07-06-harness-contract-notes.md](../specs/2026-07-06-harness-contract-notes.md).
 
 ## Explicitly out of scope (backlog, not this plan)
 
@@ -146,9 +156,65 @@ stays unresolved:
   limits); this plan does not absorb it.
 - Any Asylum-side orchestration engine or workflow DSL — permanent non-goal.
 
+## Delivery record (2026-07-13)
+
+Executed as four reviewed branches squash-merged to main (`launch packet: add
+layer-choice and verification etiquette`, `add launch profile (model/effort)
+end to end; fork reproduces source profile`, `cockpit: surface launch-profile
+controls in create and node screens`, `add typed menu-option delivery for
+claude askuserquestion decisions`). Adversarial review confirmed and fixed two
+findings pre-merge: fork was silently dropping the source profile
+(`ForkNodeRequest` gained optional model/effort, fork reproduces the source
+profile with override), and menu routing gained a service-layer regression
+test. Full suite green post-merge: 200 daemon + 71 cli + 11 types Rust tests,
+112 cockpit vitest.
+
+Live acceptance (dev daemon 127.0.0.1:7788, evidence in
+`~/.claude/jobs/8fda2981/tmp/live-check-evidence/`):
+
+- HARN-005/007 PASS: node created with `--model haiku --effort low` — real
+  process argv carried both flags, inspect recorded `model=haiku effort=low`,
+  and the session transcript's assistant turn was served by
+  `claude-haiku-4-5-20251001` (the harness actually launched with it).
+- HARN-006 PASS: `POST /api/nodes/{id}/spawn` with model/effort produced a
+  peer whose argv and inspect both carried the profile.
+- HARN-007 marker PASS: a node created without a profile showed
+  `model=None effort=None` and an argv with no profile flags.
+- DECISION-004 PASS: an AskUserQuestion menu (Apple/Banana/Cherry) created a
+  pending decision carrying the option labels; answer "Durian" returned an
+  honest 400 naming the stored options and left the decision pending; answer
+  "Cherry" (non-default) selected the menu option and the node wrote
+  `PICKED=Cherry`.
+
+One new finding surfaced during acceptance, fixed in this same delivery:
+claude 2.1.207's longer welcome//rc-connecting startup swallowed the
+launch-prompt auto-delivery (the quiet-window heuristic in
+`substrate/local.rs` typed too early; manual `node send` afterward landed
+fine).
+
+**Workstream 5 (added during acceptance) — claude launch-prompt readiness.**
+Instrumentation proved neither PTY-output quiescence nor the `SessionStart`
+event can gate delivery (the composer swallows input for ~9s after both).
+Delivered fix: claude-only deliver-and-confirm — floor-gated on
+`session_started`, confirmed via a newly injected async `UserPromptSubmit`
+hook, redelivering at a 15s interval up to 3 attempts, with an accepted-latch
+closing the notify/wait race; codex path split off byte-identical.
+Adversarially reviewed; two findings remediated (retimed interval/budget to
+bound the duplicate-delivery worst case at 2 with every redelivery
+warn-logged; acceptance-latch exits logged so the narrow operator-takeover
+case is diagnosable — full correlation would require TUI parsing, which is
+barred). Live-proven twice: prompt lands unassisted, exactly once
+(confirmation latency 0.9s vs the 15s redelivery interval).
+
+Backlog observations recorded during acceptance (for Linear when mirrored):
+`NodeRecord.tokens_in` is never populated from claude telemetry
+(`ingest_statusline` records only `used_percentage`; `turn_complete` + output
+are the authoritative activity signals); the loon substrate keeps the old
+timing-based delivery, so a loon guest image shipping claude >= 2.1.207 would
+hit the same swallow and needs the same deliver-and-confirm port.
+
 ## Release status
 
-Doc-level alignment is on main, not released — doc-only, no release needed.
-Implementation (workstreams 1-3) not started; when delivered it will be
+On main, not released — awaiting authorization. All four workstreams are
 user-facing and should ship in the next cut release. Last release: v0.2.0
 (2026-07-07). See [RELEASES.md](../../../RELEASES.md).

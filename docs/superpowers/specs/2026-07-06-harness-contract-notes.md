@@ -70,3 +70,64 @@ Implementation notes (WS2):
   profile the same way it reuses stored `launch_args`.
 - Peers do NOT inherit the parent's profile (HARN-006); only an explicitly-set
   `model`/`effort` on `spawn_peer` is applied.
+
+## 2026-07-13 -- Local portable_pty crash (2026-07-07) closed as not reproducible
+
+The one-time claude 2.1.202 local-`portable_pty` "output.write assertion" crash
+from the v0.2.0 final live check does not reproduce on current versions.
+Method: a standalone repro crate mirroring `substrate/local.rs`'s exact launch
+sequence (openpty -> spawn_command -> try_clone_reader/take_writer -> drop
+slave -> reader thread -> two-write `/exit` submit) ran 5 times against the
+interactive claude TUI up to and including a clean `/exit`, never submitting a
+prompt/turn. Versions: claude 2.1.207, portable-pty 0.8.1 (the crashing
+2.1.202 binary is no longer available to test). Outcome: 5/5 clean launches
+and exits, exit code 0, no assertion or panic, no hung children. No code
+change made. If the crash recurs, capture the exact assertion text and
+`claude --version` at the time -- the failing range could not be pinned from a
+single historical occurrence.
+
+## 2026-07-13 -- Claude AskUserQuestion menu contract (verified live)
+
+Verified empirically against claude 2.1.207 in a raw PTY (no daemon):
+
+- Hook payload: a `PreToolUse` hook with matcher `AskUserQuestion` receives
+  structured options. `tool_input.questions` is an array; each question has
+  `question` (string), `header` (string), `options` (array of
+  `{label, description}`), and `multiSelect` (bool). The top-level payload also
+  carries `tool_name`, `tool_use_id`, `session_id`, `transcript_path`, `cwd`,
+  `permission_mode`, and `effort`.
+- Menu input: the single-select menu opens with option index 0 highlighted. To
+  select 0-based index N, emit N down-arrow sequences (`0x1b 0x5b 0x42`), each
+  as its own PTY write with pacing, then a lone carriage return (`0x0d`) as its
+  own write. Proven live: one down + CR selected option 2, two down + CR
+  selected option 3 (both non-default). A single coalesced burst risks
+  paste-detection; distinct paced writes are required.
+- The TUI appends extra trailing items ("Type something", "Chat about this")
+  after the model's options, but down-count navigation from the top is
+  unaffected because the real options come first.
+- Asylum applies typed delivery only to single-question, `multiSelect=false`
+  dialogs; multi-select and multi-question dialogs fall through to the
+  free-text awaiting-input path unchanged.
+
+## 2026-07-13 -- Claude 2.1.207 startup swallows early PTY input (launch-prompt readiness)
+
+Observed live: after the welcome box renders and the SessionStart hook fires,
+claude 2.1.207's composer still swallows PTY input for ~9 more seconds (a
+"connecting" phase; the swallowed bytes are never echoed or queued). Neither
+PTY-output quiescence nor the `session_started` event is a sufficient
+readiness gate -- both occur inside the swallow window. This regressed
+launch-prompt auto-delivery, which worked on 2.1.202 during the v0.2.0 gates.
+
+Asylum's contract (local substrate, claude only): deliver-and-confirm.
+Delivery is floor-gated on `SessionStart`, then confirmed via an injected
+async `UserPromptSubmit` hook (fires at prompt submission, mechanical, no TUI
+parsing); unconfirmed deliveries are retried at a 15s interval up to 3
+attempts, every redelivery warn-logged. Bounded residual: confirmations
+slower than 15s can cause up to 2 duplicate submissions (logged); an operator
+prompt during the retry window latches the confirmation and stops the loop
+(logged). Codex keeps its original timing + submit-nudge path; the loon
+substrate keeps timing-based delivery and needs the same port if loon guest
+images move to claude >= 2.1.207. Also verified in this build:
+`UserPromptSubmit` and `SessionStart` hook payloads arrive reliably over the
+injected `--settings` hooks, while claude statusline telemetry carries only
+`used_percentage` (so `tokens_in` cannot be populated from it).

@@ -16,16 +16,11 @@ as product truth.
 | [../AGENTS.md](../AGENTS.md) | Agent-facing repo conventions and active branch context. |
 | [backlog.md](backlog.md) | Linear-backed feedback intake, product-review, triage, and delivery workflow. |
 
-## Planned — Not Yet Implemented
-
-| Doc | Purpose |
-|---|---|
-| [superpowers/plans/2026-07-12-orchestration-alignment.md](superpowers/plans/2026-07-12-orchestration-alignment.md) | Execution plan for the spec's `LAYER-*` and launch-profile (`HARN-005`..`HARN-007`) requirements: launch-packet etiquette, per-node model/effort plumbing, Cockpit launch-profile controls. Mirror into Linear when the connector is available. |
-
 ## Delivered Evidence — Not Current Work
 
 | Doc | Purpose |
 |---|---|
+| [superpowers/plans/2026-07-12-orchestration-alignment.md](superpowers/plans/2026-07-12-orchestration-alignment.md) | Delivered 2026-07-13: launch-packet layer/verification etiquette (`LAYER-003`/`004`), launch profiles end to end (`HARN-005`..`HARN-007`), Cockpit launch-profile controls, menu-decision fidelity (`DECISION-004`), PTY-crash closure. Mirror into Linear when the connector is available. |
 | [superpowers/specs/2026-05-09-cockpit-node-session-ux-design.md](superpowers/specs/2026-05-09-cockpit-node-session-ux-design.md) | Delivered session-first interaction invariant retained by the current spec. |
 | [superpowers/plans/2026-05-09-cockpit-node-session-ux.md](superpowers/plans/2026-05-09-cockpit-node-session-ux.md) | Completed implementation/verification history; its old release status is superseded by `RELEASES.md`. |
 | [superpowers/plans/2026-05-10-harness-asylum-control.md](superpowers/plans/2026-05-10-harness-asylum-control.md) | Delivered `node.spawn_peer` and local MCP-injection evidence; shipped in v0.2.0. |
