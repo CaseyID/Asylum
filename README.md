@@ -6,11 +6,33 @@ It does not replace Codex, Claude Code, Pi, Hermes, or future harnesses. It laun
 
 The core product object is the **Node**: a live or resumable harness session running somewhere. A node may be a command center, supervisor, worker, evaluator, plain assistant, or custom role, but those are role hints, not mandatory workflow states.
 
+## Where Asylum Sits
+
+Capable harnesses already parallelize internally — Claude Code has subagents,
+agent teams, and scripted multi-agent workflows; other harnesses have their
+own. Asylum does not compete with any of that. It is the layer above: its unit
+of work is a whole harness session, and the harness inside every node keeps
+all of its native internal parallelism.
+
+| Layer | Unit of work | What it isolates |
+|---|---|---|
+| Harness-internal parallelism (subagents, workflows) | A context window | Context only — shares the node's machine, filesystem, credentials |
+| Asylum node | A harness session | The session; on Loon, a whole microVM (blast radius) |
+
+Nesting is the intended shape: a supervisor node coordinates worker nodes,
+and each worker fans out its own subagents internally when its work calls
+for it. Use in-harness parallelism for fine-grained fan-out inside one body
+of work; use an Asylum peer node when work needs independent lifetime,
+isolation, separate supervision, or a different workspace/harness/substrate.
+The full model — including verification etiquette and model/effort economics
+at fleet scale — is in
+[docs/concepts/orchestration-layers.md](docs/concepts/orchestration-layers.md).
+
 ## Start Here
 
 - Current product spec: [docs/specs/asylum-current-product-spec.md](docs/specs/asylum-current-product-spec.md)
 - Docs map: [docs/README.md](docs/README.md)
-- Current node session UX plan: [docs/superpowers/plans/2026-05-09-cockpit-node-session-ux.md](docs/superpowers/plans/2026-05-09-cockpit-node-session-ux.md)
+- Product feedback and backlog workflow: [docs/backlog.md](docs/backlog.md)
 - Release ledger: [RELEASES.md](RELEASES.md)
 
 ## Product Path
@@ -55,6 +77,28 @@ asylum update
 
 `asylum update` downloads the latest release, verifies its checksum, and restarts the service.
 
+### First Useful Session
+
+Check readiness, open Cockpit, and launch a real coordinator rather than starting
+from source-development commands:
+
+```bash
+asylum doctor
+asylum cockpit
+```
+
+In Cockpit, choose **launch node**, select an available harness and the `local`
+substrate, use the `supervisor` role hint, provide the workspace and the real
+objective as the initial prompt, then launch. The node receives Asylum MCP tools
+and can create peer nodes; every peer remains a real harness session that can be
+opened and controlled directly from Cockpit.
+
+The current launch form is still low-level: it does not yet preserve a separate
+human-readable node name, completion criteria, result summary, or automatic
+monitoring policy. Those product requirements live in the canonical spec and the
+Linear `Asylum` backlog. Do not treat a quiet/closed terminal as proof of task
+completion; collect the result in the session before stopping or archiving.
+
 ### ntfy Notifications (Optional)
 
 Asylum can send and receive notifications via [ntfy.sh](https://ntfy.sh) or a self-hosted ntfy server. Set these environment variables before `asylum setup`:
@@ -71,10 +115,16 @@ When configured, the daemon subscribes to the topic at startup. Inbound ntfy mes
 
 ### Known Limits
 
-- Asylum is single-user in v0.1.x. Owner tokens protect HTTP access, but token scopes are advisory labels, not per-route authorization.
+- Asylum is single-user in v0.2.0. Owner tokens protect HTTP access, but owner-token scope labels are still advisory rather than general per-route authorization. Loon guest tokens have additional node-path restrictions; they are not owner tokens.
 - Local substrate behavior is the most validated path. Loon is optional and requires a configured Loon host plus client profile (`loon connect`).
+- Loon guests cannot reach a loopback-only Asylum daemon. Binding Asylum beyond localhost can make guest MCP/events work, but it also exposes Cockpit/API on that interface; enable owner-token auth and network controls. A dedicated guest-only control listener is not delivered yet.
+- A Loon node's workspace currently lives inside its disposable VM. Asylum does not yet clone/upload a host workspace, attach a durable workspace volume, or retrieve results automatically, and stopping/archiving destroys the VM. Commit/push or otherwise export important work before teardown.
+- Loon provisioning currently depends on an agent-capable guest image and valid harness credentials. Readiness is not yet summarized as one operator-facing profile.
 - Inbound ntfy/webhook messages are recorded and can trigger hooks; ntfy replies are correlated back to the node that triggered the outbound message (via a hook `channel` action), not to arbitrary node addressing.
 - Decisions are a first-class operator workflow: harness-awaited-input events auto-create pending decisions, Cockpit/CLI/MCP can list and resolve them (approve/deny/free-text answer), and the resolution is injected back into the node. ntfy replies correlated to a node with a pending decision resolve it the same way.
+- Menu-style harness questions are not yet typed end to end. A free-text reply can be delivered as Enter and select the harness's default option; verify non-default choices in the live session.
+- Launch profiles are not selectable yet: node create/spawn does not accept harness model or reasoning-effort options, so nodes launch with the harness's own defaults. Per-node model/effort choice is specified (spec `HARN-005`..`HARN-007`) but not implemented.
+- The injected coordination guidance does not yet include layer-choice or verification etiquette (spec `LAYER-003`/`LAYER-004`); supervisors currently receive tool-surface and monitoring etiquette only.
 - Keep Cockpit bound to localhost unless you are deliberately protecting access with a private network such as Tailscale. Session URLs and transcripts are sensitive.
 
 ## Release Artifact Expectations
@@ -274,7 +324,7 @@ These commands print service definitions you can save as launch artifacts.
 ./target/debug/asylum mcp
 ```
 
-Token scopes are advisory labels in v0.1.x. Owner-token auth is enforced at the token level; per-route scope enforcement is not implemented yet.
+Owner-token scopes are advisory labels in v0.2.0. Owner-token auth is enforced at the token level; general per-route scope enforcement is not implemented yet. Per-node Loon guest tokens have narrower node-path enforcement and should not be treated as equivalent to owner tokens.
 
 `asylum` also reads optional environment:
 - `ASYLUM_SOCKET_PATH` (default `~/.asylum/run/asylum.sock`) for local CLI/MCP daemon control
@@ -290,7 +340,7 @@ When Loon is enabled, Asylum drives the real LoonV2 v2 CLI contract: `loon vm cr
 ### Acceptance Walkthrough
 
 1. Build and run `asylum daemon run` and confirm startup succeeds.
-2. `curl http://127.0.0.1:7717/api/graph` returns a JSON object with `graph`.
+2. `curl http://127.0.0.1:7717/api/graph` returns the real `nodes` and `relationships` graph payload.
 3. Create a node:
    - `asylum node create --harness codex --substrate local --role worker`
    - Verify `/api/nodes/:id` returns created `node_id`.

@@ -12,16 +12,25 @@ Canonical current product spec: [docs/specs/asylum-current-product-spec.md](docs
 
 Current docs map: [docs/README.md](docs/README.md).
 
+Product feedback and backlog workflow: [docs/backlog.md](docs/backlog.md).
+
 ## Current focus — read this if you're picking up active work
 
-**Current branch focus:** Cockpit node interaction should be session-first. Users should click/select nodes and operate the live session; Cockpit should not expose "attach" as a normal UX concept.
+**Current product focus:** turn the delivered v0.2.0 orchestration kernel into a
+coherent daily-driver product. Product truth is being refined in the canonical
+spec and actionable delivery work is tracked in the existing Linear `Asylum`
+project. Do not infer active implementation work from completed mission/plan
+documents under `docs/superpowers/`.
 
-Branch-local source of truth for this cleanup:
+Current sources of truth:
 
-- **Current product spec:** [docs/specs/asylum-current-product-spec.md](docs/specs/asylum-current-product-spec.md)
-- **Session UX design note:** [docs/superpowers/specs/2026-05-09-cockpit-node-session-ux-design.md](docs/superpowers/specs/2026-05-09-cockpit-node-session-ux-design.md)
-- **Session UX implementation/verification plan:** [docs/superpowers/plans/2026-05-09-cockpit-node-session-ux.md](docs/superpowers/plans/2026-05-09-cockpit-node-session-ux.md)
+- **Product contract:** [docs/specs/asylum-current-product-spec.md](docs/specs/asylum-current-product-spec.md)
+- **Backlog workflow:** [docs/backlog.md](docs/backlog.md)
+- **Canonical backlog:** existing Linear project `Asylum`
 - **Release truth:** [RELEASES.md](RELEASES.md)
+
+The session-first invariant remains: users select nodes and operate their live
+sessions; Cockpit does not expose "attach" as a normal product workflow.
 
 ## The principle that drives current work
 
@@ -42,7 +51,7 @@ Test fixtures and unit-test mocks are fine. The principle applies to behavior de
 - `crates/asylum-types/` — shared types and contracts (API, capabilities, config, security primitives)
 - `cockpit/` — TypeScript/React single-page app served by the daemon (`/api/...` routes; `/` serves the SPA)
 - `scripts/` — release, install, build-artifact scripts
-- `docs/` — current product spec plus active branch design/plan notes
+- `docs/` — current product sources plus explicitly labeled delivered evidence
 
 ## How to work
 
@@ -104,6 +113,8 @@ Every delivery plan must include a "Release status" section that links to the le
 
 - Asylum is single-user in v1. Do not introduce multi-tenancy, RBAC, or org-scoping.
 - Asylum is harness-intelligence-first. Do not introduce a mandatory workflow engine or fixed node state machine.
+- Asylum coordinates at session granularity. Harness-internal parallelism (subagents, agent teams, scripted in-harness workflows) is node-internal behavior: never model it as nodes or graph edges, and never build an Asylum-owned orchestration/workflow/subagent engine above or below the node graph. The layer model is [docs/concepts/orchestration-layers.md](docs/concepts/orchestration-layers.md).
+- Coordination etiquette for spawned coordinators lives in the launch packet (`crates/asylum-daemon/src/launch_packet.rs`) and is drift-checked by tests against the real MCP/hook catalogs. Update doctrine there, not in per-client copies.
 - Asylum is Loon-independent. Loon is one of two supported substrates; do not couple core logic to it.
 - Asylum is graph-first. Nodes are the core object; runs/workflows may come later.
 - Capability surface (CLI, API, MCP, cockpit) shares the same root capabilities — do not let one drift from the others.
