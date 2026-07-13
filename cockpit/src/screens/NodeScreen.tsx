@@ -172,6 +172,12 @@ export function NodeScreen({
             <span>
               session: <b className="mono">{node.harness_session_id ?? "—"}</b>
             </span>
+            <span>
+              model: <b className="mono">{node.model ?? "harness default"}</b>
+            </span>
+            <span>
+              effort: <b className="mono">{node.effort ?? "harness default"}</b>
+            </span>
           </div>
           <div className="node-tabs">
             {(["session", "events", "activity", "capabilities", "relationships"] as Tab[]).map((t) => (

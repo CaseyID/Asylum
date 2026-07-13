@@ -43,6 +43,10 @@ export function CreateScreen({ onCreated, onCancel }: CreateScreenProps): JSX.El
   const [prompt, setPrompt] = useState<string>(
     "inspect the asylum context, summarize active nodes, and ask me what to spawn next.",
   );
+  // Advanced launch-profile overrides. Free text, no Asylum-owned catalog —
+  // rendered only when the selected harness descriptor advertises support.
+  const [model, setModel] = useState<string>("");
+  const [effort, setEffort] = useState<string>("");
   const [launching, setLaunching] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -71,16 +75,22 @@ export function CreateScreen({ onCreated, onCancel }: CreateScreenProps): JSX.El
     };
   }, []);
 
+  const selectedHarness = harnesses.find((h) => h.id === harness);
+
   async function handleLaunch() {
     setLaunching(true);
     setError(null);
     try {
+      const trimmedModel = model.trim();
+      const trimmedEffort = effort.trim();
       const node = await createNode({
         harness: harness as HarnessKind,
         substrate: substrate as SubstrateKind,
         role_hint: role,
         workspace,
         description: prompt,
+        ...(selectedHarness?.supports_model && trimmedModel ? { model: trimmedModel } : {}),
+        ...(selectedHarness?.supports_effort && trimmedEffort ? { effort: trimmedEffort } : {}),
       });
       onCreated(node.id);
     } catch (err) {
@@ -89,8 +99,6 @@ export function CreateScreen({ onCreated, onCancel }: CreateScreenProps): JSX.El
       setLaunching(false);
     }
   }
-
-  const selectedHarness = harnesses.find((h) => h.id === harness);
 
   return (
     <div className="page" style={{ maxWidth: 880 }}>
@@ -218,6 +226,33 @@ export function CreateScreen({ onCreated, onCancel }: CreateScreenProps): JSX.El
               />
             </Field>
           </div>
+
+          {(selectedHarness?.supports_model || selectedHarness?.supports_effort) && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+              {selectedHarness?.supports_model && (
+                <Field label="model" hint="passed verbatim to the harness. blank uses the harness default.">
+                  <input
+                    aria-label="model"
+                    className="input mono"
+                    placeholder="harness default"
+                    value={model}
+                    onChange={(e) => setModel(e.target.value)}
+                  />
+                </Field>
+              )}
+              {selectedHarness?.supports_effort && (
+                <Field label="effort" hint="passed verbatim to the harness. blank uses the harness default.">
+                  <input
+                    aria-label="effort"
+                    className="input mono"
+                    placeholder="harness default"
+                    value={effort}
+                    onChange={(e) => setEffort(e.target.value)}
+                  />
+                </Field>
+              )}
+            </div>
+          )}
 
           <Field label="launch packet (initial prompt)" hint="injected as the first user turn, after asylum context.">
             <textarea

@@ -52,6 +52,12 @@ export interface AsylumNode {
   // on the daemon's NodeRecord as of W1/W3; optional here so fixtures/tests
   // that predate it still type-check.
   harness_session_id?: string | null;
+  // Launch-profile model/effort the node was actually launched with (recorded
+  // at launch, not an Asylum-owned catalog). `null`/absent means the harness
+  // default was used. Present on the daemon's NodeRecord as of the
+  // launch-profile workstream.
+  model?: string | null;
+  effort?: string | null;
   // augments
   output_preview?: string;
   is_command_center?: boolean;
@@ -97,6 +103,11 @@ export interface CreateNodeRequest {
   role_hint: string;
   workspace?: string;
   description?: string;
+  // Optional launch-profile overrides, passed verbatim to the harness. Only
+  // included in the request when the operator typed a non-empty value; the
+  // daemon treats an omitted field as "harness default".
+  model?: string;
+  effort?: string;
 }
 
 export interface AttachBrowserResponse {
@@ -285,6 +296,11 @@ export interface HarnessDescriptor {
   available: boolean;
   command: string;
   caps: string[];
+  // Whether this harness accepts a per-launch model / reasoning-effort
+  // override. Derived from the adapter, not an Asylum-owned catalog — the
+  // cockpit only shows the corresponding control when the flag is true.
+  supports_model?: boolean;
+  supports_effort?: boolean;
 }
 
 export interface SubstrateDescriptor {

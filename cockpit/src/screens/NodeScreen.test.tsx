@@ -128,6 +128,40 @@ describe("NodeScreen W5 decision + session surfacing", () => {
     await waitFor(() => expect(container.textContent).toContain("command-center"));
     expect(container.textContent).toMatch(/session:\s*—/);
   });
+
+  it("shows the recorded model/effort launch profile when the daemon provides one", async () => {
+    const props = {
+      node: node({ model: "opus", effort: "high" }),
+      nodes: [node({ model: "opus", effort: "high" })],
+      relationships: [],
+      onBack: vi.fn(),
+      onOpen: vi.fn(),
+      onAction: vi.fn(),
+      onGraphRefresh: vi.fn(),
+    };
+
+    const { container } = render(<NodeScreen {...props} />);
+    await waitFor(() => expect(container.textContent).toContain("command-center"));
+    expect(container.textContent).toMatch(/model:\s*opus/);
+    expect(container.textContent).toMatch(/effort:\s*high/);
+  });
+
+  it("shows harness default for model/effort when the node has none recorded", async () => {
+    const props = {
+      node: node({ model: undefined, effort: undefined }),
+      nodes: [node({ model: undefined, effort: undefined })],
+      relationships: [],
+      onBack: vi.fn(),
+      onOpen: vi.fn(),
+      onAction: vi.fn(),
+      onGraphRefresh: vi.fn(),
+    };
+
+    const { container } = render(<NodeScreen {...props} />);
+    await waitFor(() => expect(container.textContent).toContain("command-center"));
+    expect(container.textContent).toMatch(/model:\s*harness default/);
+    expect(container.textContent).toMatch(/effort:\s*harness default/);
+  });
 });
 
 describe("NodeScreen selection transition", () => {
