@@ -231,6 +231,9 @@ owner instruction), each implemented, adversarially reviewed, and live-proven:
 
 ## Release status
 
-On main, not released — awaiting authorization. All four workstreams are
-user-facing and should ship in the next cut release. Last release: v0.2.0
-(2026-07-07). See [RELEASES.md](../../../RELEASES.md).
+Released as [v0.3.0](https://github.com/CaseyID/Asylum/releases/tag/v0.3.0)
+on 2026-07-13 (owner-authorized cut): all four platforms (linux-x86_64,
+linux-arm64, darwin-arm64, darwin-x86_64), signed checksums, packaging
+validated via `cargo test-asylum-release`. Ledger row updated in
+[RELEASES.md](../../../RELEASES.md). Not yet deployed to this machine's
+installed daemon (`asylum update` is the owner's call).
