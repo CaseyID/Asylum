@@ -235,5 +235,11 @@ Released as [v0.3.0](https://github.com/CaseyID/Asylum/releases/tag/v0.3.0)
 on 2026-07-13 (owner-authorized cut): all four platforms (linux-x86_64,
 linux-arm64, darwin-arm64, darwin-x86_64), signed checksums, packaging
 validated via `cargo test-asylum-release`. Ledger row updated in
-[RELEASES.md](../../../RELEASES.md). Not yet deployed to this machine's
-installed daemon (`asylum update` is the owner's call).
+[RELEASES.md](../../../RELEASES.md). Deployed to this machine's installed
+daemon 2026-07-14 via `asylum update` (owner instruction): binary and daemon
+report 0.3.0, doctor ready, service running, and a one-session live smoke on
+the installed daemon proved the release features together — a
+`--model haiku --effort low` node carried both flags in its real argv,
+recorded the profile in inspect (still visible after stop), landed its launch
+prompt unassisted, and reported real token telemetry
+(tokens_in=30887, tokens_out=356); graceful stop, no stray processes.
